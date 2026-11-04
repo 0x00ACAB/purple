@@ -101,6 +101,11 @@ impl Model {
         model
     }
 
+    /// Add a line to the system log.
+    pub(crate) fn note(&mut self, line: String) {
+        self.log(line);
+    }
+
     pub(crate) const fn should_quit(&self) -> bool {
         self.quit
     }

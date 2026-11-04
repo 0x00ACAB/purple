@@ -1,8 +1,9 @@
 //! Process hardening applied at the start of every purple process, and protected memory
 //! for long-lived secrets ([`secret`]).
 //!
-//! Landlock and seccomp land here as later steps.
+//! In-process sandboxing (Landlock and seccomp) is in [`sandbox`].
 
+pub mod sandbox;
 pub mod secret;
 
 use std::io;

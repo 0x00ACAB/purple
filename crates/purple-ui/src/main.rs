@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
+use landlock::RulesetStatus;
+use purple_harden::sandbox::{Network, Policy, restrict};
 use purple_ipc::ui::{UiCmd, UiEvent};
 use purple_ipc::{UI_CORE_FD, inherited_stream};
 use ratatui::DefaultTerminal;
@@ -34,6 +36,10 @@ fn main() -> ExitCode {
 #[expect(unsafe_code, reason = "adopting the socket the launcher passed in")]
 fn run() -> io::Result<()> {
     purple_harden::harden()?;
+    let sandbox = restrict(&Policy {
+        writable: &[],
+        network: Network::Denied,
+    })?;
     // On X11 any client can read keystrokes and screenshot other windows.
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return Err(io::Error::other(
@@ -46,7 +52,14 @@ fn run() -> io::Result<()> {
 
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
-    let result = event_loop(&mut terminal, &mut core, &events);
+    let mut model = Model::new();
+    if sandbox.landlock != RulesetStatus::FullyEnforced {
+        model.note(format!(
+            "warning: Landlock only {:?} on this kernel",
+            sandbox.landlock
+        ));
+    }
+    let result = event_loop(&mut terminal, &mut model, &mut core, &events);
     execute!(stdout(), DisableBracketedPaste).ok();
     ratatui::try_restore()?;
     result
@@ -58,14 +71,14 @@ fn run() -> io::Result<()> {
 )]
 fn event_loop(
     terminal: &mut DefaultTerminal,
+    model: &mut Model,
     core: &mut UnixStream,
     events: &Receiver<Msg>,
 ) -> io::Result<()> {
-    let mut model = Model::new();
     while !model.should_quit() {
-        terminal.draw(|frame| view(&model, frame))?;
+        terminal.draw(|frame| view(model, frame))?;
         while let Ok(msg) = events.try_recv() {
-            apply(&mut model, msg, core)?;
+            apply(model, msg, core)?;
         }
         if event::poll(TICK)? {
             let msg = match event::read()? {
@@ -73,7 +86,7 @@ fn event_loop(
                 Event::Paste(text) => Msg::Paste(text),
                 _ => continue,
             };
-            apply(&mut model, msg, core)?;
+            apply(model, msg, core)?;
         }
     }
     Ok(())

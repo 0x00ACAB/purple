@@ -7,8 +7,12 @@
 use std::io;
 use std::process::ExitCode;
 
+use landlock::RulesetStatus;
+use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_ipc::{NET_CORE_FD, inherited_stream};
 use purple_net::{DevProviderTransport, FakeTransport, serve};
+
+const NAME: &str = "purple-net";
 
 fn main() -> ExitCode {
     match run() {
@@ -23,6 +27,10 @@ fn main() -> ExitCode {
 #[expect(unsafe_code, reason = "adopting the socket the launcher passed in")]
 fn run() -> io::Result<()> {
     purple_harden::harden()?;
+    note_sandbox(&restrict(&Policy {
+        writable: &[],
+        network: Network::Allowed,
+    })?);
     let dev_provider = dev_provider_arg()?;
     // SAFETY: the launcher hands this fd to purple-net and nothing else here uses it.
     let mut core = unsafe { inherited_stream(NET_CORE_FD)? };
@@ -41,5 +49,15 @@ fn dev_provider_arg() -> io::Result<Option<String>> {
         _ => Err(io::Error::other(
             "usage: purple-net [--dev-provider <addr>]",
         )),
+    }
+}
+
+/// Log how much of the sandbox the kernel enforced, if not all of it.
+fn note_sandbox(report: &Report) {
+    if report.landlock != RulesetStatus::FullyEnforced {
+        eprintln!(
+            "{NAME}: warning: Landlock only {:?} on this kernel",
+            report.landlock
+        );
     }
 }

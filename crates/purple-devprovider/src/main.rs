@@ -9,7 +9,11 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::thread;
 
+use landlock::RulesetStatus;
+use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_net::{FakeTransport, serve};
+
+const NAME: &str = "purple-devprovider";
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7878";
 
@@ -25,6 +29,10 @@ fn main() -> ExitCode {
 
 fn run() -> io::Result<()> {
     purple_harden::harden()?;
+    note_sandbox(&restrict(&Policy {
+        writable: &[],
+        network: Network::Allowed,
+    })?);
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_ADDR.to_owned());
@@ -48,4 +56,14 @@ fn run() -> io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Log how much of the sandbox the kernel enforced, if not all of it.
+fn note_sandbox(report: &Report) {
+    if report.landlock != RulesetStatus::FullyEnforced {
+        eprintln!(
+            "{NAME}: warning: Landlock only {:?} on this kernel",
+            report.landlock
+        );
+    }
 }

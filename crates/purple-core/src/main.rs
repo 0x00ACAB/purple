@@ -17,14 +17,17 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use landlock::RulesetStatus;
 use purple_core::invite::Invite;
 use purple_core::messenger::{Event, Messenger, Outgoing};
 use purple_core::session;
 use purple_core::vault::{HistoryEntry, KdfParams, Vault};
+use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_ipc::ui::{MAX_BODY_LEN, MAX_ERROR_LEN, UiCmd, UiEvent};
 use purple_ipc::{CORE_NET_FD, CORE_UI_FD, MailboxId, NetMsg, Packet, inherited_stream};
 use zeroize::Zeroizing;
 
+const NAME: &str = "purple-core";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const USAGE: &str = "usage: purple-core (--no-ui | --data-dir <dir>)";
 
@@ -61,6 +64,14 @@ fn parse_args() -> io::Result<Mode> {
 fn run() -> io::Result<()> {
     purple_harden::harden()?;
     let mode = parse_args()?;
+    let writable: Vec<&Path> = match &mode {
+        Mode::SelfTest => Vec::new(),
+        Mode::Serve(data_dir) => vec![data_dir.as_path()],
+    };
+    note_sandbox(&restrict(&Policy {
+        writable: &writable,
+        network: Network::Denied,
+    })?);
 
     // SAFETY: the launcher hands this fd to purple-core and nothing else here uses it.
     let mut net = unsafe { inherited_stream(CORE_NET_FD)? };
@@ -437,5 +448,15 @@ fn expect(ok: bool) -> io::Result<()> {
         Err(io::Error::other(
             "self-test did not see the expected events",
         ))
+    }
+}
+
+/// Log how much of the sandbox the kernel enforced, if not all of it.
+fn note_sandbox(report: &Report) {
+    if report.landlock != RulesetStatus::FullyEnforced {
+        eprintln!(
+            "{NAME}: warning: Landlock only {:?} on this kernel",
+            report.landlock
+        );
     }
 }
