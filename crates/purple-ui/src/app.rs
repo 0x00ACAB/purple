@@ -26,6 +26,7 @@ const MIN_PASSPHRASE_CHARS: usize = 8;
 const HELP: &[&str] = &[
     "/invite NAME          create an invite for a new contact called NAME",
     "/accept NAME INVITE   accept an invite (paste it) from a contact called NAME",
+    "/passphrase           change the vault passphrase (Esc cancels)",
     "/quit                 exit (also Esc or Ctrl-C)",
     "Up/Down or Tab switch contact; anything else you type is sent to the selected contact.",
 ];
@@ -67,10 +68,26 @@ enum Lock {
     Open,
 }
 
+/// Where a `/passphrase` change stands. Each step holds what was typed so far.
+#[derive(Default)]
+enum Change {
+    #[default]
+    Idle,
+    Old,
+    New {
+        old: Zeroizing<String>,
+    },
+    Repeat {
+        old: Zeroizing<String>,
+        new: Zeroizing<String>,
+    },
+}
+
 /// Everything the TUI shows.
 #[derive(Default)]
 pub(crate) struct Model {
     lock: Lock,
+    change: Change,
     contacts: Vec<String>,
     selected: usize,
     chats: HashMap<String, Vec<ChatLine>>,
@@ -157,6 +174,11 @@ pub(crate) fn update(model: &mut Model, msg: Msg) -> Vec<UiCmd> {
 fn on_key(model: &mut Model, key: KeyEvent) -> Vec<UiCmd> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
+        KeyCode::Esc if !matches!(model.change, Change::Idle) => {
+            model.change = Change::Idle;
+            model.input.zeroize();
+            model.log("passphrase change cancelled");
+        }
         KeyCode::Esc => model.quit = true,
         KeyCode::Char('c') if ctrl => model.quit = true,
         KeyCode::Char(c) if !ctrl => push_input(model, &sanitize(&c.to_string())),
@@ -175,6 +197,7 @@ fn on_key(model: &mut Model, key: KeyEvent) -> Vec<UiCmd> {
                 _ => 0,
             };
         }
+        KeyCode::Enter if !matches!(model.change, Change::Idle) => return submit_change(model),
         KeyCode::Enter if matches!(model.lock, Lock::Open) => return submit(model),
         KeyCode::Enter => return submit_passphrase(model),
         _ => {}
@@ -218,6 +241,11 @@ fn submit(model: &mut Model) -> Vec<UiCmd> {
         }
         (Some("quit"), None, None, None) => {
             model.quit = true;
+            Vec::new()
+        }
+        (Some("passphrase"), None, None, None) => {
+            model.change = Change::Old;
+            model.log("current passphrase:");
             Vec::new()
         }
         (Some("help"), None, None, None) => {
@@ -287,6 +315,38 @@ fn submit_passphrase(model: &mut Model) -> Vec<UiCmd> {
     }
 }
 
+fn submit_change(model: &mut Model) -> Vec<UiCmd> {
+    let typed = Zeroizing::new(std::mem::take(&mut model.input));
+    match std::mem::take(&mut model.change) {
+        Change::Old => {
+            model.log("new passphrase (at least 8 characters):");
+            model.change = Change::New { old: typed };
+        }
+        Change::New { old } => {
+            if typed.chars().count() < MIN_PASSPHRASE_CHARS {
+                model.log("use at least 8 characters:");
+                model.change = Change::New { old };
+            } else {
+                model.log("type the new passphrase again:");
+                model.change = Change::Repeat { old, new: typed };
+            }
+        }
+        Change::Repeat { old, new } => {
+            if new == typed {
+                model.log("changing passphrase...");
+                return vec![UiCmd::ChangePassphrase {
+                    old: old.to_string(),
+                    new: new.to_string(),
+                }];
+            }
+            model.log("passphrases didn't match; new passphrase:");
+            model.change = Change::New { old };
+        }
+        Change::Idle => {}
+    }
+    Vec::new()
+}
+
 fn send(model: &mut Model, body: &str) -> Vec<UiCmd> {
     let Some(contact) = model.selected_contact().map(str::to_owned) else {
         model.log("no contact selected: /invite or /accept someone first");
@@ -320,6 +380,7 @@ fn on_core_event(model: &mut Model, event: UiEvent) {
             model.lock = Lock::Open;
             model.log("unlocked. type /help for commands.");
         }
+        UiEvent::PassphraseChanged => model.log("passphrase changed"),
         UiEvent::Sent { to, body } => {
             let to = sanitize(&to);
             model.add_contact(to.clone());
@@ -426,18 +487,23 @@ pub(crate) fn view(model: &Model, frame: &mut Frame<'_>) {
     frame.render_widget(bottom_aligned(log, system, " purple ".to_owned()), system);
 
     let masked = || "*".repeat(model.input.chars().count());
-    let (input_title, shown) = match &model.lock {
-        Lock::Open => (" > ", model.input.clone()),
-        Lock::Locked {
-            new: true,
-            first: None,
-        } => (" new passphrase ", masked()),
-        Lock::Locked {
-            new: true,
-            first: Some(_),
-        } => (" repeat passphrase ", masked()),
-        Lock::Locked { new: false, .. } => (" passphrase ", masked()),
-        Lock::Starting | Lock::Unlocking => (" please wait ", String::new()),
+    let (input_title, shown) = match (&model.change, &model.lock) {
+        (Change::Old, _) => (" current passphrase ", masked()),
+        (Change::New { .. }, _) => (" new passphrase ", masked()),
+        (Change::Repeat { .. }, _) => (" repeat new passphrase ", masked()),
+        (Change::Idle, lock) => match lock {
+            Lock::Open => (" > ", model.input.clone()),
+            Lock::Locked {
+                new: true,
+                first: None,
+            } => (" new passphrase ", masked()),
+            Lock::Locked {
+                new: true,
+                first: Some(_),
+            } => (" repeat passphrase ", masked()),
+            Lock::Locked { new: false, .. } => (" passphrase ", masked()),
+            Lock::Starting | Lock::Unlocking => (" please wait ", String::new()),
+        },
     };
     frame.render_widget(
         Paragraph::new(shown).block(Block::bordered().title(input_title)),
@@ -525,6 +591,46 @@ mod tests {
                 contact: "bob".into()
             }]
         );
+    }
+
+    #[test]
+    fn passphrase_change_asks_old_then_new_twice() {
+        let mut m = open_model();
+        assert!(type_line(&mut m, "/passphrase").is_empty());
+        assert!(type_line(&mut m, "old one!").is_empty());
+        assert!(type_line(&mut m, "short").is_empty());
+        assert!(type_line(&mut m, "brand new pass").is_empty());
+        assert!(type_line(&mut m, "typo new pass").is_empty());
+        assert!(type_line(&mut m, "brand new pass").is_empty());
+        assert_eq!(
+            type_line(&mut m, "brand new pass"),
+            [UiCmd::ChangePassphrase {
+                old: "old one!".into(),
+                new: "brand new pass".into(),
+            }]
+        );
+        // Back to normal: text goes to commands again.
+        assert_eq!(
+            type_line(&mut m, "/invite bob"),
+            [UiCmd::CreateInvite {
+                contact: "bob".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn esc_cancels_a_passphrase_change_instead_of_quitting() {
+        let mut m = open_model();
+        type_line(&mut m, "/passphrase");
+        for c in "half typed".chars() {
+            update(&mut m, key(KeyCode::Char(c)));
+        }
+        update(&mut m, key(KeyCode::Esc));
+        assert!(!m.should_quit());
+        assert!(m.input.is_empty());
+        assert!(matches!(m.change, Change::Idle));
+        update(&mut m, key(KeyCode::Esc));
+        assert!(m.should_quit());
     }
 
     #[test]

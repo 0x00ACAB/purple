@@ -84,6 +84,21 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
+    /// Exactly `len` raw bytes.
+    pub(crate) fn raw(&mut self, len: usize) -> Result<&'a [u8]> {
+        let (head, rest) = self
+            .0
+            .split_at_checked(len)
+            .ok_or(Error::Malformed("snapshot truncated"))?;
+        self.0 = rest;
+        Ok(head)
+    }
+
+    /// Everything not read yet.
+    pub(crate) const fn rest(&self) -> &'a [u8] {
+        self.0
+    }
+
     pub(crate) fn string(&mut self) -> Result<String> {
         String::from_utf8(self.bytes()?.to_vec())
             .map_err(|_| Error::Malformed("snapshot string is not UTF-8"))

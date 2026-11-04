@@ -122,6 +122,16 @@ fn serve_ui(net: &mut UnixStream, mut ui: UnixStream, data_dir: &Path) -> io::Re
     loop {
         let wait = next_poll.saturating_duration_since(Instant::now());
         match commands.recv_timeout(wait) {
+            Ok(Ok(UiCmd::ChangePassphrase { old, new })) => {
+                let (old, new) = (Zeroizing::new(old), Zeroizing::new(new));
+                let changed = messenger.to_snapshot().and_then(|snapshot| {
+                    vault.change_passphrase(&old, &new, KdfParams::DEFAULT, &snapshot)
+                });
+                match changed {
+                    Ok(()) => UiEvent::PassphraseChanged.write_to(&mut ui)?,
+                    Err(err) => report(&mut ui, &err.to_string())?,
+                }
+            }
             Ok(Ok(cmd)) => match handle(cmd, &mut messenger) {
                 Ok(effects) => commit(effects, &messenger, &mut vault, net, &mut ui)?,
                 Err(err) => report(&mut ui, &err.to_string())?,
@@ -298,6 +308,11 @@ fn handle(cmd: UiCmd, messenger: &mut Messenger) -> session::Result<Effects> {
     match cmd {
         UiCmd::Unlock { .. } => {
             return Err(session::Error::State("already unlocked"));
+        }
+        UiCmd::ChangePassphrase { .. } => {
+            return Err(session::Error::State(
+                "passphrase changes are handled by the vault",
+            ));
         }
         UiCmd::CreateInvite { contact } => {
             let (invite, bundle) = messenger.create_invite(&contact)?;

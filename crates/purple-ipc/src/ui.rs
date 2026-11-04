@@ -25,6 +25,7 @@ const CMD_CREATE_INVITE: u8 = 1;
 const CMD_ACCEPT_INVITE: u8 = 2;
 const CMD_SEND: u8 = 3;
 const CMD_UNLOCK: u8 = 4;
+const CMD_CHANGE_PASSPHRASE: u8 = 5;
 
 const EVENT_INVITE_CREATED: u8 = 1;
 const EVENT_CONNECTED: u8 = 2;
@@ -33,6 +34,7 @@ const EVENT_ERROR: u8 = 4;
 const EVENT_NEED_PASSPHRASE: u8 = 5;
 const EVENT_UNLOCKED: u8 = 6;
 const EVENT_SENT: u8 = 7;
+const EVENT_PASSPHRASE_CHANGED: u8 = 8;
 
 /// What the user asked for, sent from `purple-ui` to `purple-core`.
 #[derive(Clone, PartialEq, Eq)]
@@ -41,6 +43,13 @@ pub enum UiCmd {
     Unlock {
         /// The passphrase as typed.
         passphrase: String,
+    },
+    /// Replace the vault passphrase.
+    ChangePassphrase {
+        /// The current passphrase.
+        old: String,
+        /// The new passphrase.
+        new: String,
     },
     /// Create an invite for a contact to be known as `contact`.
     CreateInvite {
@@ -68,6 +77,7 @@ impl std::fmt::Debug for UiCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unlock { .. } => f.write_str("Unlock { .. }"),
+            Self::ChangePassphrase { .. } => f.write_str("ChangePassphrase { .. }"),
             Self::CreateInvite { contact } => f
                 .debug_struct("CreateInvite")
                 .field("contact", contact)
@@ -95,6 +105,8 @@ pub enum UiEvent {
     },
     /// The vault is open. Saved contacts and history follow as ordinary events.
     Unlocked,
+    /// The passphrase was changed.
+    PassphraseChanged,
     /// A message this user sent earlier, replayed from history.
     Sent {
         /// Recipient.
@@ -140,6 +152,11 @@ impl UiCmd {
                 out.tag(CMD_UNLOCK);
                 out.str(passphrase, MAX_PASSPHRASE_LEN)?;
             }
+            Self::ChangePassphrase { old, new } => {
+                out.tag(CMD_CHANGE_PASSPHRASE);
+                out.str(old, MAX_PASSPHRASE_LEN)?;
+                out.str(new, MAX_PASSPHRASE_LEN)?;
+            }
             Self::CreateInvite { contact } => {
                 out.tag(CMD_CREATE_INVITE);
                 out.str(contact, MAX_NAME_LEN)?;
@@ -170,6 +187,10 @@ impl UiCmd {
         let cmd = match d.tag()? {
             CMD_UNLOCK => Self::Unlock {
                 passphrase: d.str(MAX_PASSPHRASE_LEN)?,
+            },
+            CMD_CHANGE_PASSPHRASE => Self::ChangePassphrase {
+                old: d.str(MAX_PASSPHRASE_LEN)?,
+                new: d.str(MAX_PASSPHRASE_LEN)?,
             },
             CMD_CREATE_INVITE => Self::CreateInvite {
                 contact: d.str(MAX_NAME_LEN)?,
@@ -202,6 +223,7 @@ impl UiEvent {
                 out.tag(u8::from(*new));
             }
             Self::Unlocked => out.tag(EVENT_UNLOCKED),
+            Self::PassphraseChanged => out.tag(EVENT_PASSPHRASE_CHANGED),
             Self::Sent { to, body } => {
                 out.tag(EVENT_SENT);
                 out.str(to, MAX_NAME_LEN)?;
@@ -247,6 +269,7 @@ impl UiEvent {
                 },
             },
             EVENT_UNLOCKED => Self::Unlocked,
+            EVENT_PASSPHRASE_CHANGED => Self::PassphraseChanged,
             EVENT_SENT => Self::Sent {
                 to: d.str(MAX_NAME_LEN)?,
                 body: d.str(MAX_BODY_LEN)?,
@@ -342,6 +365,10 @@ mod tests {
             UiCmd::Unlock {
                 passphrase: s("correct horse"),
             },
+            UiCmd::ChangePassphrase {
+                old: s("correct horse"),
+                new: s("battery staple"),
+            },
             UiCmd::CreateInvite {
                 contact: s("alice"),
             },
@@ -362,6 +389,7 @@ mod tests {
             UiEvent::NeedPassphrase { new: true },
             UiEvent::NeedPassphrase { new: false },
             UiEvent::Unlocked,
+            UiEvent::PassphraseChanged,
             UiEvent::Sent {
                 to: s("bob"),
                 body: s("earlier"),
@@ -411,6 +439,12 @@ mod tests {
             passphrase: s("hunter22"),
         };
         assert!(!format!("{cmd:?}").contains("hunter22"));
+        let change = UiCmd::ChangePassphrase {
+            old: s("hunter22"),
+            new: s("hunter33"),
+        };
+        let shown = format!("{change:?}");
+        assert!(!shown.contains("hunter22") && !shown.contains("hunter33"));
     }
 
     #[test]
