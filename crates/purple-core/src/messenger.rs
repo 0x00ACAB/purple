@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use purple_ipc::{MailboxId, Packet};
+use zeroize::Zeroizing;
 
+use crate::codec::{Reader, Writer};
 use crate::content::Content;
 use crate::fragment::{Reassembler, split};
 use crate::invite::Invite;
@@ -179,6 +181,61 @@ impl Messenger {
         outgoing(&queue, &wire)
     }
 
+    /// Serialize everything needed to resume: the account (identity, prekeys, sessions),
+    /// contacts and their queue secrets, and pending invites. Partly reassembled messages
+    /// aren't kept.
+    ///
+    /// # Errors
+    /// Fails only if libsignal can't serialize a record.
+    pub fn to_snapshot(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let mut w = Writer::default();
+        w.u8(SNAPSHOT_VERSION);
+        self.account.encode(&mut w)?;
+        w.len(self.contacts.len())?;
+        for (name, contact) in &self.contacts {
+            w.bytes(name.as_bytes())?;
+            w.bytes(contact.send.as_bytes())?;
+            w.bytes(contact.receive.as_bytes())?;
+        }
+        for pending in [&self.invites, &self.accepting] {
+            w.len(pending.len())?;
+            for (name, invite) in pending {
+                w.bytes(name.as_bytes())?;
+                w.bytes(&invite.encode())?;
+            }
+        }
+        Ok(w.finish())
+    }
+
+    /// Restore a messenger from [`Self::to_snapshot`].
+    ///
+    /// # Errors
+    /// Fails on an unknown version or any malformed field.
+    pub fn from_snapshot(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != SNAPSHOT_VERSION {
+            return Err(Error::Malformed("unknown snapshot version"));
+        }
+        let account = Account::decode(&mut r)?;
+        let mut contacts = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let name = r.string()?;
+            let send = secret(r.bytes()?)?;
+            let receive = secret(r.bytes()?)?;
+            contacts.insert(name, Contact { send, receive });
+        }
+        let invites = read_invites(&mut r)?;
+        let accepting = read_invites(&mut r)?;
+        r.finish()?;
+        Ok(Self {
+            account,
+            contacts,
+            invites,
+            accepting,
+            reassemblers: HashMap::new(),
+        })
+    }
+
     /// Names of connected contacts.
     pub fn contacts(&self) -> impl Iterator<Item = &str> {
         self.contacts.keys().map(String::as_str)
@@ -294,6 +351,24 @@ impl Messenger {
         }
         Ok(())
     }
+}
+
+const SNAPSHOT_VERSION: u8 = 1;
+
+fn secret(bytes: &[u8]) -> Result<QueueSecret> {
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| Error::Malformed("queue secret has the wrong length"))?;
+    Ok(QueueSecret::from_bytes(Zeroizing::new(array)))
+}
+
+fn read_invites(r: &mut Reader<'_>) -> Result<BTreeMap<String, Invite>> {
+    let mut out = BTreeMap::new();
+    for _ in 0..r.len()? {
+        let name = r.string()?;
+        out.insert(name, Invite::decode(r.bytes()?)?);
+    }
+    Ok(out)
 }
 
 /// Longest contact name, in characters.
@@ -473,6 +548,47 @@ mod tests {
             provider.poll(&mut alice, NOW),
             [Event::Connected("bob".into())]
         );
+    }
+
+    #[test]
+    fn snapshot_restores_contacts_sessions_and_pending_invites() {
+        let mut provider = Provider::default();
+        let (alice, mut bob) = connected(&mut provider);
+        let (invite, bundle) = bob.create_invite("carol").unwrap();
+        provider.deliver(bundle);
+
+        // Both restart from snapshots, then keep talking.
+        let mut alice = Messenger::from_snapshot(&alice.to_snapshot().unwrap()).unwrap();
+        let mut bob = Messenger::from_snapshot(&bob.to_snapshot().unwrap()).unwrap();
+        provider.deliver(alice.send("bob", b"after restart", NOW).unwrap());
+        assert_eq!(
+            provider.poll(&mut bob, NOW),
+            [text("alice", b"after restart")]
+        );
+        provider.deliver(bob.send("alice", b"me too", NOW).unwrap());
+        assert_eq!(provider.poll(&mut alice, NOW), [text("bob", b"me too")]);
+
+        // Bob's invite for carol survived the restart.
+        let mut carol = Messenger::new().unwrap();
+        carol.accept_invite("bob", invite).unwrap();
+        assert_eq!(
+            provider.poll(&mut carol, NOW),
+            [Event::Connected("bob".into())]
+        );
+        assert_eq!(
+            provider.poll(&mut bob, NOW),
+            [Event::Connected("carol".into())]
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_garbage() {
+        let snapshot = Messenger::new().unwrap().to_snapshot().unwrap();
+        assert!(Messenger::from_snapshot(&snapshot[..snapshot.len() - 1]).is_err());
+        let mut wrong_version = snapshot.to_vec();
+        wrong_version[0] = 99;
+        assert!(Messenger::from_snapshot(&wrong_version).is_err());
+        assert!(Messenger::from_snapshot(&[]).is_err());
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub const MAX_BODY_LEN: usize = 16 * 1024;
 pub const MAX_INVITE_LEN: usize = 256;
 /// Longest error text, in bytes.
 pub const MAX_ERROR_LEN: usize = 512;
+/// Longest passphrase, in bytes.
+pub const MAX_PASSPHRASE_LEN: usize = 1024;
 
 /// The largest message is a name plus a body.
 const MAX_UI_FRAME: usize = 1 + 2 + MAX_NAME_LEN + 2 + MAX_BODY_LEN;
@@ -22,15 +24,24 @@ const MAX_UI_FRAME: usize = 1 + 2 + MAX_NAME_LEN + 2 + MAX_BODY_LEN;
 const CMD_CREATE_INVITE: u8 = 1;
 const CMD_ACCEPT_INVITE: u8 = 2;
 const CMD_SEND: u8 = 3;
+const CMD_UNLOCK: u8 = 4;
 
 const EVENT_INVITE_CREATED: u8 = 1;
 const EVENT_CONNECTED: u8 = 2;
 const EVENT_MESSAGE: u8 = 3;
 const EVENT_ERROR: u8 = 4;
+const EVENT_NEED_PASSPHRASE: u8 = 5;
+const EVENT_UNLOCKED: u8 = 6;
+const EVENT_SENT: u8 = 7;
 
 /// What the user asked for, sent from `purple-ui` to `purple-core`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum UiCmd {
+    /// Unlock the vault, or create it if [`UiEvent::NeedPassphrase`] said it's new.
+    Unlock {
+        /// The passphrase as typed.
+        passphrase: String,
+    },
     /// Create an invite for a contact to be known as `contact`.
     CreateInvite {
         /// Name for the new contact.
@@ -52,9 +63,45 @@ pub enum UiCmd {
     },
 }
 
+/// Debug without the passphrase.
+impl std::fmt::Debug for UiCmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlock { .. } => f.write_str("Unlock { .. }"),
+            Self::CreateInvite { contact } => f
+                .debug_struct("CreateInvite")
+                .field("contact", contact)
+                .finish(),
+            Self::AcceptInvite { contact, .. } => f
+                .debug_struct("AcceptInvite")
+                .field("contact", contact)
+                .finish_non_exhaustive(),
+            Self::Send { contact, .. } => f
+                .debug_struct("Send")
+                .field("contact", contact)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// What happened, sent from `purple-core` to `purple-ui`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
+    /// The vault is locked. `new` is true when there's no vault yet and the passphrase
+    /// will create one.
+    NeedPassphrase {
+        /// Whether unlocking will create a new vault.
+        new: bool,
+    },
+    /// The vault is open. Saved contacts and history follow as ordinary events.
+    Unlocked,
+    /// A message this user sent earlier, replayed from history.
+    Sent {
+        /// Recipient.
+        to: String,
+        /// Message text.
+        body: String,
+    },
     /// An invite is ready to show.
     InviteCreated {
         /// Contact it's for.
@@ -89,6 +136,10 @@ impl UiCmd {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         let mut out = Encoder::default();
         match self {
+            Self::Unlock { passphrase } => {
+                out.tag(CMD_UNLOCK);
+                out.str(passphrase, MAX_PASSPHRASE_LEN)?;
+            }
             Self::CreateInvite { contact } => {
                 out.tag(CMD_CREATE_INVITE);
                 out.str(contact, MAX_NAME_LEN)?;
@@ -117,6 +168,9 @@ impl UiCmd {
         };
         let mut d = Decoder(&frame);
         let cmd = match d.tag()? {
+            CMD_UNLOCK => Self::Unlock {
+                passphrase: d.str(MAX_PASSPHRASE_LEN)?,
+            },
             CMD_CREATE_INVITE => Self::CreateInvite {
                 contact: d.str(MAX_NAME_LEN)?,
             },
@@ -143,6 +197,16 @@ impl UiEvent {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         let mut out = Encoder::default();
         match self {
+            Self::NeedPassphrase { new } => {
+                out.tag(EVENT_NEED_PASSPHRASE);
+                out.tag(u8::from(*new));
+            }
+            Self::Unlocked => out.tag(EVENT_UNLOCKED),
+            Self::Sent { to, body } => {
+                out.tag(EVENT_SENT);
+                out.str(to, MAX_NAME_LEN)?;
+                out.str(body, MAX_BODY_LEN)?;
+            }
             Self::InviteCreated { contact, invite } => {
                 out.tag(EVENT_INVITE_CREATED);
                 out.str(contact, MAX_NAME_LEN)?;
@@ -175,6 +239,18 @@ impl UiEvent {
         };
         let mut d = Decoder(&frame);
         let event = match d.tag()? {
+            EVENT_NEED_PASSPHRASE => Self::NeedPassphrase {
+                new: match d.tag()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(invalid("invalid flag")),
+                },
+            },
+            EVENT_UNLOCKED => Self::Unlocked,
+            EVENT_SENT => Self::Sent {
+                to: d.str(MAX_NAME_LEN)?,
+                body: d.str(MAX_BODY_LEN)?,
+            },
             EVENT_INVITE_CREATED => Self::InviteCreated {
                 contact: d.str(MAX_NAME_LEN)?,
                 invite: d.str(MAX_INVITE_LEN)?,
@@ -263,6 +339,9 @@ mod tests {
     #[test]
     fn commands_and_events_round_trip() {
         let cmds = [
+            UiCmd::Unlock {
+                passphrase: s("correct horse"),
+            },
             UiCmd::CreateInvite {
                 contact: s("alice"),
             },
@@ -280,6 +359,13 @@ mod tests {
             },
         ];
         let events = [
+            UiEvent::NeedPassphrase { new: true },
+            UiEvent::NeedPassphrase { new: false },
+            UiEvent::Unlocked,
+            UiEvent::Sent {
+                to: s("bob"),
+                body: s("earlier"),
+            },
             UiEvent::InviteCreated {
                 contact: s("alice"),
                 invite: s("purple1abc"),
@@ -320,6 +406,14 @@ mod tests {
     }
 
     #[test]
+    fn debug_never_shows_the_passphrase() {
+        let cmd = UiCmd::Unlock {
+            passphrase: s("hunter22"),
+        };
+        assert!(!format!("{cmd:?}").contains("hunter22"));
+    }
+
+    #[test]
     fn rejects_oversized_fields_on_write() {
         let long_name = UiCmd::CreateInvite {
             contact: "x".repeat(MAX_NAME_LEN + 1),
@@ -357,5 +451,7 @@ mod tests {
             );
         }
         assert!(UiEvent::read_from(&mut &frame(&[99])[..]).is_err());
+        assert!(UiEvent::read_from(&mut &frame(&[EVENT_NEED_PASSPHRASE, 2])[..]).is_err());
+        assert!(UiEvent::read_from(&mut &frame(&[EVENT_UNLOCKED, 0])[..]).is_err());
     }
 }

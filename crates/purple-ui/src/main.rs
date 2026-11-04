@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
-use purple_ipc::ui::UiEvent;
+use purple_ipc::ui::{UiCmd, UiEvent};
 use purple_ipc::{UI_CORE_FD, inherited_stream};
 use ratatui::DefaultTerminal;
+use zeroize::Zeroize;
 
 use app::{Model, Msg, update, view};
 
@@ -79,8 +80,12 @@ fn event_loop(
 }
 
 fn apply(model: &mut Model, msg: Msg, core: &mut UnixStream) -> io::Result<()> {
-    for cmd in update(model, msg) {
-        cmd.write_to(core)?;
+    for mut cmd in update(model, msg) {
+        let written = cmd.write_to(core);
+        if let UiCmd::Unlock { passphrase } = &mut cmd {
+            passphrase.zeroize();
+        }
+        written?;
     }
     Ok(())
 }

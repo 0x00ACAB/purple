@@ -1,6 +1,9 @@
-//! Process hardening applied at the start of every purple process.
+//! Process hardening applied at the start of every purple process, and protected memory
+//! for long-lived secrets ([`secret`]).
 //!
-//! Landlock, seccomp and `memfd_secret` key storage land here as later steps.
+//! Landlock and seccomp land here as later steps.
+
+pub mod secret;
 
 use std::io;
 

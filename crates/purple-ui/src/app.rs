@@ -3,6 +3,9 @@
 //!
 //! Everything shown that came from outside this process goes through [`sanitize`] first,
 //! so a peer can't send terminal escape sequences or bidi overrides.
+//!
+//! Until `purple-core` reports the vault unlocked, the input line takes the passphrase
+//! (masked), and nothing typed is parsed as a command.
 
 use std::collections::HashMap;
 
@@ -13,9 +16,12 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Lines kept in the system log.
 const SYSTEM_LOG_LINES: usize = 200;
+/// Shortest passphrase for a new vault. purple-core enforces the same limit.
+const MIN_PASSPHRASE_CHARS: usize = 8;
 
 const HELP: &[&str] = &[
     "/invite NAME          create an invite for a new contact called NAME",
@@ -43,9 +49,28 @@ struct ChatLine {
     body: String,
 }
 
+/// Where unlocking the vault stands.
+#[derive(Default)]
+enum Lock {
+    /// Waiting for purple-core to say whether a vault exists.
+    #[default]
+    Starting,
+    /// Asking for the passphrase. For a new vault, `first` holds the first entry until it's
+    /// been typed again.
+    Locked {
+        new: bool,
+        first: Option<Zeroizing<String>>,
+    },
+    /// Passphrase sent; waiting for purple-core.
+    Unlocking,
+    /// Unlocked: the input line takes messages and commands.
+    Open,
+}
+
 /// Everything the TUI shows.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Model {
+    lock: Lock,
     contacts: Vec<String>,
     selected: usize,
     chats: HashMap<String, Vec<ChatLine>>,
@@ -54,10 +79,25 @@ pub(crate) struct Model {
     quit: bool,
 }
 
+/// Debug without the input line or passphrase.
+impl std::fmt::Debug for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Model")
+            .field("contacts", &self.contacts)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        self.input.zeroize();
+    }
+}
+
 impl Model {
     pub(crate) fn new() -> Self {
         let mut model = Self::default();
-        model.log("purple: type /help for commands.");
+        model.log("purple: starting...");
         model
     }
 
@@ -130,7 +170,8 @@ fn on_key(model: &mut Model, key: KeyEvent) -> Vec<UiCmd> {
                 _ => 0,
             };
         }
-        KeyCode::Enter => return submit(model),
+        KeyCode::Enter if matches!(model.lock, Lock::Open) => return submit(model),
+        KeyCode::Enter => return submit_passphrase(model),
         _ => {}
     }
     Vec::new()
@@ -187,6 +228,60 @@ fn submit(model: &mut Model) -> Vec<UiCmd> {
     }
 }
 
+fn submit_passphrase(model: &mut Model) -> Vec<UiCmd> {
+    let typed = Zeroizing::new(std::mem::take(&mut model.input));
+    let unlock = |passphrase: &Zeroizing<String>| UiCmd::Unlock {
+        passphrase: passphrase.to_string(),
+    };
+    match std::mem::take(&mut model.lock) {
+        Lock::Locked { new: false, .. } => {
+            model.lock = Lock::Unlocking;
+            model.log("unlocking...");
+            vec![unlock(&typed)]
+        }
+        Lock::Locked {
+            new: true,
+            first: None,
+        } => {
+            if typed.chars().count() < MIN_PASSPHRASE_CHARS {
+                model.log("use at least 8 characters");
+                model.lock = Lock::Locked {
+                    new: true,
+                    first: None,
+                };
+            } else {
+                model.log("type it again to confirm:");
+                model.lock = Lock::Locked {
+                    new: true,
+                    first: Some(typed),
+                };
+            }
+            Vec::new()
+        }
+        Lock::Locked {
+            new: true,
+            first: Some(first),
+        } => {
+            if first == typed {
+                model.lock = Lock::Unlocking;
+                model.log("creating your vault...");
+                vec![unlock(&typed)]
+            } else {
+                model.log("passphrases didn't match; choose one again:");
+                model.lock = Lock::Locked {
+                    new: true,
+                    first: None,
+                };
+                Vec::new()
+            }
+        }
+        other @ (Lock::Starting | Lock::Unlocking | Lock::Open) => {
+            model.lock = other;
+            Vec::new()
+        }
+    }
+}
+
 fn send(model: &mut Model, body: &str) -> Vec<UiCmd> {
     let Some(contact) = model.selected_contact().map(str::to_owned) else {
         model.log("no contact selected: /invite or /accept someone first");
@@ -208,6 +303,26 @@ fn send(model: &mut Model, body: &str) -> Vec<UiCmd> {
 
 fn on_core_event(model: &mut Model, event: UiEvent) {
     match event {
+        UiEvent::NeedPassphrase { new } => {
+            model.lock = Lock::Locked { new, first: None };
+            model.log(if new {
+                "choose a passphrase for your new vault (at least 8 characters):"
+            } else {
+                "enter your passphrase:"
+            });
+        }
+        UiEvent::Unlocked => {
+            model.lock = Lock::Open;
+            model.log("unlocked. type /help for commands.");
+        }
+        UiEvent::Sent { to, body } => {
+            let to = sanitize(&to);
+            model.add_contact(to.clone());
+            model.chats.entry(to).or_default().push(ChatLine {
+                from: "me".to_owned(),
+                body: sanitize(&body),
+            });
+        }
         UiEvent::InviteCreated { contact, invite } => {
             model.log(format!(
                 "invite for {} created. Give them this whole line:",
@@ -305,8 +420,22 @@ pub(crate) fn view(model: &Model, frame: &mut Frame<'_>) {
     let log: Vec<Line<'_>> = model.system.iter().map(|l| Line::raw(l.as_str())).collect();
     frame.render_widget(bottom_aligned(log, system, " purple ".to_owned()), system);
 
+    let masked = || "*".repeat(model.input.chars().count());
+    let (input_title, shown) = match &model.lock {
+        Lock::Open => (" > ", model.input.clone()),
+        Lock::Locked {
+            new: true,
+            first: None,
+        } => (" new passphrase ", masked()),
+        Lock::Locked {
+            new: true,
+            first: Some(_),
+        } => (" repeat passphrase ", masked()),
+        Lock::Locked { new: false, .. } => (" passphrase ", masked()),
+        Lock::Starting | Lock::Unlocking => (" please wait ", String::new()),
+    };
     frame.render_widget(
-        Paragraph::new(model.input.as_str()).block(Block::bordered().title(" > ")),
+        Paragraph::new(shown).block(Block::bordered().title(input_title)),
         input,
     );
 }
@@ -336,11 +465,83 @@ mod tests {
         Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    /// A model that's past the passphrase prompt.
+    fn open_model() -> Model {
+        let mut m = Model::new();
+        update(&mut m, Msg::Core(UiEvent::Unlocked));
+        m
+    }
+
     fn type_line(model: &mut Model, text: &str) -> Vec<UiCmd> {
         for c in text.chars() {
             update(model, key(KeyCode::Char(c)));
         }
         update(model, key(KeyCode::Enter))
+    }
+
+    fn unlock_cmd(passphrase: &str) -> Vec<UiCmd> {
+        vec![UiCmd::Unlock {
+            passphrase: passphrase.into(),
+        }]
+    }
+
+    #[test]
+    fn new_vault_needs_a_long_enough_passphrase_typed_twice() {
+        let mut m = Model::new();
+        update(&mut m, Msg::Core(UiEvent::NeedPassphrase { new: true }));
+        assert!(type_line(&mut m, "short").is_empty());
+        assert!(type_line(&mut m, "correct horse").is_empty());
+        assert!(type_line(&mut m, "wrong horse!").is_empty());
+        assert!(type_line(&mut m, "correct horse").is_empty());
+        assert_eq!(
+            type_line(&mut m, "correct horse"),
+            unlock_cmd("correct horse")
+        );
+    }
+
+    #[test]
+    fn existing_vault_unlocks_and_nothing_is_a_command_until_then() {
+        let mut m = Model::new();
+        assert!(type_line(&mut m, "/invite bob").is_empty());
+        update(&mut m, Msg::Core(UiEvent::NeedPassphrase { new: false }));
+        assert_eq!(type_line(&mut m, "/invite bob"), unlock_cmd("/invite bob"));
+        update(
+            &mut m,
+            Msg::Core(UiEvent::Error {
+                message: "wrong passphrase".into(),
+            }),
+        );
+        update(&mut m, Msg::Core(UiEvent::NeedPassphrase { new: false }));
+        assert_eq!(type_line(&mut m, "right one"), unlock_cmd("right one"));
+        update(&mut m, Msg::Core(UiEvent::Unlocked));
+        assert_eq!(
+            type_line(&mut m, "/invite bob"),
+            [UiCmd::CreateInvite {
+                contact: "bob".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn replayed_history_shows_both_directions() {
+        let mut m = open_model();
+        update(
+            &mut m,
+            Msg::Core(UiEvent::Sent {
+                to: "bob".into(),
+                body: "earlier".into(),
+            }),
+        );
+        update(
+            &mut m,
+            Msg::Core(UiEvent::Message {
+                from: "bob".into(),
+                body: "reply".into(),
+            }),
+        );
+        let froms: Vec<_> = m.chats["bob"].iter().map(|l| l.from.as_str()).collect();
+        assert_eq!(froms, ["me", "bob"]);
+        assert_eq!(m.contacts, ["bob"]);
     }
 
     #[test]
@@ -354,7 +555,7 @@ mod tests {
 
     #[test]
     fn commands_become_core_requests() {
-        let mut m = Model::new();
+        let mut m = open_model();
         assert_eq!(
             type_line(&mut m, "/invite alice"),
             [UiCmd::CreateInvite {
@@ -375,7 +576,7 @@ mod tests {
 
     #[test]
     fn text_goes_to_the_selected_contact_only_once_connected() {
-        let mut m = Model::new();
+        let mut m = open_model();
         assert!(type_line(&mut m, "hello?").is_empty());
 
         update(
@@ -403,7 +604,7 @@ mod tests {
 
     #[test]
     fn incoming_text_is_sanitized() {
-        let mut m = Model::new();
+        let mut m = open_model();
         update(
             &mut m,
             Msg::Core(UiEvent::Message {
@@ -416,14 +617,14 @@ mod tests {
 
     #[test]
     fn wrapped_paste_is_joined() {
-        let mut m = Model::new();
+        let mut m = open_model();
         update(&mut m, Msg::Paste("/accept bob purple1ab\ncd\r\nef".into()));
         assert_eq!(m.input, "/accept bob purple1abcdef");
     }
 
     #[test]
     fn control_keys_never_reach_the_input() {
-        let mut m = Model::new();
+        let mut m = open_model();
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),

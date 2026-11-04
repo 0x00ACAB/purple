@@ -120,11 +120,20 @@ fn run() -> io::Result<bool> {
                 (core_ui.as_raw_fd(), CORE_UI_FD),
                 (core_net.as_raw_fd(), CORE_NET_FD),
             ];
+            // Inside the sandbox the data directory is mounted at a fixed path.
+            let data_arg = if sandboxed {
+                sandbox::CORE_DATA_DIR.to_owned()
+            } else {
+                data_dir
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("data directory path is not UTF-8"))?
+                    .to_owned()
+            };
             children.push(spawn(
                 &Profile::Core { data_dir },
                 bin_dir,
                 sandboxed,
-                &[],
+                &["--data-dir", &data_arg],
                 &core_fds,
                 Background(log.as_ref()),
             )?);

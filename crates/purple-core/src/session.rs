@@ -10,16 +10,18 @@ use std::time::SystemTime;
 use futures_executor::block_on;
 use libsignal_protocol::kem::KeyType;
 use libsignal_protocol::{
-    CiphertextMessage, DeviceId, GenericSignedPreKey, IdentityKeyPair, IdentityKeyStore,
-    InMemSignalProtocolStore, KeyPair, KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore,
-    PreKeyBundle, PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore, ProtocolAddress,
-    SignalMessage, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
-    Timestamp, message_decrypt, message_encrypt, process_prekey_bundle,
+    CiphertextMessage, DeviceId, GenericSignedPreKey, IdentityKeyPair, KeyPair, KyberPreKeyId,
+    KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeySignalMessage,
+    PreKeyStore, ProtocolAddress, SignalMessage, SignalProtocolError, SignedPreKeyId,
+    SignedPreKeyRecord, SignedPreKeyStore, Timestamp, message_decrypt, message_encrypt,
+    process_prekey_bundle,
 };
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
+use crate::codec::{Reader, Writer};
 use crate::invite::{Invite, encode_bundle};
+use crate::signal_store::Stores;
 
 /// libsignal puts the registration ID in the clear inside `PreKey` messages, and Signal uses
 /// a random one per install. A constant leaks nothing about who sent the message.
@@ -77,7 +79,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// One user's identity, prekeys and sessions with their contacts.
 pub struct Account {
-    store: InMemSignalProtocolStore,
+    stores: Stores,
     local: ProtocolAddress,
     next_prekey_id: u32,
 }
@@ -96,7 +98,7 @@ impl Account {
     pub fn generate() -> Result<Self> {
         let identity = IdentityKeyPair::generate(&mut rng());
         Ok(Self {
-            store: InMemSignalProtocolStore::new(identity, REGISTRATION_ID)?,
+            stores: Stores::new(identity),
             local: address(LOCAL_NAME)?,
             next_prekey_id: 1,
         })
@@ -110,7 +112,7 @@ impl Account {
     pub fn new_prekey_bundle(&mut self) -> Result<PreKeyBundle> {
         let mut rng = rng();
         let id = self.take_prekey_id()?;
-        let identity = block_on(self.store.get_identity_key_pair())?;
+        let identity = *self.stores.identity();
 
         let one_time = KeyPair::generate(&mut rng);
         let signed = KeyPair::generate(&mut rng);
@@ -124,11 +126,11 @@ impl Account {
             identity.private_key(),
         )?;
 
-        block_on(self.store.save_pre_key(
+        block_on(self.stores.pre_keys.save_pre_key(
             PreKeyId::from(id),
             &PreKeyRecord::new(PreKeyId::from(id), &one_time),
         ))?;
-        block_on(self.store.save_signed_pre_key(
+        block_on(self.stores.signed_pre_keys.save_signed_pre_key(
             SignedPreKeyId::from(id),
             &SignedPreKeyRecord::new(
                 SignedPreKeyId::from(id),
@@ -138,7 +140,8 @@ impl Account {
             ),
         ))?;
         block_on(
-            self.store
+            self.stores
+                .kyber_pre_keys
                 .save_kyber_pre_key(KyberPreKeyId::from(id), &kyber),
         )?;
 
@@ -163,7 +166,7 @@ impl Account {
     /// Fails if generating the prekeys fails.
     pub fn create_invite(&mut self) -> Result<(Invite, Vec<u8>)> {
         let bundle = self.new_prekey_bundle()?;
-        let identity = *block_on(self.store.get_identity_key_pair())?.identity_key();
+        let identity = *self.stores.identity().identity_key();
         Ok((Invite::create(identity)?, encode_bundle(&bundle)?))
     }
 
@@ -188,8 +191,8 @@ impl Account {
         block_on(process_prekey_bundle(
             &peer,
             &self.local,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
+            &mut self.stores.sessions,
+            &mut self.stores.identities,
             bundle,
             SystemTime::now(),
             &mut rng(),
@@ -207,8 +210,8 @@ impl Account {
             plaintext,
             &peer,
             &self.local,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
+            &mut self.stores.sessions,
+            &mut self.stores.identities,
             SystemTime::now(),
             &mut rng(),
         ))?;
@@ -249,11 +252,11 @@ impl Account {
             &message,
             &peer,
             &self.local,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
-            &mut self.store.pre_key_store,
-            &self.store.signed_pre_key_store,
-            &mut self.store.kyber_pre_key_store,
+            &mut self.stores.sessions,
+            &mut self.stores.identities,
+            &mut self.stores.pre_keys,
+            &self.stores.signed_pre_keys,
+            &mut self.stores.kyber_pre_keys,
             &mut rng(),
         ))?;
         Ok(plaintext)
@@ -261,11 +264,29 @@ impl Account {
 
     #[cfg(test)]
     fn snapshot(&self) -> Self {
-        Self {
-            store: self.store.clone(),
-            local: self.local.clone(),
-            next_prekey_id: self.next_prekey_id,
-        }
+        let mut w = Writer::default();
+        self.encode(&mut w).unwrap();
+        let bytes = w.finish();
+        let mut r = Reader::new(&bytes);
+        let copy = Self::decode(&mut r).unwrap();
+        r.finish().unwrap();
+        copy
+    }
+
+    /// Write the account's whole state (identity, prekeys, sessions) into a snapshot.
+    pub(crate) fn encode(&self, w: &mut Writer) -> Result<()> {
+        w.u32(self.next_prekey_id);
+        self.stores.encode(w)
+    }
+
+    /// Restore an account written by [`Self::encode`].
+    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        let next_prekey_id = r.u32()?;
+        Ok(Self {
+            stores: Stores::decode(r)?,
+            local: address(LOCAL_NAME)?,
+            next_prekey_id,
+        })
     }
 
     fn take_prekey_id(&mut self) -> Result<u32> {
@@ -442,9 +463,7 @@ mod tests {
         let other = Account::generate().unwrap();
         let bundle = bob.new_prekey_bundle().unwrap();
         // Bob's prekeys presented under someone else's identity: the signatures don't match.
-        let other_identity = *block_on(other.store.get_identity_key_pair())
-            .unwrap()
-            .identity_key();
+        let other_identity = *other.stores.identity().identity_key();
         let forged = bundle
             .modify(|content| content.identity_key = Some(other_identity))
             .unwrap();

@@ -12,7 +12,7 @@ const APP_DIR: &str = "/app";
 /// Where `purple-net` keeps its state inside its sandbox.
 const NET_STATE_DIR: &str = "/state";
 /// Where `purple-core` keeps its database inside its sandbox.
-const CORE_DATA_DIR: &str = "/data";
+pub(crate) const CORE_DATA_DIR: &str = "/data";
 
 const MAX_PASSED_FDS: usize = 4;
 
