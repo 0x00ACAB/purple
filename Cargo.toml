@@ -11,7 +11,11 @@ license = "AGPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
+futures-executor = "0.3"
 libc = "0.2"
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+# Must match the rand major version libsignal-protocol uses.
+rand = "0.9"
 purple-harden = { path = "crates/purple-harden" }
 purple-ipc = { path = "crates/purple-ipc" }
 

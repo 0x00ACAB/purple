@@ -1,7 +1,11 @@
+//! purple-core library: sessions and packet padding.
+//!
 //! Padding of message payloads into fixed-size packets.
 //!
 //! Until libsignal lands (build step 2), packets carry padded plaintext. After that, the
 //! padded plaintext is encrypted and the ciphertext fills the packet.
+
+pub mod session;
 
 use std::io;
 
