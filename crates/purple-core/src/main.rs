@@ -4,7 +4,8 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
-use purple_core::{pad, unpad};
+use purple_core::fragment::{Reassembler, split};
+use purple_core::session::Account;
 use purple_ipc::{CORE_NET_FD, CORE_UI_FD, MAILBOX_ID_LEN, MailboxId, NetMsg, inherited_stream};
 
 fn main() -> ExitCode {
@@ -35,24 +36,56 @@ fn run() -> io::Result<()> {
     Ok(())
 }
 
-/// Send one packet to a mailbox through purple-net and fetch it back.
+/// Two local accounts run a PQXDH handshake and exchange a reply, with every message
+/// fragmented and carried through purple-net.
 fn self_test(net: &mut UnixStream) -> io::Result<()> {
-    let mailbox = MailboxId([0x42; MAILBOX_ID_LEN]);
-    let message = b"purple-core self-test";
-    NetMsg::Send {
-        mailbox,
-        packet: pad(message)?,
-    }
-    .write_to(net)?;
-    NetMsg::Fetch { mailbox }.write_to(net)?;
+    let to_bob = MailboxId([0xB0; MAILBOX_ID_LEN]);
+    let to_alice = MailboxId([0xA1; MAILBOX_ID_LEN]);
+    let mut alice = Account::generate().map_err(io::Error::other)?;
+    let mut bob = Account::generate().map_err(io::Error::other)?;
+    let bundle = bob.new_prekey_bundle().map_err(io::Error::other)?;
+    alice
+        .start_session("bob", &bundle)
+        .map_err(io::Error::other)?;
 
-    let mut received = Vec::new();
+    let hello = alice
+        .encrypt("bob", b"hello bob")
+        .map_err(io::Error::other)?;
+    send(net, to_bob, &hello)?;
+    let at_bob = receive(net, to_bob)?;
+    expect(bob.decrypt("alice", &at_bob).map_err(io::Error::other)? == b"hello bob")?;
+
+    let reply = bob
+        .encrypt("alice", b"hello alice")
+        .map_err(io::Error::other)?;
+    send(net, to_alice, &reply)?;
+    let at_alice = receive(net, to_alice)?;
+    expect(alice.decrypt("bob", &at_alice).map_err(io::Error::other)? == b"hello alice")?;
+
+    eprintln!("purple-core: self-test ok (PQXDH handshake and reply through purple-net)");
+    Ok(())
+}
+
+fn send(net: &mut UnixStream, mailbox: MailboxId, message: &[u8]) -> io::Result<()> {
+    for packet in split(message)? {
+        NetMsg::Send { mailbox, packet }.write_to(net)?;
+    }
+    Ok(())
+}
+
+/// Fetch `mailbox` and return the one message it should hold.
+fn receive(net: &mut UnixStream, mailbox: MailboxId) -> io::Result<Vec<u8>> {
+    NetMsg::Fetch { mailbox }.write_to(net)?;
+    let mut reassembler = Reassembler::default();
+    let mut messages = Vec::new();
     loop {
         match NetMsg::read_from(net)? {
             Some(NetMsg::Delivered {
                 mailbox: from,
                 packet,
-            }) if from == mailbox => received.push(packet),
+            }) if from == mailbox => {
+                messages.extend(reassembler.push(&packet)?);
+            }
             Some(NetMsg::FetchDone { mailbox: from }) if from == mailbox => break,
             Some(_) => {
                 return Err(io::Error::new(
@@ -68,14 +101,20 @@ fn self_test(net: &mut UnixStream) -> io::Result<()> {
             }
         }
     }
-
-    match received.as_slice() {
-        [packet] if unpad(packet)? == message => {
-            eprintln!("purple-core: round trip through purple-net ok");
-            Ok(())
-        }
-        _ => Err(io::Error::other(
-            "self-test packet did not come back intact",
+    match <[Vec<u8>; 1]>::try_from(messages) {
+        Ok([message]) => Ok(message),
+        Err(_) => Err(io::Error::other(
+            "expected exactly one message in the mailbox",
         )),
+    }
+}
+
+fn expect(ok: bool) -> io::Result<()> {
+    if ok {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "self-test message did not come back intact",
+        ))
     }
 }
