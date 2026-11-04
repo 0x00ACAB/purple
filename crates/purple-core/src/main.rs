@@ -5,6 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 use purple_core::fragment::{Reassembler, split};
+use purple_core::invite::Invite;
 use purple_core::session::Account;
 use purple_ipc::{CORE_NET_FD, CORE_UI_FD, MAILBOX_ID_LEN, MailboxId, NetMsg, inherited_stream};
 
@@ -36,17 +37,30 @@ fn run() -> io::Result<()> {
     Ok(())
 }
 
-/// Two local accounts run a PQXDH handshake and exchange a reply, with every message
+/// Two local accounts connect through an invite and exchange messages, with every message
 /// fragmented and carried through purple-net.
 fn self_test(net: &mut UnixStream) -> io::Result<()> {
+    let bundle_box = MailboxId([0xB1; MAILBOX_ID_LEN]);
     let to_bob = MailboxId([0xB0; MAILBOX_ID_LEN]);
+    // Until message contents carry it, Alice's reply mailbox is fixed here.
     let to_alice = MailboxId([0xA1; MAILBOX_ID_LEN]);
     let mut alice = Account::generate().map_err(io::Error::other)?;
     let mut bob = Account::generate().map_err(io::Error::other)?;
-    let bundle = bob.new_prekey_bundle().map_err(io::Error::other)?;
-    alice
-        .start_session("bob", &bundle)
+
+    // Bob shows a QR code and stores his sealed bundle at the provider.
+    let (invite, sealed) = bob
+        .create_invite(bundle_box, to_bob)
         .map_err(io::Error::other)?;
+    send(net, bundle_box, &sealed)?;
+    let qr = invite.encode();
+
+    // Alice scans it, fetches the bundle and starts the session.
+    let scanned = Invite::decode(&qr).map_err(io::Error::other)?;
+    let fetched = receive(net, scanned.bundle_mailbox())?;
+    let first = alice
+        .accept_invite("bob", &scanned, &fetched)
+        .map_err(io::Error::other)?;
+    expect(first == to_bob)?;
 
     let hello = alice
         .encrypt("bob", b"hello bob")
@@ -62,7 +76,7 @@ fn self_test(net: &mut UnixStream) -> io::Result<()> {
     let at_alice = receive(net, to_alice)?;
     expect(alice.decrypt("bob", &at_alice).map_err(io::Error::other)? == b"hello alice")?;
 
-    eprintln!("purple-core: self-test ok (PQXDH handshake and reply through purple-net)");
+    eprintln!("purple-core: self-test ok (invite, PQXDH handshake and reply through purple-net)");
     Ok(())
 }
 

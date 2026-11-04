@@ -8,9 +8,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+chacha20poly1305.workspace = true
 futures-executor.workspace = true
 libsignal-protocol.workspace = true
 rand.workspace = true
+zeroize.workspace = true
 purple-harden.workspace = true
 purple-ipc.workspace = true
 

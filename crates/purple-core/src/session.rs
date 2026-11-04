@@ -16,12 +16,15 @@ use libsignal_protocol::{
     SignalMessage, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
     Timestamp, message_decrypt, message_encrypt, process_prekey_bundle,
 };
+use purple_ipc::MailboxId;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
+use crate::invite::Invite;
+
 /// libsignal puts the registration ID in the clear inside `PreKey` messages, and Signal uses
 /// a random one per install. A constant leaks nothing about who sent the message.
-const REGISTRATION_ID: u32 = 1;
+pub(crate) const REGISTRATION_ID: u32 = 1;
 /// purple has one device per account. Like the registration ID, a constant leaks nothing.
 const DEVICE_ID: u8 = 1;
 /// Name of the local account in libsignal's stores. Peers are named by the caller.
@@ -142,6 +145,39 @@ impl Account {
         )?)
     }
 
+    /// Create a one-time invite. Returns the invite for the QR code or link, and the
+    /// encrypted bundle to store at `bundle_mailbox`. The accepting side sends its first
+    /// message to `first_mailbox`.
+    ///
+    /// # Errors
+    /// Fails if generating the prekeys or sealing the bundle fails.
+    pub fn create_invite(
+        &mut self,
+        bundle_mailbox: MailboxId,
+        first_mailbox: MailboxId,
+    ) -> Result<(Invite, Vec<u8>)> {
+        let bundle = self.new_prekey_bundle()?;
+        let identity = *block_on(self.store.get_identity_key_pair())?.identity_key();
+        Invite::create(identity, bundle_mailbox, first_mailbox, &bundle)
+    }
+
+    /// Accept `invite` using the sealed bundle fetched from its mailbox, and start a session
+    /// with `peer`. Returns the mailbox to send the first message to.
+    ///
+    /// # Errors
+    /// Fails if the bundle doesn't decrypt, or its signatures don't match the invite's
+    /// identity key.
+    pub fn accept_invite(
+        &mut self,
+        peer: &str,
+        invite: &Invite,
+        sealed_bundle: &[u8],
+    ) -> Result<MailboxId> {
+        let (bundle, first_mailbox) = invite.open(sealed_bundle)?;
+        self.start_session(peer, &bundle)?;
+        Ok(first_mailbox)
+    }
+
     /// Start a session with `peer` from the bundle in their invite. The first message
     /// encrypted to `peer` afterwards carries the PQXDH handshake.
     ///
@@ -248,7 +284,7 @@ fn rng() -> impl rand::CryptoRng {
     OsRng.unwrap_err()
 }
 
-fn device_id() -> Result<DeviceId> {
+pub(crate) fn device_id() -> Result<DeviceId> {
     DeviceId::new(DEVICE_ID).map_err(|_| Error::Malformed("invalid device ID"))
 }
 
