@@ -118,12 +118,12 @@ impl Invite {
 
     /// Queue where the inviter stores the prekey bundle.
     pub(crate) fn bundle_queue(&self) -> Result<Queue> {
-        QueueSecret::derive(self.key.as_slice(), b"bundle")?.queue(0)
+        QueueSecret::derive(self.key.as_slice(), b"bundle")?.queue()
     }
 
     /// Queue where the accepter sends the first message.
     pub(crate) fn intro_queue(&self) -> Result<Queue> {
-        QueueSecret::derive(self.key.as_slice(), b"intro")?.queue(0)
+        QueueSecret::derive(self.key.as_slice(), b"intro")?.queue()
     }
 
     /// Rebuild a fetched bundle under this invite's identity key. Its signatures are
@@ -267,8 +267,8 @@ mod tests {
         let (invite, bundle) = bob.create_invite().unwrap();
         let scanned = Invite::decode(&invite.encode()).unwrap();
         assert_eq!(
-            scanned.bundle_queue().unwrap().mailbox(),
-            invite.bundle_queue().unwrap().mailbox()
+            scanned.bundle_queue().unwrap().stream(),
+            invite.bundle_queue().unwrap().stream()
         );
 
         let mut alice = Account::generate().unwrap();
@@ -281,8 +281,8 @@ mod tests {
     fn bundle_and_intro_queues_differ() {
         let (invite, _) = Account::generate().unwrap().create_invite().unwrap();
         assert_ne!(
-            invite.bundle_queue().unwrap().mailbox(),
-            invite.intro_queue().unwrap().mailbox()
+            invite.bundle_queue().unwrap().stream(),
+            invite.intro_queue().unwrap().stream()
         );
     }
 

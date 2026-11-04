@@ -1,8 +1,8 @@
 //! Cover traffic: one packet per tick, with ticks at exponentially distributed intervals
 //! (a Poisson process, as in Loopix).
 //!
-//! A tick sends the oldest queued real packet if there is one, otherwise a cover packet:
-//! random bytes to a random mailbox. Real packets are sealed and look random too, so an
+//! A tick writes the oldest queued real packet if there is one, otherwise a cover packet:
+//! random bytes into a random box. Real packets are sealed and look random too, so an
 //! observer sees the same stream whether or not the user is talking; sending a message
 //! only adds queueing delay.
 
@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
-use purple_ipc::{MAILBOX_ID_LEN, MailboxId, PACKET_LEN, Packet};
+use purple_ipc::{BoxRef, PACKET_LEN, Packet, SEED_LEN, StreamSeed};
 use rand::{Rng, RngCore};
 
 use crate::Transport;
@@ -34,7 +34,7 @@ pub enum Sent {
 #[derive(Debug)]
 pub struct Scheduler<T> {
     transport: T,
-    queue: VecDeque<(MailboxId, Packet)>,
+    queue: VecDeque<(BoxRef, Packet)>,
     mean: Duration,
     next_tick: Instant,
 }
@@ -52,8 +52,8 @@ impl<T: Transport> Scheduler<T> {
     }
 
     /// Queue a real packet for the next free tick.
-    pub fn enqueue(&mut self, mailbox: MailboxId, packet: Packet) {
-        self.queue.push_back((mailbox, packet));
+    pub fn enqueue(&mut self, at: BoxRef, packet: Packet) {
+        self.queue.push_back((at, packet));
     }
 
     /// Real packets waiting to be sent.
@@ -73,12 +73,12 @@ impl<T: Transport> Scheduler<T> {
     /// # Errors
     /// Fails if the transport fails. A real packet that fails to send is dropped.
     pub fn tick(&mut self) -> io::Result<Sent> {
-        let sent = if let Some((mailbox, packet)) = self.queue.pop_front() {
-            self.transport.send(&mailbox, packet)?;
+        let sent = if let Some((at, packet)) = self.queue.pop_front() {
+            self.transport.write(&at, packet)?;
             Sent::Real
         } else {
-            let (mailbox, packet) = cover_packet()?;
-            self.transport.send(&mailbox, packet)?;
+            let (at, packet) = cover_packet()?;
+            self.transport.write(&at, packet)?;
             Sent::Cover
         };
         let now = Instant::now();
@@ -86,13 +86,13 @@ impl<T: Transport> Scheduler<T> {
         Ok(sent)
     }
 
-    /// Fetch a mailbox right away. Fetches aren't scheduled here: `purple-core` already
-    /// polls on a fixed clock with padded rounds.
+    /// Read a box right away. Reads aren't scheduled here: `purple-core` already polls on
+    /// a fixed clock with padded rounds.
     ///
     /// # Errors
     /// Fails if the transport fails.
-    pub fn fetch(&mut self, mailbox: &MailboxId) -> io::Result<Vec<Packet>> {
-        self.transport.fetch(mailbox)
+    pub fn read(&mut self, at: &BoxRef) -> io::Result<Option<Packet>> {
+        self.transport.read(at)
     }
 }
 
@@ -106,32 +106,43 @@ pub fn sample_delay(mean: Duration) -> Duration {
     mean.mul_f64(factor).max(MIN_DELAY)
 }
 
-/// Random bytes to a random mailbox. Indistinguishable from a sealed real packet.
-fn cover_packet() -> io::Result<(MailboxId, Packet)> {
+/// Random bytes into a random box. Indistinguishable from a sealed real packet.
+fn cover_packet() -> io::Result<(BoxRef, Packet)> {
     let mut rng = rand::rng();
-    let mut mailbox = [0u8; MAILBOX_ID_LEN];
-    rng.fill_bytes(&mut mailbox);
+    let mut seed = [0u8; SEED_LEN];
+    rng.fill_bytes(&mut seed);
+    let at = BoxRef {
+        stream: StreamSeed(seed),
+        index: rng.random(),
+    };
     let mut bytes = vec![0u8; PACKET_LEN];
     rng.fill_bytes(&mut bytes);
-    Ok((MailboxId(mailbox), Packet::from_slice(&bytes)?))
+    Ok((at, Packet::from_slice(&bytes)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Records every packet sent.
+    /// Records every packet written.
     #[derive(Default)]
-    struct Recorder(Vec<(MailboxId, Packet)>);
+    struct Recorder(Vec<(BoxRef, Packet)>);
 
     impl Transport for Recorder {
-        fn send(&mut self, mailbox: &MailboxId, packet: Packet) -> io::Result<()> {
-            self.0.push((*mailbox, packet));
+        fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()> {
+            self.0.push((*at, packet));
             Ok(())
         }
 
-        fn fetch(&mut self, _: &MailboxId) -> io::Result<Vec<Packet>> {
-            Ok(Vec::new())
+        fn read(&mut self, _: &BoxRef) -> io::Result<Option<Packet>> {
+            Ok(None)
+        }
+    }
+
+    fn at(seed: u8) -> BoxRef {
+        BoxRef {
+            stream: StreamSeed([seed; SEED_LEN]),
+            index: 0,
         }
     }
 
@@ -142,15 +153,15 @@ mod tests {
     #[test]
     fn every_tick_sends_exactly_one_packet_real_ones_first_in_order() {
         let mut s = Scheduler::new(Recorder::default(), Duration::from_secs(1));
-        s.enqueue(MailboxId([1; 32]), packet(1));
-        s.enqueue(MailboxId([2; 32]), packet(2));
+        s.enqueue(at(1), packet(1));
+        s.enqueue(at(2), packet(2));
         let sent: Vec<Sent> = (0..4).map(|_| s.tick().unwrap()).collect();
         assert_eq!(sent, [Sent::Real, Sent::Real, Sent::Cover, Sent::Cover]);
 
         let log = &s.transport.0;
         assert_eq!(log.len(), 4);
-        assert_eq!(log[0], (MailboxId([1; 32]), packet(1)));
-        assert_eq!(log[1], (MailboxId([2; 32]), packet(2)));
+        assert_eq!(log[0], (at(1), packet(1)));
+        assert_eq!(log[1], (at(2), packet(2)));
         assert_eq!(s.queued(), 0);
     }
 

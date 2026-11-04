@@ -1,71 +1,128 @@
-//! Transports that carry packets between mailboxes, the request loop that serves them to
-//! `purple-core` (or, in `purple-devprovider`, to other purple instances), and the
-//! cover-traffic [`scheduler`].
+//! Transports that store and fetch boxes, plus the cover-traffic [`scheduler`].
+//!
+//! purple's transport abstraction is a box store: every packet goes into its own
+//! write-once box, addressed by a stream seed and an index. Pigeonhole provides this
+//! natively; anything else (the dev provider here, or a Nym-based provider) stores one
+//! packet per derived box address. A transport turns (seed, index) into an address with a
+//! one-way function, so whoever stores the boxes can't tell which ones form a stream.
 
 pub mod scheduler;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use purple_ipc::{MailboxId, NetMsg, Packet};
+use hkdf::Hkdf;
+use purple_ipc::{BoxRef, PACKET_LEN, Packet, read_frame, write_frame};
+use sha2::Sha256;
 
-/// Moves fixed-size packets to and from mailboxes. The mixnet client implements this; so
-/// does [`FakeTransport`] for tests and local development.
+/// Stores and fetches write-once boxes.
 pub trait Transport {
-    /// Queue `packet` for delivery to `mailbox`.
+    /// Write `packet` into box `at`. Writing a box that already exists leaves it as it is.
     ///
     /// # Errors
     /// Fails if the packet can't be handed to the network.
-    fn send(&mut self, mailbox: &MailboxId, packet: Packet) -> io::Result<()>;
+    fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()>;
 
-    /// Take every packet waiting in `mailbox`.
+    /// Read box `at`. `None` if it hasn't been written or has expired.
     ///
     /// # Errors
-    /// Fails if the mailbox can't be reached.
-    fn fetch(&mut self, mailbox: &MailboxId) -> io::Result<Vec<Packet>>;
+    /// Fails if the network can't be reached.
+    fn read(&mut self, at: &BoxRef) -> io::Result<Option<Packet>>;
 }
 
-/// In-memory stand-in for the mixnet. Clones share one network, so two clones behave like
-/// two clients talking through the same providers.
-#[derive(Clone, Debug, Default)]
-pub struct FakeTransport {
-    network: Arc<Mutex<FakeNetwork>>,
-}
+/// Where a box lives at a provider. Unlinkable to its stream without the seed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BoxAddr(pub [u8; 32]);
 
-#[derive(Debug, Default)]
-struct FakeNetwork {
-    mailboxes: HashMap<MailboxId, VecDeque<(Instant, Packet)>>,
-    retention: Option<Duration>,
-    sends: u64,
-}
-
-/// How many sends between sweeps for expired packets.
-const SWEEP_EVERY: u64 = 1024;
-
-impl FakeTransport {
-    /// A network that drops packets older than `retention`. Cover traffic goes to random
-    /// mailboxes nobody fetches, so without a limit those packets pile up forever.
-    #[must_use]
-    pub fn with_retention(retention: Duration) -> Self {
-        Self {
-            network: Arc::new(Mutex::new(FakeNetwork {
-                retention: Some(retention),
-                ..FakeNetwork::default()
-            })),
-        }
+impl std::fmt::Debug for BoxAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BoxAddr(..)")
     }
 }
 
-impl FakeNetwork {
-    fn sweep(&mut self, now: Instant) {
-        let retention = self.retention;
-        self.mailboxes.retain(|_, packets| {
-            packets.retain(|(stored, _)| !expired(retention, *stored, now));
-            !packets.is_empty()
-        });
+/// The provider address of box `at`: HKDF keyed by the stream seed, over the index.
+#[must_use]
+pub fn box_address(at: &BoxRef) -> BoxAddr {
+    let mut addr = [0u8; 32];
+    // A 32-byte output is always within HKDF-SHA256's limit, so this can't fail.
+    Hkdf::<Sha256>::new(Some(b"purple box address v1"), &at.stream.0)
+        .expand(&at.index.to_be_bytes(), &mut addr)
+        .ok();
+    BoxAddr(addr)
+}
+
+/// Write-once boxes in memory, with optional expiry. Clones share one store. Used by the
+/// in-memory network and by `purple-devprovider`.
+#[derive(Clone, Debug, Default)]
+pub struct BoxStore {
+    inner: Arc<Mutex<StoreInner>>,
+}
+
+#[derive(Debug, Default)]
+struct StoreInner {
+    boxes: HashMap<BoxAddr, (Instant, Packet)>,
+    retention: Option<Duration>,
+    writes: u64,
+}
+
+/// How many writes between sweeps for expired boxes.
+const SWEEP_EVERY: u64 = 1024;
+
+impl BoxStore {
+    /// A store that forgets boxes older than `retention`. Cover traffic writes boxes nobody
+    /// reads, so without a limit they pile up forever.
+    #[must_use]
+    pub fn with_retention(retention: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(StoreInner {
+                retention: Some(retention),
+                ..StoreInner::default()
+            })),
+        }
+    }
+
+    /// Store `packet` at `addr` unless something is already there.
+    ///
+    /// # Errors
+    /// Fails only if the lock is poisoned.
+    pub fn put(&self, addr: BoxAddr, packet: Packet) -> io::Result<()> {
+        let mut inner = self.inner.lock().map_err(poisoned)?;
+        let now = Instant::now();
+        let retention = inner.retention;
+        let occupied = inner
+            .boxes
+            .get(&addr)
+            .is_some_and(|(stored, _)| !expired(retention, *stored, now));
+        if !occupied {
+            inner.boxes.insert(addr, (now, packet));
+        }
+        inner.writes = inner.writes.wrapping_add(1);
+        if inner.writes.is_multiple_of(SWEEP_EVERY) {
+            inner
+                .boxes
+                .retain(|_, (stored, _)| !expired(retention, *stored, now));
+        }
+        drop(inner);
+        Ok(())
+    }
+
+    /// The packet at `addr`, if it's there and hasn't expired.
+    ///
+    /// # Errors
+    /// Fails only if the lock is poisoned.
+    pub fn get(&self, addr: &BoxAddr) -> io::Result<Option<Packet>> {
+        let inner = self.inner.lock().map_err(poisoned)?;
+        let now = Instant::now();
+        let found = inner
+            .boxes
+            .get(addr)
+            .filter(|(stored, _)| !expired(inner.retention, *stored, now))
+            .map(|(_, packet)| packet.clone());
+        drop(inner);
+        Ok(found)
     }
 }
 
@@ -73,64 +130,145 @@ fn expired(retention: Option<Duration>, stored: Instant, now: Instant) -> bool {
     retention.is_some_and(|retention| now.saturating_duration_since(stored) > retention)
 }
 
-impl Transport for FakeTransport {
-    fn send(&mut self, mailbox: &MailboxId, packet: Packet) -> io::Result<()> {
-        let mut network = self.network.lock().map_err(poisoned)?;
-        let now = Instant::now();
-        network
-            .mailboxes
-            .entry(*mailbox)
-            .or_default()
-            .push_back((now, packet));
-        network.sends = network.sends.wrapping_add(1);
-        if network.sends.is_multiple_of(SWEEP_EVERY) {
-            network.sweep(now);
-        }
-        drop(network);
-        Ok(())
-    }
+/// In-memory stand-in for the network: a [`BoxStore`] addressed through [`box_address`].
+/// Clones share one network, so two clones behave like two clients of the same providers.
+#[derive(Clone, Debug, Default)]
+pub struct FakeTransport {
+    store: BoxStore,
+}
 
-    fn fetch(&mut self, mailbox: &MailboxId) -> io::Result<Vec<Packet>> {
-        let mut network = self.network.lock().map_err(poisoned)?;
-        let now = Instant::now();
-        let stored = network.mailboxes.remove(mailbox).unwrap_or_default();
-        let retention = network.retention;
-        drop(network);
-        Ok(stored
-            .into_iter()
-            .filter(|(at, _)| !expired(retention, *at, now))
-            .map(|(_, packet)| packet)
-            .collect())
+impl FakeTransport {
+    /// A network whose boxes expire after `retention`.
+    #[must_use]
+    pub fn with_retention(retention: Duration) -> Self {
+        Self {
+            store: BoxStore::with_retention(retention),
+        }
     }
 }
 
-/// Answer [`NetMsg`] requests from `peer` with `transport` until `peer` closes the stream.
+impl Transport for FakeTransport {
+    fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()> {
+        self.store.put(box_address(at), packet)
+    }
+
+    fn read(&mut self, at: &BoxRef) -> io::Result<Option<Packet>> {
+        self.store.get(&box_address(at))
+    }
+}
+
+/// Messages between `purple-net` and `purple-devprovider`. Only box addresses cross this
+/// link, never stream seeds or indices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderMsg {
+    /// Store a packet.
+    Put {
+        /// Where.
+        addr: BoxAddr,
+        /// What.
+        packet: Packet,
+    },
+    /// Ask for a box. Answered by `Found` or `Empty`.
+    Get {
+        /// Which box.
+        addr: BoxAddr,
+    },
+    /// The box holds this packet.
+    Found {
+        /// Which box.
+        addr: BoxAddr,
+        /// Its contents.
+        packet: Packet,
+    },
+    /// The box is empty or expired.
+    Empty {
+        /// Which box.
+        addr: BoxAddr,
+    },
+}
+
+const MAX_PROVIDER_FRAME: usize = 1 + 32 + PACKET_LEN;
+const TAG_PUT: u8 = 1;
+const TAG_GET: u8 = 2;
+const TAG_FOUND: u8 = 3;
+const TAG_EMPTY: u8 = 4;
+
+impl ProviderMsg {
+    /// Write as one frame: tag, address, then the packet if there is one.
+    ///
+    /// # Errors
+    /// Fails if the write fails.
+    pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
+        let (tag, addr, packet) = match self {
+            Self::Put { addr, packet } => (TAG_PUT, addr, Some(packet)),
+            Self::Get { addr } => (TAG_GET, addr, None),
+            Self::Found { addr, packet } => (TAG_FOUND, addr, Some(packet)),
+            Self::Empty { addr } => (TAG_EMPTY, addr, None),
+        };
+        let mut out = Vec::with_capacity(MAX_PROVIDER_FRAME);
+        out.push(tag);
+        out.extend_from_slice(&addr.0);
+        if let Some(packet) = packet {
+            out.extend_from_slice(packet.as_bytes());
+        }
+        write_frame(w, &out, MAX_PROVIDER_FRAME)
+    }
+
+    /// Read one message. `None` on a clean EOF between frames.
+    ///
+    /// # Errors
+    /// Fails on a read error or a malformed message.
+    pub fn read_from(r: &mut impl Read) -> io::Result<Option<Self>> {
+        let Some(frame) = read_frame(r, MAX_PROVIDER_FRAME)? else {
+            return Ok(None);
+        };
+        let (&tag, rest) = frame
+            .split_first()
+            .ok_or_else(|| invalid("empty message"))?;
+        let (addr, body) = rest
+            .split_first_chunk::<32>()
+            .ok_or_else(|| invalid("message too short"))?;
+        let addr = BoxAddr(*addr);
+        let msg = match tag {
+            TAG_PUT => Self::Put {
+                addr,
+                packet: Packet::from_slice(body)?,
+            },
+            TAG_FOUND => Self::Found {
+                addr,
+                packet: Packet::from_slice(body)?,
+            },
+            TAG_GET | TAG_EMPTY if !body.is_empty() => return Err(invalid("trailing bytes")),
+            TAG_GET => Self::Get { addr },
+            TAG_EMPTY => Self::Empty { addr },
+            _ => return Err(invalid("unknown message tag")),
+        };
+        Ok(Some(msg))
+    }
+}
+
+/// Answer one client's `Put`/`Get` requests from `store` until it disconnects.
 ///
 /// # Errors
-/// Fails on an I/O error, a malformed request, or a message only the serving side may send.
-pub fn serve(peer: &mut (impl Read + Write), transport: &mut impl Transport) -> io::Result<()> {
-    while let Some(msg) = NetMsg::read_from(peer)? {
+/// Fails on an I/O error or a message only the provider may send.
+pub fn serve_provider(peer: &mut (impl Read + Write), store: &BoxStore) -> io::Result<()> {
+    while let Some(msg) = ProviderMsg::read_from(peer)? {
         match msg {
-            NetMsg::Send { mailbox, packet } => transport.send(&mailbox, packet)?,
-            NetMsg::Fetch { mailbox } => {
-                for packet in transport.fetch(&mailbox)? {
-                    NetMsg::Delivered { mailbox, packet }.write_to(peer)?;
-                }
-                NetMsg::FetchDone { mailbox }.write_to(peer)?;
-            }
-            NetMsg::Delivered { .. } | NetMsg::FetchDone { .. } => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "peer sent a message only the serving side may send",
-                ));
+            ProviderMsg::Put { addr, packet } => store.put(addr, packet)?,
+            ProviderMsg::Get { addr } => match store.get(&addr)? {
+                Some(packet) => ProviderMsg::Found { addr, packet }.write_to(peer)?,
+                None => ProviderMsg::Empty { addr }.write_to(peer)?,
+            },
+            ProviderMsg::Found { .. } | ProviderMsg::Empty { .. } => {
+                return Err(invalid("client sent a message only the provider may send"));
             }
         }
     }
     Ok(())
 }
 
-/// Forwards to a `purple-devprovider` over TCP. Development only: the provider sees every
-/// mailbox this client uses, with no mixnet in between.
+/// Forwards to a `purple-devprovider` over TCP. Development only: there is no mixnet in
+/// between, so the provider sees which client reads and writes which boxes.
 #[derive(Debug)]
 pub struct DevProviderTransport {
     stream: TcpStream,
@@ -149,52 +287,40 @@ impl DevProviderTransport {
 }
 
 impl Transport for DevProviderTransport {
-    fn send(&mut self, mailbox: &MailboxId, packet: Packet) -> io::Result<()> {
-        NetMsg::Send {
-            mailbox: *mailbox,
+    fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()> {
+        ProviderMsg::Put {
+            addr: box_address(at),
             packet,
         }
         .write_to(&mut self.stream)
     }
 
-    fn fetch(&mut self, mailbox: &MailboxId) -> io::Result<Vec<Packet>> {
-        NetMsg::Fetch { mailbox: *mailbox }.write_to(&mut self.stream)?;
-        let mut packets = Vec::new();
-        loop {
-            match NetMsg::read_from(&mut self.stream)? {
-                Some(NetMsg::Delivered {
-                    mailbox: from,
-                    packet,
-                }) if from == *mailbox => {
-                    packets.push(packet);
-                }
-                Some(NetMsg::FetchDone { mailbox: from }) if from == *mailbox => {
-                    return Ok(packets);
-                }
-                Some(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unexpected reply from the dev provider",
-                    ));
-                }
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "dev provider closed the connection",
-                    ));
-                }
-            }
+    fn read(&mut self, at: &BoxRef) -> io::Result<Option<Packet>> {
+        let addr = box_address(at);
+        ProviderMsg::Get { addr }.write_to(&mut self.stream)?;
+        match ProviderMsg::read_from(&mut self.stream)? {
+            Some(ProviderMsg::Found { addr: got, packet }) if got == addr => Ok(Some(packet)),
+            Some(ProviderMsg::Empty { addr: got }) if got == addr => Ok(None),
+            Some(_) => Err(invalid("unexpected reply from the dev provider")),
+            None => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "dev provider closed the connection",
+            )),
         }
     }
 }
 
+fn invalid(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
 fn poisoned<T>(_: PoisonError<T>) -> io::Error {
-    io::Error::other("fake transport lock poisoned")
+    io::Error::other("box store lock poisoned")
 }
 
 #[cfg(test)]
 mod tests {
-    use purple_ipc::PACKET_LEN;
+    use purple_ipc::{SEED_LEN, StreamSeed};
 
     use super::*;
 
@@ -202,72 +328,100 @@ mod tests {
         Packet::from_slice(&[byte; PACKET_LEN]).unwrap()
     }
 
-    #[test]
-    fn fetch_returns_packets_in_order_then_empties() {
-        let mut net = FakeTransport::default();
-        let mailbox = MailboxId([1; 32]);
-        net.send(&mailbox, packet(1)).unwrap();
-        net.send(&mailbox, packet(2)).unwrap();
-        assert_eq!(net.fetch(&mailbox).unwrap(), vec![packet(1), packet(2)]);
-        assert!(net.fetch(&mailbox).unwrap().is_empty());
-    }
-
-    #[test]
-    fn mailboxes_are_isolated() {
-        let mut net = FakeTransport::default();
-        net.send(&MailboxId([1; 32]), packet(1)).unwrap();
-        assert!(net.fetch(&MailboxId([2; 32])).unwrap().is_empty());
-    }
-
-    #[test]
-    fn expired_packets_are_dropped() {
-        let mailbox = MailboxId([5; 32]);
-        let mut instant = FakeTransport::with_retention(Duration::ZERO);
-        instant.send(&mailbox, packet(1)).unwrap();
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(instant.fetch(&mailbox).unwrap().is_empty());
-
-        let mut lasting = FakeTransport::with_retention(Duration::from_hours(1));
-        lasting.send(&mailbox, packet(1)).unwrap();
-        assert_eq!(lasting.fetch(&mailbox).unwrap(), vec![packet(1)]);
-    }
-
-    #[test]
-    fn sweeps_unfetched_mailboxes() {
-        let mut net = FakeTransport::with_retention(Duration::ZERO);
-        for i in 0..SWEEP_EVERY {
-            let id = i.to_be_bytes();
-            let mut mailbox = [0u8; 32];
-            mailbox[..8].copy_from_slice(&id);
-            net.send(&MailboxId(mailbox), packet(0)).unwrap();
+    fn at(seed: u8, index: u64) -> BoxRef {
+        BoxRef {
+            stream: StreamSeed([seed; SEED_LEN]),
+            index,
         }
-        assert!(net.network.lock().unwrap().mailboxes.len() < 2);
     }
 
     #[test]
-    fn dev_provider_transport_round_trips_through_serve() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            serve(&mut stream, &mut FakeTransport::default()).unwrap();
-        });
-        let mut client = DevProviderTransport::connect(&addr).unwrap();
-        let mailbox = MailboxId([4; 32]);
-        client.send(&mailbox, packet(1)).unwrap();
-        client.send(&mailbox, packet(2)).unwrap();
-        assert_eq!(client.fetch(&mailbox).unwrap(), vec![packet(1), packet(2)]);
-        assert!(client.fetch(&mailbox).unwrap().is_empty());
-        drop(client);
-        server.join().unwrap();
+    fn boxes_are_write_once_and_reads_do_not_consume() {
+        let mut net = FakeTransport::default();
+        net.write(&at(1, 0), packet(1)).unwrap();
+        net.write(&at(1, 0), packet(2)).unwrap();
+        assert_eq!(net.read(&at(1, 0)).unwrap(), Some(packet(1)));
+        assert_eq!(net.read(&at(1, 0)).unwrap(), Some(packet(1)));
+        assert_eq!(net.read(&at(1, 1)).unwrap(), None);
+        assert_eq!(net.read(&at(2, 0)).unwrap(), None);
+    }
+
+    #[test]
+    fn box_addresses_hide_the_stream() {
+        let a0 = box_address(&at(1, 0));
+        let a1 = box_address(&at(1, 1));
+        let b0 = box_address(&at(2, 0));
+        assert_ne!(a0, a1);
+        assert_ne!(a0, b0);
+        assert_eq!(a0, box_address(&at(1, 0)));
+        // Nothing of the seed or index shows in the address.
+        assert!(!a0.0.windows(4).any(|w| w == [1, 1, 1, 1]));
     }
 
     #[test]
     fn clones_share_one_network() {
         let mut alice = FakeTransport::default();
         let mut bob = alice.clone();
-        let mailbox = MailboxId([3; 32]);
-        alice.send(&mailbox, packet(7)).unwrap();
-        assert_eq!(bob.fetch(&mailbox).unwrap(), vec![packet(7)]);
+        alice.write(&at(3, 0), packet(7)).unwrap();
+        assert_eq!(bob.read(&at(3, 0)).unwrap(), Some(packet(7)));
+    }
+
+    #[test]
+    fn expired_boxes_read_as_empty_and_can_be_rewritten() {
+        let store = BoxStore::with_retention(Duration::ZERO);
+        let addr = BoxAddr([5; 32]);
+        store.put(addr, packet(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(store.get(&addr).unwrap(), None);
+        store.put(addr, packet(2)).unwrap();
+
+        let lasting = BoxStore::with_retention(Duration::from_hours(1));
+        lasting.put(addr, packet(3)).unwrap();
+        assert_eq!(lasting.get(&addr).unwrap(), Some(packet(3)));
+    }
+
+    #[test]
+    fn sweeps_expired_boxes() {
+        let store = BoxStore::with_retention(Duration::ZERO);
+        for i in 0..SWEEP_EVERY {
+            let mut addr = [0u8; 32];
+            addr[..8].copy_from_slice(&i.to_be_bytes());
+            store.put(BoxAddr(addr), packet(0)).unwrap();
+        }
+        assert!(store.inner.lock().unwrap().boxes.len() < 2);
+    }
+
+    #[test]
+    fn dev_provider_transport_round_trips_through_serve_provider() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let store = BoxStore::default();
+        let server_store = store.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            serve_provider(&mut stream, &server_store).unwrap();
+        });
+        let mut client = DevProviderTransport::connect(&addr).unwrap();
+        client.write(&at(4, 0), packet(1)).unwrap();
+        client.write(&at(4, 1), packet(2)).unwrap();
+        assert_eq!(client.read(&at(4, 0)).unwrap(), Some(packet(1)));
+        assert_eq!(client.read(&at(4, 1)).unwrap(), Some(packet(2)));
+        assert_eq!(client.read(&at(4, 2)).unwrap(), None);
+        drop(client);
+        server.join().unwrap();
+        // The provider only ever saw derived addresses.
+        assert!(store.get(&box_address(&at(4, 0))).unwrap().is_some());
+    }
+
+    #[test]
+    fn provider_messages_reject_garbage() {
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &[99; 33], MAX_PROVIDER_FRAME).unwrap();
+        assert!(ProviderMsg::read_from(&mut &frame[..]).is_err());
+        let mut trailing = Vec::new();
+        let mut body = vec![TAG_GET];
+        body.extend_from_slice(&[0; 33]);
+        write_frame(&mut trailing, &body, MAX_PROVIDER_FRAME).unwrap();
+        assert!(ProviderMsg::read_from(&mut &trailing[..]).is_err());
     }
 }

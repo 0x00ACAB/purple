@@ -1,32 +1,30 @@
 //! The messenger: contacts, invites and queues on top of [`Account`].
 //!
-//! It never touches the network. Callers ask which mailboxes to poll, hand it every packet
-//! fetched from them, and deliver the packets it returns.
+//! It never touches the network. Callers ask which boxes to read next, hand it every
+//! packet they find there, and write the boxes it returns.
 //!
-//! Connecting: the inviter stores a prekey bundle in the invite's bundle queue. The
-//! accepter fetches it, starts a session, and sends a hello to the invite's intro queue
-//! carrying fresh secrets for both directions. From then on each direction uses its own
-//! queue, whose mailbox and key change every epoch.
+//! Connecting: the inviter writes a prekey bundle to the invite's bundle stream. The
+//! accepter reads it, starts a session, and writes a hello to the invite's intro stream
+//! carrying fresh secrets for both directions. From then on each direction is its own
+//! stream of write-once boxes, read in order.
 
 use std::collections::{BTreeMap, HashMap};
 
-use purple_ipc::{MailboxId, Packet};
+use purple_ipc::{BoxRef, Packet, StreamSeed};
 use zeroize::Zeroizing;
 
 use crate::codec::{Reader, Writer};
 use crate::content::Content;
 use crate::fragment::{Reassembler, split};
 use crate::invite::Invite;
-use crate::queue::{Queue, QueueSecret, epoch};
+use crate::queue::{Queue, QueueSecret};
 use crate::session::{Account, Error, Result};
 
-/// Packets to deliver to one mailbox.
-#[derive(Debug)]
+/// Boxes to write.
+#[derive(Debug, Default)]
 pub struct Outgoing {
-    /// Destination mailbox.
-    pub mailbox: MailboxId,
-    /// Sealed packets, in order.
-    pub packets: Vec<Packet>,
+    /// Each box and the sealed packet that goes in it, in stream order.
+    pub writes: Vec<(BoxRef, Packet)>,
 }
 
 /// Something the user should see.
@@ -48,13 +46,23 @@ pub enum Event {
 pub struct Step {
     /// Events for the user.
     pub events: Vec<Event>,
-    /// Packets to deliver.
+    /// Boxes to write.
     pub outgoing: Vec<Outgoing>,
 }
 
 struct Contact {
     send: QueueSecret,
     receive: QueueSecret,
+    /// Next box this side writes on the send stream.
+    next_send: u64,
+    /// Next box this side reads on the receive stream.
+    next_read: u64,
+}
+
+/// An invite waiting for something to arrive on one of its streams.
+struct Pending {
+    invite: Invite,
+    next_read: u64,
 }
 
 enum Route {
@@ -67,11 +75,11 @@ enum Route {
 pub struct Messenger {
     account: Account,
     contacts: BTreeMap<String, Contact>,
-    /// Invites this user created, waiting for the accepter's hello.
-    invites: BTreeMap<String, Invite>,
-    /// Invites this user accepted, waiting for the inviter's bundle.
-    accepting: BTreeMap<String, Invite>,
-    reassemblers: HashMap<MailboxId, Reassembler>,
+    /// Invites this user created, waiting for the accepter's hello on the intro stream.
+    invites: BTreeMap<String, Pending>,
+    /// Invites this user accepted, waiting for the inviter's bundle on the bundle stream.
+    accepting: BTreeMap<String, Pending>,
+    reassemblers: HashMap<StreamSeed, Reassembler>,
 }
 
 impl std::fmt::Debug for Messenger {
@@ -96,15 +104,21 @@ impl Messenger {
     }
 
     /// Create an invite for a contact who will be known as `contact`. Returns the invite to
-    /// show as a QR code or link, and the bundle packets to deliver.
+    /// show as a QR code or link, and the bundle boxes to write.
     ///
     /// # Errors
     /// Fails if `contact` is already in use, or generating the prekeys fails.
     pub fn create_invite(&mut self, contact: &str) -> Result<(Invite, Outgoing)> {
         self.check_name_free(contact)?;
         let (invite, bundle) = self.account.create_invite()?;
-        let outgoing = outgoing(&invite.bundle_queue()?, &bundle)?;
-        self.invites.insert(contact.to_owned(), invite.clone());
+        let (outgoing, _) = outgoing(&invite.bundle_queue()?, 0, &bundle)?;
+        self.invites.insert(
+            contact.to_owned(),
+            Pending {
+                invite: invite.clone(),
+                next_read: 0,
+            },
+        );
         Ok((invite, outgoing))
     }
 
@@ -115,51 +129,67 @@ impl Messenger {
     /// Fails if `contact` is already in use.
     pub fn accept_invite(&mut self, contact: &str, invite: Invite) -> Result<()> {
         self.check_name_free(contact)?;
-        self.accepting.insert(contact.to_owned(), invite);
+        self.accepting.insert(
+            contact.to_owned(),
+            Pending {
+                invite,
+                next_read: 0,
+            },
+        );
         Ok(())
     }
 
-    /// Every mailbox to poll at time `now` (Unix seconds). For each contact that's the
-    /// receive queue for the current epoch and the ones either side, to tolerate clock skew
-    /// between the two devices.
+    /// The next box to read on every stream this messenger receives on.
     ///
     /// # Errors
     /// Fails only if queue derivation fails.
-    pub fn mailboxes(&self, now: u64) -> Result<Vec<MailboxId>> {
+    pub fn reads(&self) -> Result<Vec<BoxRef>> {
         let mut out = Vec::new();
-        for invite in self.accepting.values() {
-            out.push(invite.bundle_queue()?.mailbox());
+        for pending in self.accepting.values() {
+            out.push(BoxRef {
+                stream: pending.invite.bundle_queue()?.stream(),
+                index: pending.next_read,
+            });
         }
-        for invite in self.invites.values() {
-            out.push(invite.intro_queue()?.mailbox());
+        for pending in self.invites.values() {
+            out.push(BoxRef {
+                stream: pending.invite.intro_queue()?.stream(),
+                index: pending.next_read,
+            });
         }
         for contact in self.contacts.values() {
-            for e in epochs_around(now) {
-                out.push(contact.receive.queue(e)?.mailbox());
-            }
+            out.push(BoxRef {
+                stream: contact.receive.queue()?.stream(),
+                index: contact.next_read,
+            });
         }
         Ok(out)
     }
 
-    /// Handle one packet fetched from `mailbox`.
+    /// Handle the packet read from box `at`, which must be the next box of one of the
+    /// streams in [`Self::reads`].
+    ///
+    /// The stream moves on to the next box even if this packet turns out to be forged or
+    /// malformed, so one bad box can't block the stream.
     ///
     /// # Errors
-    /// Fails if the mailbox isn't one this messenger polls, or the packet is forged,
-    /// malformed or replayed. The messenger's state is unchanged on failure.
-    pub fn receive(&mut self, mailbox: MailboxId, packet: &Packet, now: u64) -> Result<Step> {
-        let (route, queue) = self.route(mailbox, now)?;
-        let fragment = queue.open(packet)?;
+    /// Fails if `at` isn't the next box of a stream this messenger reads, or the packet is
+    /// forged, malformed or replayed.
+    pub fn receive(&mut self, at: BoxRef, packet: &Packet) -> Result<Step> {
+        let (route, queue) = self.route(at)?;
+        self.advance(&route)?;
+        let fragment = queue.open(at.index, packet)?;
         let Some(message) = self
             .reassemblers
-            .entry(mailbox)
+            .entry(at.stream)
             .or_default()
             .push(&fragment)?
         else {
             return Ok(Step::default());
         };
         match route {
-            Route::Bundle(name) => self.finish_accept(&name, mailbox, &message),
-            Route::Intro(name) => self.finish_invite(&name, mailbox, &message),
+            Route::Bundle(name) => self.finish_accept(&name, at.stream, &message),
+            Route::Intro(name) => self.finish_invite(&name, at.stream, &message),
             Route::Contact(name) => self.deliver(&name, &message),
         }
     }
@@ -168,22 +198,26 @@ impl Messenger {
     ///
     /// # Errors
     /// Fails if `contact` isn't a connected contact.
-    pub fn send(&mut self, contact: &str, body: &[u8], now: u64) -> Result<Outgoing> {
-        let queue = self
+    pub fn send(&mut self, contact: &str, body: &[u8]) -> Result<Outgoing> {
+        let known = self
             .contacts
             .get(contact)
-            .ok_or(Error::State("unknown contact"))?
-            .send
-            .queue(epoch(now))?;
+            .ok_or(Error::State("unknown contact"))?;
+        let queue = known.send.queue()?;
+        let first = known.next_send;
         let wire = self
             .account
             .encrypt(contact, &Content::Text(body.to_vec()).encode())?;
-        outgoing(&queue, &wire)
+        let (out, next) = outgoing(&queue, first, &wire)?;
+        if let Some(state) = self.contacts.get_mut(contact) {
+            state.next_send = next;
+        }
+        Ok(out)
     }
 
     /// Serialize everything needed to resume: the account (identity, prekeys, sessions),
-    /// contacts and their queue secrets, and pending invites. Partly reassembled messages
-    /// aren't kept.
+    /// contacts with their queue secrets and stream positions, and pending invites. Partly
+    /// reassembled messages aren't kept.
     ///
     /// # Errors
     /// Fails only if libsignal can't serialize a record.
@@ -196,12 +230,15 @@ impl Messenger {
             w.bytes(name.as_bytes())?;
             w.bytes(contact.send.as_bytes())?;
             w.bytes(contact.receive.as_bytes())?;
+            w.u64(contact.next_send);
+            w.u64(contact.next_read);
         }
-        for pending in [&self.invites, &self.accepting] {
-            w.len(pending.len())?;
-            for (name, invite) in pending {
+        for invites in [&self.invites, &self.accepting] {
+            w.len(invites.len())?;
+            for (name, pending) in invites {
                 w.bytes(name.as_bytes())?;
-                w.bytes(&invite.encode())?;
+                w.bytes(&pending.invite.encode())?;
+                w.u64(pending.next_read);
             }
         }
         Ok(w.finish())
@@ -220,12 +257,16 @@ impl Messenger {
         let mut contacts = BTreeMap::new();
         for _ in 0..r.len()? {
             let name = r.string()?;
-            let send = secret(r.bytes()?)?;
-            let receive = secret(r.bytes()?)?;
-            contacts.insert(name, Contact { send, receive });
+            let contact = Contact {
+                send: secret(r.bytes()?)?,
+                receive: secret(r.bytes()?)?,
+                next_send: r.u64()?,
+                next_read: r.u64()?,
+            };
+            contacts.insert(name, contact);
         }
-        let invites = read_invites(&mut r)?;
-        let accepting = read_invites(&mut r)?;
+        let invites = read_pending(&mut r)?;
+        let accepting = read_pending(&mut r)?;
         r.finish()?;
         Ok(Self {
             account,
@@ -241,14 +282,13 @@ impl Messenger {
         self.contacts.keys().map(String::as_str)
     }
 
-    fn finish_accept(&mut self, name: &str, mailbox: MailboxId, bundle: &[u8]) -> Result<Step> {
+    fn finish_accept(&mut self, name: &str, stream: StreamSeed, bundle: &[u8]) -> Result<Step> {
         let invite = self
             .accepting
             .get(name)
             .ok_or(Error::State("no pending accept"))?
+            .invite
             .clone();
-        // A bundle that fails here (for example one planted by someone else who saw the QR
-        // code) leaves the accept pending, so the real bundle can still complete it.
         self.account.accept_invite(name, &invite, bundle)?;
 
         let to_inviter = QueueSecret::random()?;
@@ -258,15 +298,17 @@ impl Messenger {
             to_accepter: to_accepter.clone(),
         };
         let wire = self.account.encrypt(name, &hello.encode())?;
-        let intro = outgoing(&invite.intro_queue()?, &wire)?;
+        let (intro, _) = outgoing(&invite.intro_queue()?, 0, &wire)?;
 
         self.accepting.remove(name);
-        self.reassemblers.remove(&mailbox);
+        self.reassemblers.remove(&stream);
         self.contacts.insert(
             name.to_owned(),
             Contact {
                 send: to_inviter,
                 receive: to_accepter,
+                next_send: 0,
+                next_read: 0,
             },
         );
         Ok(Step {
@@ -275,21 +317,23 @@ impl Messenger {
         })
     }
 
-    fn finish_invite(&mut self, name: &str, mailbox: MailboxId, wire: &[u8]) -> Result<Step> {
+    fn finish_invite(&mut self, name: &str, stream: StreamSeed, wire: &[u8]) -> Result<Step> {
         let Content::Hello {
             to_inviter,
             to_accepter,
         } = Content::decode(&self.account.decrypt(name, wire)?)?
         else {
-            return Err(Error::Malformed("expected a hello on the intro queue"));
+            return Err(Error::Malformed("expected a hello on the intro stream"));
         };
         self.invites.remove(name);
-        self.reassemblers.remove(&mailbox);
+        self.reassemblers.remove(&stream);
         self.contacts.insert(
             name.to_owned(),
             Contact {
                 send: to_accepter,
                 receive: to_inviter,
+                next_send: 0,
+                next_read: 0,
             },
         );
         Ok(Step {
@@ -311,30 +355,47 @@ impl Messenger {
         }
     }
 
-    fn route(&self, mailbox: MailboxId, now: u64) -> Result<(Route, Queue)> {
-        for (name, invite) in &self.accepting {
-            let queue = invite.bundle_queue()?;
-            if queue.mailbox() == mailbox {
-                return Ok((Route::Bundle(name.clone()), queue));
+    /// Find which stream box `at` belongs to, and check it's that stream's next box.
+    fn route(&self, at: BoxRef) -> Result<(Route, Queue)> {
+        let mut found = None;
+        for (name, pending) in &self.accepting {
+            let queue = pending.invite.bundle_queue()?;
+            if queue.stream() == at.stream {
+                found = Some((Route::Bundle(name.clone()), queue, pending.next_read));
             }
         }
-        for (name, invite) in &self.invites {
-            let queue = invite.intro_queue()?;
-            if queue.mailbox() == mailbox {
-                return Ok((Route::Intro(name.clone()), queue));
+        for (name, pending) in &self.invites {
+            let queue = pending.invite.intro_queue()?;
+            if queue.stream() == at.stream {
+                found = Some((Route::Intro(name.clone()), queue, pending.next_read));
             }
         }
         for (name, contact) in &self.contacts {
-            for e in epochs_around(now) {
-                let queue = contact.receive.queue(e)?;
-                if queue.mailbox() == mailbox {
-                    return Ok((Route::Contact(name.clone()), queue));
-                }
+            let queue = contact.receive.queue()?;
+            if queue.stream() == at.stream {
+                found = Some((Route::Contact(name.clone()), queue, contact.next_read));
             }
         }
-        Err(Error::State(
-            "packet for a mailbox this messenger doesn't poll",
-        ))
+        let (route, queue, next) = found.ok_or(Error::State(
+            "packet for a stream this messenger doesn't read",
+        ))?;
+        if at.index != next {
+            return Err(Error::State("box read out of order"));
+        }
+        Ok((route, queue))
+    }
+
+    fn advance(&mut self, route: &Route) -> Result<()> {
+        let next_read = match route {
+            Route::Bundle(name) => self.accepting.get_mut(name).map(|p| &mut p.next_read),
+            Route::Intro(name) => self.invites.get_mut(name).map(|p| &mut p.next_read),
+            Route::Contact(name) => self.contacts.get_mut(name).map(|c| &mut c.next_read),
+        }
+        .ok_or(Error::State("stream vanished"))?;
+        *next_read = next_read
+            .checked_add(1)
+            .ok_or(Error::State("stream index exhausted"))?;
+        Ok(())
     }
 
     fn check_name_free(&self, name: &str) -> Result<()> {
@@ -353,7 +414,7 @@ impl Messenger {
     }
 }
 
-const SNAPSHOT_VERSION: u8 = 1;
+const SNAPSHOT_VERSION: u8 = 2;
 
 fn secret(bytes: &[u8]) -> Result<QueueSecret> {
     let array: [u8; 32] = bytes
@@ -362,11 +423,15 @@ fn secret(bytes: &[u8]) -> Result<QueueSecret> {
     Ok(QueueSecret::from_bytes(Zeroizing::new(array)))
 }
 
-fn read_invites(r: &mut Reader<'_>) -> Result<BTreeMap<String, Invite>> {
+fn read_pending(r: &mut Reader<'_>) -> Result<BTreeMap<String, Pending>> {
     let mut out = BTreeMap::new();
     for _ in 0..r.len()? {
         let name = r.string()?;
-        out.insert(name, Invite::decode(r.bytes()?)?);
+        let pending = Pending {
+            invite: Invite::decode(r.bytes()?)?,
+            next_read: r.u64()?,
+        };
+        out.insert(name, pending);
     }
     Ok(out)
 }
@@ -384,55 +449,58 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// The previous, current and next epoch at `now`.
-fn epochs_around(now: u64) -> impl Iterator<Item = u64> {
-    let e = epoch(now);
-    [e.checked_sub(1), Some(e), e.checked_add(1)]
-        .into_iter()
-        .flatten()
-}
-
-fn outgoing(queue: &Queue, message: &[u8]) -> Result<Outgoing> {
-    let packets = split(message)?
-        .iter()
-        .map(|fragment| queue.seal(fragment))
-        .collect::<Result<_>>()?;
-    Ok(Outgoing {
-        mailbox: queue.mailbox(),
-        packets,
-    })
+/// Fragment `message`, seal each fragment for consecutive boxes from `first`. Returns the
+/// writes and the index after the last box used.
+fn outgoing(queue: &Queue, first: u64, message: &[u8]) -> Result<(Outgoing, u64)> {
+    let mut index = first;
+    let mut writes = Vec::new();
+    for fragment in split(message)? {
+        let at = BoxRef {
+            stream: queue.stream(),
+            index,
+        };
+        writes.push((at, queue.seal(index, &fragment)?));
+        index = index
+            .checked_add(1)
+            .ok_or(Error::State("stream index exhausted"))?;
+    }
+    Ok((Outgoing { writes }, index))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::EPOCH_SECS;
 
-    const DAY: u64 = EPOCH_SECS;
-    const NOW: u64 = 20_000 * DAY + 3600;
-
-    /// An in-memory provider: mailboxes of packets, drained on fetch.
+    /// An in-memory box store: write-once, reads don't consume.
     #[derive(Default)]
-    struct Provider(HashMap<MailboxId, Vec<Packet>>);
+    struct Provider(HashMap<BoxRef, Packet>);
 
     impl Provider {
         fn deliver(&mut self, out: Outgoing) {
-            self.0.entry(out.mailbox).or_default().extend(out.packets);
+            for (at, packet) in out.writes {
+                self.0.entry(at).or_insert(packet);
+            }
         }
 
-        /// Fetch every mailbox `m` polls, feed the packets in, deliver what it sends.
-        fn poll(&mut self, m: &mut Messenger, now: u64) -> Vec<Event> {
+        /// Read every stream `m` follows until nothing new turns up, writing what it sends.
+        fn poll(&mut self, m: &mut Messenger) -> Vec<Event> {
             let mut events = Vec::new();
-            for mailbox in m.mailboxes(now).unwrap() {
-                for packet in self.0.remove(&mailbox).unwrap_or_default() {
-                    let step = m.receive(mailbox, &packet, now).unwrap();
-                    events.extend(step.events);
-                    for out in step.outgoing {
-                        self.deliver(out);
+            loop {
+                let mut progressed = false;
+                for at in m.reads().unwrap() {
+                    if let Some(packet) = self.0.get(&at).cloned() {
+                        progressed = true;
+                        let step = m.receive(at, &packet).unwrap();
+                        events.extend(step.events);
+                        for out in step.outgoing {
+                            self.deliver(out);
+                        }
                     }
                 }
+                if !progressed {
+                    return events;
+                }
             }
-            events
         }
     }
 
@@ -444,14 +512,8 @@ mod tests {
         alice
             .accept_invite("bob", Invite::decode(&invite.encode()).unwrap())
             .unwrap();
-        assert_eq!(
-            provider.poll(&mut alice, NOW),
-            [Event::Connected("bob".into())]
-        );
-        assert_eq!(
-            provider.poll(&mut bob, NOW),
-            [Event::Connected("alice".into())]
-        );
+        assert_eq!(provider.poll(&mut alice), [Event::Connected("bob".into())]);
+        assert_eq!(provider.poll(&mut bob), [Event::Connected("alice".into())]);
         (alice, bob)
     }
 
@@ -467,118 +529,120 @@ mod tests {
         let mut provider = Provider::default();
         let (mut alice, mut bob) = connected(&mut provider);
 
-        provider.deliver(alice.send("bob", b"hi bob", NOW).unwrap());
-        assert_eq!(provider.poll(&mut bob, NOW), [text("alice", b"hi bob")]);
-        provider.deliver(bob.send("alice", b"hi alice", NOW).unwrap());
-        assert_eq!(provider.poll(&mut alice, NOW), [text("bob", b"hi alice")]);
+        provider.deliver(alice.send("bob", b"hi bob").unwrap());
+        assert_eq!(provider.poll(&mut bob), [text("alice", b"hi bob")]);
+        provider.deliver(bob.send("alice", b"hi alice").unwrap());
+        assert_eq!(provider.poll(&mut alice), [text("bob", b"hi alice")]);
 
-        // A message spanning several packets.
+        // A message spanning several boxes.
         let long = vec![b'x'; 10_000];
-        let out = alice.send("bob", &long, NOW).unwrap();
-        assert!(out.packets.len() > 1);
+        let out = alice.send("bob", &long).unwrap();
+        assert!(out.writes.len() > 1);
         provider.deliver(out);
-        assert_eq!(provider.poll(&mut bob, NOW), [text("alice", &long)]);
+        assert_eq!(provider.poll(&mut bob), [text("alice", &long)]);
     }
 
     #[test]
-    fn mailboxes_rotate_every_epoch() {
+    fn messages_fill_consecutive_boxes_of_one_stream() {
         let mut provider = Provider::default();
         let (mut alice, mut bob) = connected(&mut provider);
-        let today = alice.send("bob", b"today", NOW).unwrap();
-        let tomorrow = alice.send("bob", b"tomorrow", NOW + DAY).unwrap();
-        assert_ne!(today.mailbox, tomorrow.mailbox);
+        let first = alice.send("bob", b"one").unwrap();
+        let second = alice.send("bob", b"two").unwrap();
+        let (a, b) = (first.writes[0].0, second.writes[0].0);
+        assert_eq!(a.stream, b.stream);
+        assert_eq!(b.index, a.index + 1);
 
-        provider.deliver(today);
-        provider.deliver(tomorrow);
+        // Delivered out of order, read in order.
+        provider.deliver(second);
+        assert!(provider.poll(&mut bob).is_empty());
+        provider.deliver(first);
         assert_eq!(
-            provider.poll(&mut bob, NOW + DAY),
-            [text("alice", b"today"), text("alice", b"tomorrow")]
+            provider.poll(&mut bob),
+            [text("alice", b"one"), text("alice", b"two")]
         );
     }
 
     #[test]
-    fn tolerates_a_day_of_clock_skew_either_way() {
-        let mut provider = Provider::default();
-        let (mut alice, mut bob) = connected(&mut provider);
-        provider.deliver(alice.send("bob", b"ahead", NOW + DAY).unwrap());
-        provider.deliver(alice.send("bob", b"behind", NOW - DAY).unwrap());
-        let mut got = provider.poll(&mut bob, NOW);
-        got.sort_by_key(|e| format!("{e:?}"));
-        assert_eq!(got, [text("alice", b"ahead"), text("alice", b"behind")]);
-    }
-
-    #[test]
-    fn provider_mailboxes_hold_only_sealed_packets() {
-        // Nothing the provider stores contains the plaintext or libsignal's cleartext
-        // PreKey fields: every packet opens only with the queue key.
+    fn boxes_hold_only_sealed_packets() {
+        // Nothing the provider stores contains plaintext or libsignal's cleartext PreKey
+        // fields: every packet opens only with the queue key.
         let mut provider = Provider::default();
         let (mut alice, _bob) = connected(&mut provider);
-        let out = alice.send("bob", b"secret words", NOW).unwrap();
-        for packet in &out.packets {
+        let out = alice.send("bob", b"secret words").unwrap();
+        for (at, packet) in &out.writes {
             assert!(!packet.as_bytes().windows(12).any(|w| w == b"secret words"));
-            assert!(
-                QueueSecret::random()
-                    .unwrap()
-                    .queue(epoch(NOW))
-                    .unwrap()
-                    .open(packet)
-                    .is_err()
-            );
+            let stranger = QueueSecret::random().unwrap().queue().unwrap();
+            assert!(stranger.open(at.index, packet).is_err());
         }
     }
 
     #[test]
-    fn planted_bundle_does_not_block_the_real_one() {
+    fn rejects_boxes_out_of_order_or_on_unknown_streams() {
+        let mut provider = Provider::default();
+        let (mut alice, mut bob) = connected(&mut provider);
+        let out = alice.send("bob", b"x").unwrap();
+        let (at, packet) = out.writes[0].clone();
+        let skipped = BoxRef {
+            index: at.index + 1,
+            ..at
+        };
+        assert!(bob.receive(skipped, &packet).is_err());
+        assert!(alice.receive(at, &packet).is_err());
+        assert_eq!(
+            bob.receive(at, &packet).unwrap().events,
+            [text("alice", b"x")]
+        );
+    }
+
+    #[test]
+    fn planted_bundle_is_rejected() {
+        // Someone who saw the QR code can fill the bundle stream first. Boxes are
+        // write-once, so the invite then fails (a denial of service), but Alice never
+        // starts a session with the impostor.
         let mut provider = Provider::default();
         let mut alice = Messenger::new().unwrap();
         let mut bob = Messenger::new().unwrap();
         let (invite, bundle) = bob.create_invite("alice").unwrap();
-
-        // Mallory saw the QR code and plants her own bundle first.
         let (_, mallory_bundle) = Account::generate().unwrap().create_invite().unwrap();
-        let planted = outgoing(&invite.bundle_queue().unwrap(), &mallory_bundle).unwrap();
-        alice.accept_invite("bob", invite).unwrap();
-        let mailbox = planted.mailbox;
-        for packet in &planted.packets {
-            assert!(alice.receive(mailbox, packet, NOW).is_err());
-        }
-
+        let (planted, _) = outgoing(&invite.bundle_queue().unwrap(), 0, &mallory_bundle).unwrap();
+        provider.deliver(planted);
         provider.deliver(bundle);
-        assert_eq!(
-            provider.poll(&mut alice, NOW),
-            [Event::Connected("bob".into())]
-        );
+        alice.accept_invite("bob", invite).unwrap();
+
+        let mut errors = 0;
+        for at in alice.reads().unwrap() {
+            let mut at = at;
+            while let Some(packet) = provider.0.get(&at).cloned() {
+                errors += usize::from(alice.receive(at, &packet).is_err());
+                at.index += 1;
+            }
+        }
+        assert_eq!(errors, 1);
+        assert_eq!(alice.contacts().count(), 0);
     }
 
     #[test]
-    fn snapshot_restores_contacts_sessions_and_pending_invites() {
+    fn snapshot_restores_contacts_positions_and_pending_invites() {
         let mut provider = Provider::default();
-        let (alice, mut bob) = connected(&mut provider);
+        let (mut alice, mut bob) = connected(&mut provider);
+        provider.deliver(alice.send("bob", b"before").unwrap());
+        assert_eq!(provider.poll(&mut bob), [text("alice", b"before")]);
         let (invite, bundle) = bob.create_invite("carol").unwrap();
         provider.deliver(bundle);
 
-        // Both restart from snapshots, then keep talking.
+        // Both restart from snapshots, then keep talking on the same streams.
         let mut alice = Messenger::from_snapshot(&alice.to_snapshot().unwrap()).unwrap();
         let mut bob = Messenger::from_snapshot(&bob.to_snapshot().unwrap()).unwrap();
-        provider.deliver(alice.send("bob", b"after restart", NOW).unwrap());
-        assert_eq!(
-            provider.poll(&mut bob, NOW),
-            [text("alice", b"after restart")]
-        );
-        provider.deliver(bob.send("alice", b"me too", NOW).unwrap());
-        assert_eq!(provider.poll(&mut alice, NOW), [text("bob", b"me too")]);
+        provider.deliver(alice.send("bob", b"after restart").unwrap());
+        assert_eq!(provider.poll(&mut bob), [text("alice", b"after restart")]);
+        provider.deliver(bob.send("alice", b"me too").unwrap());
+        assert_eq!(provider.poll(&mut alice), [text("bob", b"me too")]);
 
         // Bob's invite for carol survived the restart.
         let mut carol = Messenger::new().unwrap();
         carol.accept_invite("bob", invite).unwrap();
-        assert_eq!(
-            provider.poll(&mut carol, NOW),
-            [Event::Connected("bob".into())]
-        );
-        assert_eq!(
-            provider.poll(&mut bob, NOW),
-            [Event::Connected("carol".into())]
-        );
+        assert_eq!(provider.poll(&mut carol), [Event::Connected("bob".into())]);
+        assert_eq!(provider.poll(&mut bob), [Event::Connected("carol".into())]);
     }
 
     #[test]
@@ -592,15 +656,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_mailboxes_and_duplicate_names() {
+    fn rejects_duplicate_and_unsafe_names() {
         let mut provider = Provider::default();
         let (mut alice, mut bob) = connected(&mut provider);
-        let stray = alice.send("bob", b"x", NOW).unwrap();
-        assert!(
-            alice
-                .receive(stray.mailbox, &stray.packets[0], NOW)
-                .is_err()
-        );
         assert!(bob.create_invite("alice").is_err());
         for bad in [
             "",
@@ -611,6 +669,6 @@ mod tests {
         ] {
             assert!(bob.create_invite(bad).is_err(), "{bad:?}");
         }
-        assert!(alice.send("carol", b"x", NOW).is_err());
+        assert!(alice.send("carol", b"x").is_err());
     }
 }

@@ -1,14 +1,16 @@
-//! Queues: the mailboxes one direction of a conversation uses over time, and the sealing
-//! of each packet so the provider storing it sees only random bytes.
+//! Queues: one direction of a conversation, carried as an append-only stream of
+//! write-once boxes.
 //!
-//! A queue secret yields a different mailbox and key for every epoch (one UTC day). The
-//! provider can't link one day's mailbox to the next, and can't read fragment headers or
-//! the libsignal metadata inside.
+//! A queue secret yields two things by HKDF: the stream seed, which is all the transport
+//! gets, and the key that seals every packet. The transport can't derive the key from the
+//! seed, so whoever stores the boxes (or runs `purple-net`) sees only random bytes. Each
+//! packet's AAD is its box index, so boxes can't be swapped or replayed at another
+//! position undetected.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
-use purple_ipc::{MAILBOX_ID_LEN, MailboxId, PACKET_LEN, Packet};
+use purple_ipc::{PACKET_LEN, Packet, SEED_LEN, StreamSeed};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use sha2::Sha256;
@@ -20,21 +22,10 @@ const SECRET_LEN: usize = 32;
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
-const SALT: &[u8] = b"purple queue v1";
+const SALT: &[u8] = b"purple queue v2";
 
 /// Bytes of plaintext one sealed packet carries.
 pub const SEALED_LEN: usize = PACKET_LEN - NONCE_LEN - TAG_LEN;
-/// Length of one epoch. Each epoch uses a fresh mailbox and key.
-pub const EPOCH_SECS: u64 = 86_400;
-
-/// The epoch that `unix_secs` falls in.
-#[must_use]
-pub const fn epoch(unix_secs: u64) -> u64 {
-    match unix_secs.checked_div(EPOCH_SECS) {
-        Some(epoch) => epoch,
-        None => 0,
-    }
-}
 
 /// Secret for one direction of a conversation, shared by both sides.
 #[derive(Clone)]
@@ -67,57 +58,53 @@ impl QueueSecret {
         &self.0
     }
 
-    /// A secret derived from other key material, for queues that don't rotate (an invite's
-    /// bundle and intro queues).
+    /// A secret derived from other key material (an invite's bundle and intro queues).
     pub(crate) fn derive(ikm: &[u8], label: &[u8]) -> Result<Self> {
         let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
         expand(ikm, &[b"derive:", label], secret.as_mut_slice())?;
         Ok(Self(secret))
     }
 
-    /// The mailbox and key for `epoch`.
+    /// The stream seed and sealing key for this queue.
     ///
     /// # Errors
     /// Fails only if HKDF rejects the output length, which can't happen for these sizes.
-    pub fn queue(&self, epoch: u64) -> Result<Queue> {
-        let epoch = epoch.to_be_bytes();
-        let mut mailbox = [0u8; MAILBOX_ID_LEN];
-        expand(self.0.as_slice(), &[b"mailbox:", &epoch], &mut mailbox)?;
+    pub fn queue(&self) -> Result<Queue> {
+        let mut seed = [0u8; SEED_LEN];
+        expand(self.0.as_slice(), &[b"stream"], &mut seed)?;
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
-        expand(self.0.as_slice(), &[b"key:", &epoch], key.as_mut_slice())?;
+        expand(self.0.as_slice(), &[b"key"], key.as_mut_slice())?;
         Ok(Queue {
-            mailbox: MailboxId(mailbox),
+            stream: StreamSeed(seed),
             key,
         })
     }
 }
 
-/// One mailbox and the key that seals packets sent to it.
+/// A queue's stream seed and the key that seals packets written to it.
 pub struct Queue {
-    mailbox: MailboxId,
+    stream: StreamSeed,
     key: Zeroizing<[u8; KEY_LEN]>,
 }
 
 impl std::fmt::Debug for Queue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Queue")
-            .field("mailbox", &self.mailbox)
-            .finish_non_exhaustive()
+        f.debug_struct("Queue").finish_non_exhaustive()
     }
 }
 
 impl Queue {
-    /// The mailbox this queue delivers to.
+    /// The stream the transport writes this queue's boxes to.
     #[must_use]
-    pub const fn mailbox(&self) -> MailboxId {
-        self.mailbox
+    pub const fn stream(&self) -> StreamSeed {
+        self.stream
     }
 
-    /// Seal exactly [`SEALED_LEN`] bytes into one packet.
+    /// Seal exactly [`SEALED_LEN`] bytes for box `index`.
     ///
     /// # Errors
     /// Fails if `plaintext` is the wrong length or the OS RNG fails.
-    pub fn seal(&self, plaintext: &[u8]) -> Result<Packet> {
+    pub fn seal(&self, index: u64, plaintext: &[u8]) -> Result<Packet> {
         if plaintext.len() != SEALED_LEN {
             return Err(Error::Malformed("sealed plaintext has the wrong length"));
         }
@@ -131,7 +118,7 @@ impl Queue {
                 &XNonce::from(nonce),
                 Payload {
                     msg: plaintext,
-                    aad: &self.mailbox.0,
+                    aad: &index.to_be_bytes(),
                 },
             )
             .map_err(|_| Error::Malformed("packet encryption failed"))?;
@@ -140,11 +127,11 @@ impl Queue {
         )?)
     }
 
-    /// Open a packet sealed for this queue.
+    /// Open the packet read from box `index`.
     ///
     /// # Errors
-    /// Fails if the packet wasn't sealed with this queue's key and mailbox, or was altered.
-    pub fn open(&self, packet: &Packet) -> Result<Zeroizing<Vec<u8>>> {
+    /// Fails if the packet wasn't sealed with this queue's key for this index, or was altered.
+    pub fn open(&self, index: u64, packet: &Packet) -> Result<Zeroizing<Vec<u8>>> {
         let (nonce, ciphertext) = packet
             .as_bytes()
             .split_first_chunk::<NONCE_LEN>()
@@ -155,7 +142,7 @@ impl Queue {
                 &XNonce::from(*nonce),
                 Payload {
                     msg: ciphertext,
-                    aad: &self.mailbox.0,
+                    aad: &index.to_be_bytes(),
                 },
             )
             .map_err(|_| Error::Malformed("packet failed to decrypt"))?;
@@ -179,55 +166,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mailbox_and_key_change_every_epoch() {
+    fn both_sides_derive_the_same_stream_and_key() {
         let secret = QueueSecret::random().unwrap();
-        let today = secret.queue(20_000).unwrap();
-        let tomorrow = secret.queue(20_001).unwrap();
-        assert_ne!(today.mailbox(), tomorrow.mailbox());
-        assert_ne!(*today.key, *tomorrow.key);
-        // Both sides derive the same queue from the same secret.
-        assert_eq!(
-            QueueSecret::from_bytes(Zeroizing::new(*secret.as_bytes()))
-                .queue(20_000)
-                .unwrap()
-                .mailbox(),
-            today.mailbox()
-        );
+        let copy = QueueSecret::from_bytes(Zeroizing::new(*secret.as_bytes()));
+        let (mine, theirs) = (secret.queue().unwrap(), copy.queue().unwrap());
+        assert_eq!(mine.stream(), theirs.stream());
+        let packet = mine.seal(3, &[7; SEALED_LEN]).unwrap();
+        assert_eq!(theirs.open(3, &packet).unwrap().as_slice(), [7; SEALED_LEN]);
     }
 
     #[test]
-    fn sealed_packet_opens_only_with_its_own_queue() {
-        let secret = QueueSecret::random().unwrap();
-        let queue = secret.queue(1).unwrap();
-        let plaintext = vec![7u8; SEALED_LEN];
-        let packet = queue.seal(&plaintext).unwrap();
-        assert_eq!(queue.open(&packet).unwrap().as_slice(), plaintext);
+    fn stream_seed_is_not_the_key() {
+        let queue = QueueSecret::random().unwrap().queue().unwrap();
+        assert_ne!(queue.stream().0, *queue.key);
+        assert_ne!(queue.stream().0, [0; SEED_LEN]);
+    }
 
-        assert!(secret.queue(2).unwrap().open(&packet).is_err());
-        assert!(
-            QueueSecret::random()
-                .unwrap()
-                .queue(1)
-                .unwrap()
-                .open(&packet)
-                .is_err()
-        );
+    #[test]
+    fn packets_open_only_at_their_own_index_with_their_own_key() {
+        let queue = QueueSecret::random().unwrap().queue().unwrap();
+        let packet = queue.seal(5, &[1; SEALED_LEN]).unwrap();
+        assert!(queue.open(5, &packet).is_ok());
+        assert!(queue.open(6, &packet).is_err());
+        let other = QueueSecret::random().unwrap().queue().unwrap();
+        assert!(other.open(5, &packet).is_err());
 
         let mut tampered = *packet.as_bytes();
         tampered[PACKET_LEN - 1] ^= 1;
-        assert!(queue.open(&Packet::from_slice(&tampered).unwrap()).is_err());
+        assert!(
+            queue
+                .open(5, &Packet::from_slice(&tampered).unwrap())
+                .is_err()
+        );
     }
 
     #[test]
     fn seal_rejects_wrong_length() {
-        let queue = QueueSecret::random().unwrap().queue(0).unwrap();
-        assert!(queue.seal(&[0; SEALED_LEN - 1]).is_err());
-    }
-
-    #[test]
-    fn epochs_are_utc_days() {
-        assert_eq!(epoch(0), 0);
-        assert_eq!(epoch(EPOCH_SECS - 1), 0);
-        assert_eq!(epoch(EPOCH_SECS), 1);
+        let queue = QueueSecret::random().unwrap().queue().unwrap();
+        assert!(queue.seal(0, &[0; SEALED_LEN - 1]).is_err());
     }
 }

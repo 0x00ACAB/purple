@@ -22,7 +22,8 @@ libc = "0.2"
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
 # Must match the rand major version libsignal-protocol uses.
 rand = "0.9"
-ratatui = "0.30"
+# line_count gives the exact wrapped height, so long chat messages stay scrolled to the end.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 seccompiler = "0.5"
 sha2 = "0.10"
 zeroize = "1"

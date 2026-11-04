@@ -26,16 +26,18 @@ use purple_core::vault::{HistoryEntry, KdfParams, Vault};
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_ipc::ui::{MAX_BODY_LEN, MAX_ERROR_LEN, UiCmd, UiEvent};
 use purple_ipc::{
-    CORE_NET_FD, CORE_UI_FD, MAILBOX_ID_LEN, MailboxId, NetMsg, Packet, inherited_stream,
+    BoxRef, CORE_NET_FD, CORE_UI_FD, NetMsg, Packet, SEED_LEN, StreamSeed, inherited_stream,
 };
-use rand::RngCore;
 use rand::seq::SliceRandom;
+use rand::{Rng, RngCore};
 use zeroize::Zeroizing;
 
 const NAME: &str = "purple-core";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// Fetches per poll round come in multiples of this.
+/// Reads in a poll's first wave come in multiples of this.
 const POLL_ROUND: usize = 16;
+/// Most box reads one poll makes, so a long backlog can't stall the loop.
+const MAX_READS_PER_POLL: usize = 256;
 const SELF_TEST_POLLS: u32 = 200;
 const SELF_TEST_WAIT: Duration = Duration::from_millis(100);
 const USAGE: &str = "usage: purple-core (--no-ui | --data-dir <dir>)";
@@ -165,9 +167,9 @@ fn next_on_grid(previous: Instant) -> Instant {
     next
 }
 
-/// Pad `real` with random mailboxes up to a multiple of [`POLL_ROUND`] and shuffle, so the
-/// number and order of fetches don't reveal how many contacts or invites exist.
-fn padded_round(real: &[MailboxId]) -> Vec<MailboxId> {
+/// Pad `real` with reads of random boxes up to a multiple of [`POLL_ROUND`] and shuffle, so
+/// the number and order of reads don't reveal how many contacts or invites exist.
+fn padded_round(real: &[BoxRef]) -> Vec<BoxRef> {
     let mut rng = rand::rng();
     let target = real
         .len()
@@ -176,9 +178,12 @@ fn padded_round(real: &[MailboxId]) -> Vec<MailboxId> {
         .saturating_mul(POLL_ROUND);
     let mut round = real.to_vec();
     while round.len() < target {
-        let mut mailbox = [0u8; MAILBOX_ID_LEN];
-        rng.fill_bytes(&mut mailbox);
-        round.push(MailboxId(mailbox));
+        let mut seed = [0u8; SEED_LEN];
+        rng.fill_bytes(&mut seed);
+        round.push(BoxRef {
+            stream: StreamSeed(seed),
+            index: rng.random(),
+        });
     }
     round.shuffle(&mut rng);
     round
@@ -329,7 +334,7 @@ fn handle(cmd: UiCmd, messenger: &mut Messenger) -> session::Result<Effects> {
             let at = now()?;
             effects
                 .outgoing
-                .push(messenger.send(&contact, body.as_bytes(), at)?);
+                .push(messenger.send(&contact, body.as_bytes())?);
             effects.history.push(HistoryEntry {
                 contact,
                 outgoing: true,
@@ -357,8 +362,11 @@ fn clip(text: &str, max: usize) -> String {
     text.get(..end).unwrap_or_default().to_owned()
 }
 
-/// Fetch every mailbox `messenger` polls and hand it the packets. Nothing is sent here:
-/// the replies come back in the effects for [`commit`]. Packets the messenger rejects are
+/// Read the next box of every stream `messenger` follows and hand it what turns up.
+///
+/// Reads go out in waves: the first is padded (see [`padded_round`]), and whenever a box
+/// turns up, the stream's following box is read in the next wave. Nothing is written here:
+/// replies come back in the effects for [`commit`]. Packets the messenger rejects are
 /// skipped and their errors returned; I/O errors with purple-net are fatal.
 fn poll(
     net: &mut UnixStream,
@@ -367,20 +375,20 @@ fn poll(
 ) -> io::Result<(Effects, Vec<session::Error>)> {
     let mut effects = Effects::default();
     let mut errors = Vec::new();
-    let real: HashSet<MailboxId> = messenger
-        .mailboxes(now)
-        .map_err(io::Error::other)?
-        .into_iter()
-        .collect();
-    let round = padded_round(&real.iter().copied().collect::<Vec<_>>());
-    for mailbox in round {
-        let packets = fetch(net, mailbox)?;
-        if !real.contains(&mailbox) {
-            continue;
-        }
-        for packet in packets {
+    let real = messenger.reads().map_err(io::Error::other)?;
+    let followed: HashSet<StreamSeed> = real.iter().map(|at| at.stream).collect();
+    let mut wave = padded_round(&real);
+    let mut budget = MAX_READS_PER_POLL;
+    while !wave.is_empty() {
+        budget = budget.saturating_sub(wave.len());
+        let mut following = Vec::new();
+        for (at, packet) in read_wave(net, &wave)? {
+            let Some(packet) = packet else { continue };
+            if !followed.contains(&at.stream) {
+                continue;
+            }
             effects.changed = true;
-            match messenger.receive(mailbox, &packet, now) {
+            match messenger.receive(at, &packet) {
                 Ok(step) => {
                     effects.outgoing.extend(step.outgoing);
                     for event in step.events {
@@ -397,9 +405,35 @@ fn poll(
                 }
                 Err(err) => errors.push(err),
             }
+            if let Some(index) = at.index.checked_add(1) {
+                following.push(BoxRef { index, ..at });
+            }
         }
+        following.truncate(budget);
+        wave = following;
     }
     Ok((effects, errors))
+}
+
+/// Send every read in `wave`, then collect the replies, which purple-net sends in order.
+fn read_wave(net: &mut UnixStream, wave: &[BoxRef]) -> io::Result<Vec<(BoxRef, Option<Packet>)>> {
+    for at in wave {
+        NetMsg::Read { at: *at }.write_to(net)?;
+    }
+    wave.iter()
+        .map(|at| match NetMsg::read_from(net)? {
+            Some(NetMsg::Found { at: got, packet }) if got == *at => Ok((*at, Some(packet))),
+            Some(NetMsg::Empty { at: got }) if got == *at => Ok((*at, None)),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply from purple-net",
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "purple-net closed the socket",
+            )),
+        })
+        .collect()
 }
 
 fn to_ui_event(event: Event) -> UiEvent {
@@ -412,36 +446,9 @@ fn to_ui_event(event: Event) -> UiEvent {
     }
 }
 
-fn fetch(net: &mut UnixStream, mailbox: MailboxId) -> io::Result<Vec<Packet>> {
-    NetMsg::Fetch { mailbox }.write_to(net)?;
-    let mut packets = Vec::new();
-    loop {
-        match NetMsg::read_from(net)? {
-            Some(NetMsg::Delivered {
-                mailbox: from,
-                packet,
-            }) if from == mailbox => packets.push(packet),
-            Some(NetMsg::FetchDone { mailbox: from }) if from == mailbox => return Ok(packets),
-            Some(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected reply from purple-net",
-                ));
-            }
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "purple-net closed the socket",
-                ));
-            }
-        }
-    }
-}
-
 fn deliver(net: &mut UnixStream, out: Outgoing) -> io::Result<()> {
-    let mailbox = out.mailbox;
-    for packet in out.packets {
-        NetMsg::Send { mailbox, packet }.write_to(net)?;
+    for (at, packet) in out.writes {
+        NetMsg::Write { at, packet }.write_to(net)?;
     }
     Ok(())
 }
@@ -471,13 +478,11 @@ fn self_test(net: &mut UnixStream) -> io::Result<()> {
     expect(self_test_poll(net, &mut bob, now)? == [alice_connected])?;
 
     let to_alice = bob
-        .send("alice", b"hello alice", now)
+        .send("alice", b"hello alice")
         .map_err(io::Error::other)?;
     deliver(net, to_alice)?;
     expect(self_test_poll(net, &mut alice, now)? == [message("bob", "hello alice")])?;
-    let to_bob = alice
-        .send("bob", b"hello bob", now)
-        .map_err(io::Error::other)?;
+    let to_bob = alice.send("bob", b"hello bob").map_err(io::Error::other)?;
     deliver(net, to_bob)?;
     expect(self_test_poll(net, &mut bob, now)? == [message("alice", "hello bob")])?;
 
@@ -547,10 +552,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rounds_are_padded_to_a_multiple_of_sixteen_and_keep_every_real_mailbox() {
+    fn rounds_are_padded_to_a_multiple_of_sixteen_and_keep_every_real_read() {
         for count in [0, 1, 15, 16, 17, 40] {
-            let real: Vec<MailboxId> = (0..count)
-                .map(|i| MailboxId([u8::try_from(i).unwrap(); MAILBOX_ID_LEN]))
+            let real: Vec<BoxRef> = (0..count)
+                .map(|i| BoxRef {
+                    stream: StreamSeed([u8::try_from(i).unwrap(); SEED_LEN]),
+                    index: 0,
+                })
                 .collect();
             let round = padded_round(&real);
             assert_eq!(round.len() % POLL_ROUND, 0, "{count}");

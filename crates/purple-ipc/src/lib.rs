@@ -12,10 +12,11 @@ use std::os::unix::net::UnixStream;
 
 pub mod ui;
 
-/// Size of every packet on the wire. Placeholder until the Nym packet size is wired in.
+/// Size of every packet (one box). Must fit the transport's box payload; checked against
+/// the Pigeonhole geometry when that transport lands.
 pub const PACKET_LEN: usize = 2048;
-/// Size of a mailbox address.
-pub const MAILBOX_ID_LEN: usize = 32;
+/// Size of a stream seed.
+pub const SEED_LEN: usize = 32;
 
 /// Fd where `purple-ui` finds its socket to `purple-core`.
 pub const UI_CORE_FD: RawFd = 3;
@@ -26,16 +27,35 @@ pub const CORE_NET_FD: RawFd = 4;
 /// Fd where `purple-net` finds its socket to `purple-core`.
 pub const NET_CORE_FD: RawFd = 3;
 
-const MAX_NET_FRAME: usize = 1 + MAILBOX_ID_LEN + PACKET_LEN;
+const MAX_NET_FRAME: usize = 1 + SEED_LEN + 8 + PACKET_LEN;
 
-const TAG_SEND: u8 = 1;
-const TAG_FETCH: u8 = 2;
-const TAG_DELIVERED: u8 = 3;
-const TAG_FETCH_DONE: u8 = 4;
+const TAG_WRITE: u8 = 1;
+const TAG_READ: u8 = 2;
+const TAG_FOUND: u8 = 3;
+const TAG_EMPTY: u8 = 4;
 
-/// Address of a mailbox queue at a provider.
+/// Identifies one append-only stream of boxes to the transport.
+///
+/// `purple-core` derives it one-way from a queue secret, so the transport can address boxes
+/// but can't derive the key that seals their contents. Each transport maps (seed, index) to
+/// its own box addresses.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamSeed(pub [u8; SEED_LEN]);
+
+impl fmt::Debug for StreamSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StreamSeed(..)")
+    }
+}
+
+/// One box: a position in a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct MailboxId(pub [u8; MAILBOX_ID_LEN]);
+pub struct BoxRef {
+    /// The stream.
+    pub stream: StreamSeed,
+    /// Position in the stream, from 0.
+    pub index: u64,
+}
 
 /// One fixed-size packet. Its contents are opaque to everything but `purple-core`.
 #[derive(Clone, PartialEq, Eq)]
@@ -69,45 +89,47 @@ impl fmt::Debug for Packet {
 /// Messages between `purple-core` and `purple-net`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetMsg {
-    /// core to net: queue `packet` for delivery to `mailbox`.
-    Send {
-        /// Destination mailbox.
-        mailbox: MailboxId,
-        /// Packet to deliver.
+    /// core to net: write `packet` into box `at`. Boxes are write-once.
+    Write {
+        /// The box.
+        at: BoxRef,
+        /// Its contents.
         packet: Packet,
     },
-    /// core to net: fetch everything waiting in `mailbox`.
-    Fetch {
-        /// Mailbox to drain.
-        mailbox: MailboxId,
+    /// core to net: read box `at`. Answered by [`NetMsg::Found`] or [`NetMsg::Empty`].
+    Read {
+        /// The box.
+        at: BoxRef,
     },
-    /// net to core: one packet from a fetched mailbox.
-    Delivered {
-        /// Mailbox the packet came from.
-        mailbox: MailboxId,
-        /// The packet.
+    /// net to core: box `at` holds `packet`.
+    Found {
+        /// The box.
+        at: BoxRef,
+        /// Its contents.
         packet: Packet,
     },
-    /// net to core: no more packets for this fetch.
-    FetchDone {
-        /// Mailbox the fetch was for.
-        mailbox: MailboxId,
+    /// net to core: box `at` hasn't been written (or has expired).
+    Empty {
+        /// The box.
+        at: BoxRef,
     },
 }
 
 impl NetMsg {
-    /// Encode to the wire layout: tag, mailbox, then the packet if the message has one.
+    /// Encode to the wire layout: tag, stream seed, index, then the packet if the message
+    /// has one.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let (tag, mailbox, packet) = match self {
-            Self::Send { mailbox, packet } => (TAG_SEND, mailbox, Some(packet)),
-            Self::Fetch { mailbox } => (TAG_FETCH, mailbox, None),
-            Self::Delivered { mailbox, packet } => (TAG_DELIVERED, mailbox, Some(packet)),
-            Self::FetchDone { mailbox } => (TAG_FETCH_DONE, mailbox, None),
+        let (tag, at, packet) = match self {
+            Self::Write { at, packet } => (TAG_WRITE, at, Some(packet)),
+            Self::Read { at } => (TAG_READ, at, None),
+            Self::Found { at, packet } => (TAG_FOUND, at, Some(packet)),
+            Self::Empty { at } => (TAG_EMPTY, at, None),
         };
         let mut out = Vec::with_capacity(MAX_NET_FRAME);
         out.push(tag);
-        out.extend_from_slice(&mailbox.0);
+        out.extend_from_slice(&at.stream.0);
+        out.extend_from_slice(&at.index.to_be_bytes());
         if let Some(packet) = packet {
             out.extend_from_slice(packet.as_bytes());
         }
@@ -122,22 +144,28 @@ impl NetMsg {
         let (&tag, rest) = bytes
             .split_first()
             .ok_or_else(|| invalid("empty message"))?;
-        let (id, body) = rest
-            .split_first_chunk::<MAILBOX_ID_LEN>()
+        let (seed, rest) = rest
+            .split_first_chunk::<SEED_LEN>()
             .ok_or_else(|| invalid("message too short"))?;
-        let mailbox = MailboxId(*id);
+        let (index, body) = rest
+            .split_first_chunk::<8>()
+            .ok_or_else(|| invalid("message too short"))?;
+        let at = BoxRef {
+            stream: StreamSeed(*seed),
+            index: u64::from_be_bytes(*index),
+        };
         match tag {
-            TAG_SEND => Ok(Self::Send {
-                mailbox,
+            TAG_WRITE => Ok(Self::Write {
+                at,
                 packet: Packet::from_slice(body)?,
             }),
-            TAG_DELIVERED => Ok(Self::Delivered {
-                mailbox,
+            TAG_FOUND => Ok(Self::Found {
+                at,
                 packet: Packet::from_slice(body)?,
             }),
-            TAG_FETCH | TAG_FETCH_DONE if !body.is_empty() => Err(invalid("trailing bytes")),
-            TAG_FETCH => Ok(Self::Fetch { mailbox }),
-            TAG_FETCH_DONE => Ok(Self::FetchDone { mailbox }),
+            TAG_READ | TAG_EMPTY if !body.is_empty() => Err(invalid("trailing bytes")),
+            TAG_READ => Ok(Self::Read { at }),
+            TAG_EMPTY => Ok(Self::Empty { at }),
             _ => Err(invalid("unknown message tag")),
         }
     }
@@ -251,20 +279,26 @@ mod tests {
         Packet::from_slice(&[byte; PACKET_LEN]).unwrap()
     }
 
+    fn at(index: u64) -> BoxRef {
+        BoxRef {
+            stream: StreamSeed([9; SEED_LEN]),
+            index,
+        }
+    }
+
     #[test]
     fn every_message_round_trips_over_a_socket() {
-        let mailbox = MailboxId([9; MAILBOX_ID_LEN]);
         let msgs = [
-            NetMsg::Send {
-                mailbox,
+            NetMsg::Write {
+                at: at(0),
                 packet: packet(1),
             },
-            NetMsg::Fetch { mailbox },
-            NetMsg::Delivered {
-                mailbox,
+            NetMsg::Read { at: at(1) },
+            NetMsg::Found {
+                at: at(u64::MAX),
                 packet: packet(2),
             },
-            NetMsg::FetchDone { mailbox },
+            NetMsg::Empty { at: at(3) },
         ];
         let (mut a, mut b) = UnixStream::pair().unwrap();
         for msg in &msgs {
@@ -279,31 +313,34 @@ mod tests {
 
     #[test]
     fn rejects_unknown_tag() {
-        let mut bytes = NetMsg::Fetch {
-            mailbox: MailboxId([0; MAILBOX_ID_LEN]),
-        }
-        .encode();
+        let mut bytes = NetMsg::Read { at: at(0) }.encode();
         bytes[0] = 99;
         assert!(NetMsg::decode(&bytes).is_err());
     }
 
     #[test]
     fn rejects_wrong_lengths() {
-        let mailbox = MailboxId([0; MAILBOX_ID_LEN]);
-        let mut fetch = NetMsg::Fetch { mailbox }.encode();
-        fetch.push(0);
-        assert!(NetMsg::decode(&fetch).is_err());
+        let mut read = NetMsg::Read { at: at(0) }.encode();
+        read.push(0);
+        assert!(NetMsg::decode(&read).is_err());
 
-        let mut send = NetMsg::Send {
-            mailbox,
+        let mut write = NetMsg::Write {
+            at: at(0),
             packet: packet(0),
         }
         .encode();
-        send.pop();
-        assert!(NetMsg::decode(&send).is_err());
+        write.pop();
+        assert!(NetMsg::decode(&write).is_err());
 
-        assert!(NetMsg::decode(&[TAG_FETCH, 0, 0]).is_err());
+        let mut short = NetMsg::Read { at: at(0) }.encode();
+        short.pop();
+        assert!(NetMsg::decode(&short).is_err());
         assert!(NetMsg::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn seeds_never_show_in_debug_output() {
+        assert!(!format!("{:?}", at(0)).contains('9'));
     }
 
     #[test]

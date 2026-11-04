@@ -513,18 +513,19 @@ pub(crate) fn view(model: &Model, frame: &mut Frame<'_>) {
 
 /// A wrapped, bordered paragraph scrolled so its last lines are visible.
 fn bottom_aligned(lines: Vec<Line<'_>>, area: Rect, title: String) -> Paragraph<'_> {
-    let inner_width = usize::from(area.width.saturating_sub(2)).max(1);
+    let inner_width = area.width.saturating_sub(2);
     let inner_height = area.height.saturating_sub(2);
-    let rows: usize = lines
-        .iter()
-        .map(|l| l.width().max(1).div_ceil(inner_width))
-        .sum();
+    let wrap = Wrap { trim: false };
+    // Measure with the same word wrapping the render uses, without the border.
+    let rows = Paragraph::new(lines.clone())
+        .wrap(wrap)
+        .line_count(inner_width);
     let scroll = u16::try_from(rows)
         .unwrap_or(u16::MAX)
         .saturating_sub(inner_height);
     Paragraph::new(lines)
         .block(Block::bordered().title(title))
-        .wrap(Wrap { trim: false })
+        .wrap(wrap)
         .scroll((scroll, 0))
 }
 
@@ -653,6 +654,25 @@ mod tests {
         let froms: Vec<_> = m.chats["bob"].iter().map(|l| l.from.as_str()).collect();
         assert_eq!(froms, ["me", "bob"]);
         assert_eq!(m.contacts, ["bob"]);
+    }
+
+    #[test]
+    fn long_wrapped_messages_scroll_to_their_last_line() {
+        // Word wrapping needs more rows than characters / width; the scroll must use the
+        // real wrapped height or the end of long messages is cut off.
+        let words = format!("{}THE-END", "long ".repeat(900));
+        let area = Rect::new(0, 0, 50, 20);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(
+            bottom_aligned(vec![Line::raw(words.as_str())], area, String::new()),
+            area,
+            &mut buffer,
+        );
+        let shown: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|pos| buffer[pos].symbol().to_owned())
+            .collect();
+        assert!(shown.contains("THE-END"));
     }
 
     #[test]

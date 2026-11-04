@@ -1,8 +1,8 @@
 //! purple-devprovider: a local stand-in for the mixnet and its providers, so several purple
 //! instances on one machine can reach each other during development.
 //!
-//! It keeps every mailbox in memory and sees which instance uses which mailbox, so it
-//! offers none of the mixnet's privacy. Never expose it beyond loopback.
+//! It keeps boxes in memory and only ever sees box addresses, but with no mixnet in between
+//! it sees which instance reads and writes which boxes. Never expose it beyond loopback.
 
 use std::io;
 use std::net::TcpListener;
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use landlock::RulesetStatus;
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
-use purple_net::{FakeTransport, serve};
+use purple_net::{BoxStore, serve_provider};
 
 const NAME: &str = "purple-devprovider";
 
@@ -47,12 +47,12 @@ fn run() -> io::Result<()> {
     );
 
     // Cover traffic goes to mailboxes nobody fetches; drop it after an hour.
-    let network = FakeTransport::with_retention(Duration::from_hours(1));
+    let store = BoxStore::with_retention(Duration::from_hours(1));
     for stream in listener.incoming() {
         let mut stream = stream?;
-        let mut transport = network.clone();
+        let store = store.clone();
         thread::spawn(move || {
-            if let Err(err) = serve(&mut stream, &mut transport) {
+            if let Err(err) = serve_provider(&mut stream, &store) {
                 eprintln!("purple-devprovider: client error: {err}");
             }
         });

@@ -89,7 +89,7 @@ fn run() -> io::Result<()> {
     }
 }
 
-/// Queue core's packets into the cover stream and answer its fetches, until core closes
+/// Queue core's writes into the cover stream and answer its reads, until core closes
 /// the socket. Then send what's still queued, at the same rate, and exit.
 fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::Result<()> {
     let requests = spawn_request_reader(core.try_clone()?);
@@ -98,14 +98,12 @@ fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::
             .next_tick()
             .saturating_duration_since(Instant::now());
         match requests.recv_timeout(wait) {
-            Ok(Ok(NetMsg::Send { mailbox, packet })) => scheduler.enqueue(mailbox, packet),
-            Ok(Ok(NetMsg::Fetch { mailbox })) => {
-                for packet in scheduler.fetch(&mailbox)? {
-                    NetMsg::Delivered { mailbox, packet }.write_to(&mut core)?;
-                }
-                NetMsg::FetchDone { mailbox }.write_to(&mut core)?;
-            }
-            Ok(Ok(NetMsg::Delivered { .. } | NetMsg::FetchDone { .. })) => {
+            Ok(Ok(NetMsg::Write { at, packet })) => scheduler.enqueue(at, packet),
+            Ok(Ok(NetMsg::Read { at })) => match scheduler.read(&at)? {
+                Some(packet) => NetMsg::Found { at, packet }.write_to(&mut core)?,
+                None => NetMsg::Empty { at }.write_to(&mut core)?,
+            },
+            Ok(Ok(NetMsg::Found { .. } | NetMsg::Empty { .. })) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "purple-core sent a message only purple-net may send",
