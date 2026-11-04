@@ -3,11 +3,11 @@
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use purple_core::fragment::{Reassembler, split};
 use purple_core::invite::Invite;
-use purple_core::session::Account;
-use purple_ipc::{CORE_NET_FD, CORE_UI_FD, MAILBOX_ID_LEN, MailboxId, NetMsg, inherited_stream};
+use purple_core::messenger::{Event, Messenger, Outgoing};
+use purple_ipc::{CORE_NET_FD, CORE_UI_FD, NetMsg, inherited_stream};
 
 fn main() -> ExitCode {
     match run() {
@@ -37,89 +37,99 @@ fn run() -> io::Result<()> {
     Ok(())
 }
 
-/// Two local accounts connect through an invite and exchange messages, with every message
-/// fragmented and carried through purple-net.
+/// Two local messengers connect through an invite and exchange messages. Every packet is
+/// sealed for its queue and carried through purple-net.
 fn self_test(net: &mut UnixStream) -> io::Result<()> {
-    let bundle_box = MailboxId([0xB1; MAILBOX_ID_LEN]);
-    let to_bob = MailboxId([0xB0; MAILBOX_ID_LEN]);
-    // Until message contents carry it, Alice's reply mailbox is fixed here.
-    let to_alice = MailboxId([0xA1; MAILBOX_ID_LEN]);
-    let mut alice = Account::generate().map_err(io::Error::other)?;
-    let mut bob = Account::generate().map_err(io::Error::other)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs();
+    let mut alice = Messenger::new().map_err(io::Error::other)?;
+    let mut bob = Messenger::new().map_err(io::Error::other)?;
 
-    // Bob shows a QR code and stores his sealed bundle at the provider.
-    let (invite, sealed) = bob
-        .create_invite(bundle_box, to_bob)
+    // Bob shows a QR code and stores his bundle; Alice scans it.
+    let (invite, bundle) = bob.create_invite("alice").map_err(io::Error::other)?;
+    deliver(net, bundle)?;
+    let scanned = Invite::decode(&invite.encode()).map_err(io::Error::other)?;
+    alice
+        .accept_invite("bob", scanned)
         .map_err(io::Error::other)?;
-    send(net, bundle_box, &sealed)?;
-    let qr = invite.encode();
 
-    // Alice scans it, fetches the bundle and starts the session.
-    let scanned = Invite::decode(&qr).map_err(io::Error::other)?;
-    let fetched = receive(net, scanned.bundle_mailbox())?;
-    let first = alice
-        .accept_invite("bob", &scanned, &fetched)
-        .map_err(io::Error::other)?;
-    expect(first == to_bob)?;
+    expect(poll(net, &mut alice, now)? == [Event::Connected("bob".into())])?;
+    expect(poll(net, &mut bob, now)? == [Event::Connected("alice".into())])?;
 
-    let hello = alice
-        .encrypt("bob", b"hello bob")
-        .map_err(io::Error::other)?;
-    send(net, to_bob, &hello)?;
-    let at_bob = receive(net, to_bob)?;
-    expect(bob.decrypt("alice", &at_bob).map_err(io::Error::other)? == b"hello bob")?;
+    deliver(
+        net,
+        bob.send("alice", b"hello alice", now)
+            .map_err(io::Error::other)?,
+    )?;
+    expect(poll(net, &mut alice, now)? == [text("bob", b"hello alice")])?;
+    deliver(
+        net,
+        alice
+            .send("bob", b"hello bob", now)
+            .map_err(io::Error::other)?,
+    )?;
+    expect(poll(net, &mut bob, now)? == [text("alice", b"hello bob")])?;
 
-    let reply = bob
-        .encrypt("alice", b"hello alice")
-        .map_err(io::Error::other)?;
-    send(net, to_alice, &reply)?;
-    let at_alice = receive(net, to_alice)?;
-    expect(alice.decrypt("bob", &at_alice).map_err(io::Error::other)? == b"hello alice")?;
-
-    eprintln!("purple-core: self-test ok (invite, PQXDH handshake and reply through purple-net)");
+    eprintln!("purple-core: self-test ok (invite, hello, messages both ways through purple-net)");
     Ok(())
 }
 
-fn send(net: &mut UnixStream, mailbox: MailboxId, message: &[u8]) -> io::Result<()> {
-    for packet in split(message)? {
+fn deliver(net: &mut UnixStream, out: Outgoing) -> io::Result<()> {
+    let mailbox = out.mailbox;
+    for packet in out.packets {
         NetMsg::Send { mailbox, packet }.write_to(net)?;
     }
     Ok(())
 }
 
-/// Fetch `mailbox` and return the one message it should hold.
-fn receive(net: &mut UnixStream, mailbox: MailboxId) -> io::Result<Vec<u8>> {
-    NetMsg::Fetch { mailbox }.write_to(net)?;
-    let mut reassembler = Reassembler::default();
-    let mut messages = Vec::new();
-    loop {
-        match NetMsg::read_from(net)? {
-            Some(NetMsg::Delivered {
-                mailbox: from,
-                packet,
-            }) if from == mailbox => {
-                messages.extend(reassembler.push(&packet)?);
+/// Fetch every mailbox `messenger` polls, hand it the packets, and deliver what it sends.
+fn poll(net: &mut UnixStream, messenger: &mut Messenger, now: u64) -> io::Result<Vec<Event>> {
+    let mut events = Vec::new();
+    for mailbox in messenger.mailboxes(now).map_err(io::Error::other)? {
+        NetMsg::Fetch { mailbox }.write_to(net)?;
+        let mut packets = Vec::new();
+        loop {
+            match NetMsg::read_from(net)? {
+                Some(NetMsg::Delivered {
+                    mailbox: from,
+                    packet,
+                }) if from == mailbox => {
+                    packets.push(packet);
+                }
+                Some(NetMsg::FetchDone { mailbox: from }) if from == mailbox => break,
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected reply from purple-net",
+                    ));
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "purple-net closed the socket",
+                    ));
+                }
             }
-            Some(NetMsg::FetchDone { mailbox: from }) if from == mailbox => break,
-            Some(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected reply from purple-net",
-                ));
-            }
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "purple-net closed the socket",
-                ));
+        }
+        for packet in packets {
+            let step = messenger
+                .receive(mailbox, &packet, now)
+                .map_err(io::Error::other)?;
+            events.extend(step.events);
+            for out in step.outgoing {
+                deliver(net, out)?;
             }
         }
     }
-    match <[Vec<u8>; 1]>::try_from(messages) {
-        Ok([message]) => Ok(message),
-        Err(_) => Err(io::Error::other(
-            "expected exactly one message in the mailbox",
-        )),
+    Ok(events)
+}
+
+fn text(from: &str, body: &[u8]) -> Event {
+    Event::Message {
+        from: from.into(),
+        body: body.to_vec(),
     }
 }
 
@@ -128,7 +138,7 @@ fn expect(ok: bool) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other(
-            "self-test message did not come back intact",
+            "self-test did not see the expected events",
         ))
     }
 }

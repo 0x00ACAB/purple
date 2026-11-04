@@ -1,22 +1,24 @@
-//! Splitting messages into fixed-size packets and putting them back together.
+//! Splitting messages into fixed-size fragments and putting them back together. Each
+//! fragment fills exactly one sealed packet (see [`crate::queue`]).
 //!
-//! Packet layout: message ID (8 bytes), fragment index (u16 BE), fragment count (u16 BE),
-//! data length (u16 BE), the data, then zeros to the end of the packet. Every fragment but
+//! Fragment layout: message ID (8 bytes), fragment index (u16 BE), fragment count (u16 BE),
+//! data length (u16 BE), the data, then zeros to the end of the fragment. Every fragment but
 //! the last is full, so each message has exactly one valid encoding.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io;
 
-use purple_ipc::{PACKET_LEN, Packet};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
+
+use crate::queue::SEALED_LEN;
 
 const ID_LEN: usize = 8;
 const HEADER_LEN: usize = ID_LEN + 2 + 2 + 2;
 
 /// Data bytes that fit in one fragment.
-pub const FRAGMENT_DATA_LEN: usize = PACKET_LEN - HEADER_LEN;
+pub const FRAGMENT_DATA_LEN: usize = SEALED_LEN - HEADER_LEN;
 /// Most fragments one message may have, about 130 KB. Files will get their own chunking.
 pub const MAX_FRAGMENTS: u16 = 64;
 /// Most messages a [`Reassembler`] holds incomplete at once. With [`MAX_FRAGMENTS`] this
@@ -25,17 +27,17 @@ pub const MAX_IN_FLIGHT: usize = 32;
 
 type MessageId = [u8; ID_LEN];
 
-/// Split `message` into packets under a fresh random message ID.
+/// Split `message` into fragments of [`SEALED_LEN`] bytes under a fresh random message ID.
 ///
 /// # Errors
-/// Fails if `message` needs more than [`MAX_FRAGMENTS`] packets, or if the OS RNG fails.
-pub fn split(message: &[u8]) -> io::Result<Vec<Packet>> {
+/// Fails if `message` needs more than [`MAX_FRAGMENTS`] fragments, or if the OS RNG fails.
+pub fn split(message: &[u8]) -> io::Result<Vec<Vec<u8>>> {
     let mut id = [0u8; ID_LEN];
     OsRng.try_fill_bytes(&mut id).map_err(io::Error::other)?;
     split_with_id(message, id)
 }
 
-fn split_with_id(message: &[u8], id: MessageId) -> io::Result<Vec<Packet>> {
+fn split_with_id(message: &[u8], id: MessageId) -> io::Result<Vec<Vec<u8>>> {
     // An empty message is one fragment with no data.
     let chunks: Vec<&[u8]> = if message.is_empty() {
         vec![message]
@@ -53,9 +55,9 @@ fn split_with_id(message: &[u8], id: MessageId) -> io::Result<Vec<Packet>> {
         .collect()
 }
 
-fn encode(id: MessageId, index: u16, count: u16, data: &[u8]) -> io::Result<Packet> {
+fn encode(id: MessageId, index: u16, count: u16, data: &[u8]) -> io::Result<Vec<u8>> {
     let len = u16::try_from(data.len()).map_err(|_| invalid("fragment too large"))?;
-    let mut bytes = [0u8; PACKET_LEN];
+    let mut bytes = vec![0u8; SEALED_LEN];
     let (header, body) = bytes.split_at_mut(HEADER_LEN);
     header.copy_from_slice(
         &[
@@ -69,7 +71,7 @@ fn encode(id: MessageId, index: u16, count: u16, data: &[u8]) -> io::Result<Pack
     body.get_mut(..data.len())
         .ok_or_else(|| invalid("fragment too large"))?
         .copy_from_slice(data);
-    Packet::from_slice(&bytes)
+    Ok(bytes)
 }
 
 struct Fragment<'a> {
@@ -79,12 +81,12 @@ struct Fragment<'a> {
     data: &'a [u8],
 }
 
-fn decode(packet: &Packet) -> io::Result<Fragment<'_>> {
-    let short = || invalid("packet too short");
-    let (id, rest) = packet
-        .as_bytes()
-        .split_first_chunk::<ID_LEN>()
-        .ok_or_else(short)?;
+fn decode(fragment: &[u8]) -> io::Result<Fragment<'_>> {
+    if fragment.len() != SEALED_LEN {
+        return Err(invalid("fragment has the wrong length"));
+    }
+    let short = || invalid("fragment too short");
+    let (id, rest) = fragment.split_first_chunk::<ID_LEN>().ok_or_else(short)?;
     let (index, rest) = rest.split_first_chunk::<2>().ok_or_else(short)?;
     let (count, rest) = rest.split_first_chunk::<2>().ok_or_else(short)?;
     let (len, body) = rest.split_first_chunk::<2>().ok_or_else(short)?;
@@ -133,14 +135,14 @@ struct Partial {
 }
 
 impl Reassembler {
-    /// Add one packet. Returns the whole message once its last missing fragment arrives.
+    /// Add one fragment. Returns the whole message once its last missing fragment arrives.
     /// Exact duplicates of a fragment already held are ignored.
     ///
     /// # Errors
     /// Fails on a malformed fragment, one that conflicts with fragments already held, or a
     /// new message when [`MAX_IN_FLIGHT`] messages are already incomplete.
-    pub fn push(&mut self, packet: &Packet) -> io::Result<Option<Vec<u8>>> {
-        let fragment = decode(packet)?;
+    pub fn push(&mut self, fragment: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let fragment = decode(fragment)?;
         if fragment.count == 1 {
             return Ok(Some(fragment.data.to_vec()));
         }
@@ -198,7 +200,7 @@ mod tests {
         (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
     }
 
-    fn reassemble(packets: &[Packet]) -> Option<Vec<u8>> {
+    fn reassemble(packets: &[Vec<u8>]) -> Option<Vec<u8>> {
         let mut r = Reassembler::default();
         let mut out = None;
         for packet in packets {
@@ -268,13 +270,15 @@ mod tests {
 
     #[test]
     fn rejects_bad_length_and_dirty_padding() {
-        let mut bad_len = *encode([0; ID_LEN], 0, 1, b"hi").unwrap().as_bytes();
+        let mut bad_len = encode([0; ID_LEN], 0, 1, b"hi").unwrap();
         bad_len[HEADER_LEN - 2..HEADER_LEN].copy_from_slice(&u16::MAX.to_be_bytes());
-        assert!(decode(&Packet::from_slice(&bad_len).unwrap()).is_err());
+        assert!(decode(&bad_len).is_err());
 
-        let mut dirty = *encode([0; ID_LEN], 0, 1, b"hi").unwrap().as_bytes();
-        dirty[PACKET_LEN - 1] = 1;
-        assert!(decode(&Packet::from_slice(&dirty).unwrap()).is_err());
+        let mut dirty = encode([0; ID_LEN], 0, 1, b"hi").unwrap();
+        dirty[SEALED_LEN - 1] = 1;
+        assert!(decode(&dirty).is_err());
+
+        assert!(decode(&[0; SEALED_LEN - 1]).is_err());
     }
 
     #[test]

@@ -16,11 +16,10 @@ use libsignal_protocol::{
     SignalMessage, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
     Timestamp, message_decrypt, message_encrypt, process_prekey_bundle,
 };
-use purple_ipc::MailboxId;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
-use crate::invite::Invite;
+use crate::invite::{Invite, encode_bundle};
 
 /// libsignal puts the registration ID in the clear inside `PreKey` messages, and Signal uses
 /// a random one per install. A constant leaks nothing about who sent the message.
@@ -40,20 +39,32 @@ pub const TAG_WHISPER: u8 = 2;
 pub enum Error {
     /// libsignal rejected the operation: bad signature, untrusted identity, replay, etc.
     Signal(SignalProtocolError),
-    /// The wire bytes aren't a message purple accepts.
+    /// The bytes aren't something purple accepts.
     Malformed(&'static str),
+    /// Fragment reassembly or another I/O-level step failed.
+    Io(std::io::Error),
+    /// A name, invite or contact the call refers to doesn't exist or is already taken.
+    State(&'static str),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Signal(err) => write!(f, "signal protocol: {err}"),
-            Self::Malformed(msg) => write!(f, "malformed message: {msg}"),
+            Self::Malformed(msg) => write!(f, "malformed: {msg}"),
+            Self::Io(err) => write!(f, "{err}"),
+            Self::State(msg) => f.write_str(msg),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
 
 impl From<SignalProtocolError> for Error {
     fn from(err: SignalProtocolError) -> Self {
@@ -146,36 +157,24 @@ impl Account {
     }
 
     /// Create a one-time invite. Returns the invite for the QR code or link, and the
-    /// encrypted bundle to store at `bundle_mailbox`. The accepting side sends its first
-    /// message to `first_mailbox`.
+    /// encoded prekey bundle to store in the invite's bundle queue.
     ///
     /// # Errors
-    /// Fails if generating the prekeys or sealing the bundle fails.
-    pub fn create_invite(
-        &mut self,
-        bundle_mailbox: MailboxId,
-        first_mailbox: MailboxId,
-    ) -> Result<(Invite, Vec<u8>)> {
+    /// Fails if generating the prekeys fails.
+    pub fn create_invite(&mut self) -> Result<(Invite, Vec<u8>)> {
         let bundle = self.new_prekey_bundle()?;
         let identity = *block_on(self.store.get_identity_key_pair())?.identity_key();
-        Invite::create(identity, bundle_mailbox, first_mailbox, &bundle)
+        Ok((Invite::create(identity)?, encode_bundle(&bundle)?))
     }
 
-    /// Accept `invite` using the sealed bundle fetched from its mailbox, and start a session
-    /// with `peer`. Returns the mailbox to send the first message to.
+    /// Accept `invite` using the bundle fetched from its bundle queue, and start a session
+    /// with `peer`.
     ///
     /// # Errors
-    /// Fails if the bundle doesn't decrypt, or its signatures don't match the invite's
+    /// Fails if the bundle is malformed, or its signatures don't match the invite's
     /// identity key.
-    pub fn accept_invite(
-        &mut self,
-        peer: &str,
-        invite: &Invite,
-        sealed_bundle: &[u8],
-    ) -> Result<MailboxId> {
-        let (bundle, first_mailbox) = invite.open(sealed_bundle)?;
-        self.start_session(peer, &bundle)?;
-        Ok(first_mailbox)
+    pub fn accept_invite(&mut self, peer: &str, invite: &Invite, bundle: &[u8]) -> Result<()> {
+        self.start_session(peer, &invite.decode_bundle(bundle)?)
     }
 
     /// Start a session with `peer` from the bundle in their invite. The first message
