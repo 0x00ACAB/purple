@@ -2020,6 +2020,7 @@ name = "purple"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "purple-harden",
  "purple-ipc",
 ]
 

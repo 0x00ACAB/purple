@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 libc.workspace = true
+purple-harden.workspace = true
 purple-ipc.workspace = true
 
 [lints]

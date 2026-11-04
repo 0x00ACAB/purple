@@ -13,19 +13,40 @@ const APP_DIR: &str = "/app";
 const NET_STATE_DIR: &str = "/state";
 /// Where `purple-core` keeps its database inside its sandbox.
 pub(crate) const CORE_DATA_DIR: &str = "/data";
+/// Where `kpclientd`'s socket directory is mounted, in its sandbox and in `purple-net`'s.
+pub(crate) const KP_SOCKET_DIR: &str = "/run/kp";
+/// The socket path `kpclientd`'s config must listen on.
+pub(crate) const KP_SOCKET: &str = "/run/kp/kpclientd.sock";
+/// Where the `kpclientd` binary and its config are mounted in its sandbox.
+const KP_BINARY: &str = "/opt/kpclientd";
+pub(crate) const KP_CONFIG: &str = "/etc/purple/kpclientd.toml";
+/// Fds bwrap reads `kpclientd`'s seccomp filters from.
+pub(crate) const KP_SECCOMP_FDS: [RawFd; 2] = [10, 11];
 
 const MAX_PASSED_FDS: usize = 4;
 
 /// What one purple process is allowed to reach.
 #[derive(Debug)]
 pub(crate) enum Profile {
-    /// Network access plus its own state directory.
-    Net { state_dir: PathBuf },
+    /// Network access plus its own state directory, and `kpclientd`'s socket directory
+    /// (read-only) when that transport is in use.
+    Net {
+        state_dir: PathBuf,
+        kp_socket_dir: Option<PathBuf>,
+    },
     /// Its own data directory. No network, no display.
     Core { data_dir: PathBuf },
     /// The terminal it inherits only. No network, nothing writable. `WAYLAND_DISPLAY` is
     /// passed through so `purple-ui` can refuse to run outside a Wayland session.
     Ui { wayland_display: OsString },
+    /// Katzenpost's client daemon: network access, its config read-only, and the directory
+    /// it creates its socket in. purple can't modify it, so bwrap installs purple's seccomp
+    /// filters on it (from [`KP_SECCOMP_FDS`]).
+    KpClientd {
+        binary: PathBuf,
+        config: PathBuf,
+        socket_dir: PathBuf,
+    },
 }
 
 impl Profile {
@@ -34,6 +55,17 @@ impl Profile {
             Self::Net { .. } => "purple-net",
             Self::Core { .. } => "purple-core",
             Self::Ui { .. } => "purple-ui",
+            Self::KpClientd { .. } => "kpclientd",
+        }
+    }
+
+    /// The program to run inside the sandbox.
+    fn exec_path(&self) -> PathBuf {
+        match self {
+            Self::KpClientd { .. } => PathBuf::from(KP_BINARY),
+            Self::Net { .. } | Self::Core { .. } | Self::Ui { .. } => {
+                Path::new(APP_DIR).join(self.binary())
+            }
         }
     }
 }
@@ -89,7 +121,13 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
     out.extend(["--ro-bind".into(), bin_dir.into(), APP_DIR.into()]);
 
     match profile {
-        Profile::Net { state_dir } => {
+        Profile::Net {
+            state_dir,
+            kp_socket_dir,
+        } => {
+            if let Some(dir) = kp_socket_dir {
+                out.extend(["--ro-bind".into(), dir.into(), KP_SOCKET_DIR.into()]);
+            }
             out.extend(
                 [
                     "--share-net",
@@ -120,13 +158,22 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
                 wayland_display.clone(),
             ]);
         }
+        Profile::KpClientd {
+            binary,
+            config,
+            socket_dir,
+        } => {
+            out.push("--share-net".into());
+            out.extend(["--ro-bind".into(), binary.into(), KP_BINARY.into()]);
+            out.extend(["--ro-bind".into(), config.into(), KP_CONFIG.into()]);
+            out.extend(["--bind".into(), socket_dir.into(), KP_SOCKET_DIR.into()]);
+            for fd in KP_SECCOMP_FDS {
+                out.extend(["--add-seccomp-fd".into(), fd.to_string().into()]);
+            }
+        }
     }
 
-    out.extend([
-        "--chdir".into(),
-        "/".into(),
-        Path::new(APP_DIR).join(profile.binary()).into(),
-    ]);
+    out.extend(["--chdir".into(), "/".into(), profile.exec_path().into()]);
     out.extend(args.iter().map(OsString::from));
     out
 }
@@ -204,11 +251,57 @@ mod tests {
         args.iter().any(|arg| arg == needle)
     }
 
+    fn kpclientd() -> Profile {
+        Profile::KpClientd {
+            binary: "/opt/k/kpclientd".into(),
+            config: "/cfg/client.toml".into(),
+            socket_dir: "/run/user/1000/purple/kp".into(),
+        }
+    }
+
+    #[test]
+    fn kpclientd_gets_network_its_config_socket_dir_and_purples_seccomp() {
+        let args = bwrap_args(&kpclientd(), Path::new("/b"), &["-c", KP_CONFIG]);
+        assert!(has(&args, "--share-net"));
+        assert!(has(&args, "/opt/k/kpclientd") && has(&args, KP_BINARY));
+        assert!(has(&args, "/cfg/client.toml") && has(&args, KP_CONFIG));
+        assert!(has(&args, "/run/user/1000/purple/kp") && has(&args, KP_SOCKET_DIR));
+        assert_eq!(args.iter().filter(|a| *a == "--add-seccomp-fd").count(), 2);
+        assert_eq!(args[args.len() - 3], KP_BINARY);
+    }
+
+    #[test]
+    fn net_sees_the_kpclientd_socket_dir_only_when_asked_and_read_only() {
+        let with = bwrap_args(
+            &Profile::Net {
+                state_dir: "/s".into(),
+                kp_socket_dir: Some("/run/user/1000/purple/kp".into()),
+            },
+            Path::new("/b"),
+            &[],
+        );
+        let at = with
+            .iter()
+            .position(|a| a == "/run/user/1000/purple/kp")
+            .unwrap();
+        assert_eq!(with[at - 1], "--ro-bind");
+        assert_eq!(with[at + 1], KP_SOCKET_DIR);
+        let core = bwrap_args(
+            &Profile::Core {
+                data_dir: "/d".into(),
+            },
+            Path::new("/b"),
+            &[],
+        );
+        assert!(!has(&core, KP_SOCKET_DIR));
+    }
+
     #[test]
     fn every_profile_is_isolated() {
         let profiles = [
             Profile::Net {
                 state_dir: "/s".into(),
+                kp_socket_dir: None,
             },
             Profile::Core {
                 data_dir: "/d".into(),
@@ -216,6 +309,7 @@ mod tests {
             Profile::Ui {
                 wayland_display: "wayland-1".into(),
             },
+            kpclientd(),
         ];
         for profile in &profiles {
             let args = bwrap_args(profile, Path::new("/bin-dir"), &[]);
@@ -235,6 +329,7 @@ mod tests {
         let net = bwrap_args(
             &Profile::Net {
                 state_dir: "/s".into(),
+                kp_socket_dir: None,
             },
             Path::new("/b"),
             &[],

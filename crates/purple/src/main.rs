@@ -1,26 +1,31 @@
 //! purple launcher: starts `purple-net`, `purple-core` and `purple-ui`, each in its own
 //! bubblewrap sandbox, connected only by the sockets passed in here.
 //!
-//! Usage: `purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>]`. `--no-ui`
-//! runs the self-test instead of the TUI. `--dev-provider` points `purple-net` at a local
-//! `purple-devprovider`. `--send-interval-ms` sets the mean gap between packets in the
-//! cover stream (default 1000; the self-test uses 50 unless told otherwise).
+//! Usage: `purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>]
+//! [--kpclientd <binary> --kp-config <file>]`. `--no-ui` runs the self-test instead of the
+//! TUI. `--dev-provider` points `purple-net` at a local `purple-devprovider`.
+//! `--send-interval-ms` sets the mean gap between packets in the cover stream (default
+//! 1000; the self-test uses 50 unless told otherwise). `--kpclientd` and `--kp-config` also
+//! run Katzenpost's client daemon in a fifth sandbox, with its socket shared read-only with
+//! `purple-net`.
 
 mod sandbox;
 
 use std::ffi::OsString;
-use std::fs::{DirBuilder, File, OpenOptions};
-use std::io;
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode, Stdio};
 
+use purple_harden::sandbox::{Network, seccomp_programs};
 use purple_ipc::{CORE_NET_FD, CORE_UI_FD, NET_CORE_FD, UI_CORE_FD};
 use sandbox::Profile;
 
-const USAGE: &str = "usage: purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>]";
+const USAGE: &str = "usage: purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>] \
+                     [--kpclientd <binary> --kp-config <file>]";
 /// Mean send gap for the self-test, so it finishes in seconds.
 const SELF_TEST_SEND_INTERVAL_MS: &str = "50";
 
@@ -40,6 +45,8 @@ struct Options {
     no_ui: bool,
     dev_provider: Option<String>,
     send_interval_ms: Option<String>,
+    kpclientd: Option<PathBuf>,
+    kp_config: Option<PathBuf>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
@@ -53,6 +60,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
             "--send-interval-ms" => {
                 options.send_interval_ms =
                     Some(args.next().ok_or_else(|| io::Error::other(USAGE))?);
+            }
+            "--kpclientd" => {
+                options.kpclientd =
+                    Some(args.next().ok_or_else(|| io::Error::other(USAGE))?.into());
+            }
+            "--kp-config" => {
+                options.kp_config =
+                    Some(args.next().ok_or_else(|| io::Error::other(USAGE))?.into());
             }
             _ => return Err(io::Error::other(USAGE)),
         }
@@ -87,6 +102,8 @@ fn run() -> io::Result<bool> {
         );
     }
 
+    let kp = prepare_kpclientd(options.kpclientd, options.kp_config, sandboxed)?;
+
     let state_root = private_dir(&xdg_dir("XDG_STATE_HOME", ".local/state")?.join("purple"))?;
     let state_dir = private_dir(&state_root.join("net"))?;
     let data_dir = private_dir(&xdg_dir("XDG_DATA_HOME", ".local/share")?.join("purple/core"))?;
@@ -96,23 +113,30 @@ fn run() -> io::Result<bool> {
         None => None,
     };
 
-    let mut net_args: Vec<&str> = Vec::new();
-    if let Some(addr) = options.dev_provider.as_deref() {
-        net_args.extend(["--dev-provider", addr]);
-    }
-    let send_interval = match (options.send_interval_ms.as_deref(), options.no_ui) {
-        (Some(ms), _) => Some(ms),
-        (None, true) => Some(SELF_TEST_SEND_INTERVAL_MS),
-        (None, false) => None,
+    let net_args = net_args(
+        options.dev_provider.as_deref(),
+        options.send_interval_ms.as_deref(),
+        options.no_ui,
+    );
+
+    let kp_child = match &kp {
+        Some((binary, config, socket_dir)) => Some(spawn_kpclientd(
+            binary,
+            config,
+            socket_dir,
+            bin_dir,
+            Background(log.as_ref()),
+        )?),
+        None => None,
     };
-    if let Some(ms) = send_interval {
-        net_args.extend(["--send-interval-ms", ms]);
-    }
 
     let mut children = Vec::new();
     let (core_net, net_core) = UnixStream::pair()?;
     children.push(spawn(
-        &Profile::Net { state_dir },
+        &Profile::Net {
+            state_dir,
+            kp_socket_dir: kp.map(|(_, _, socket_dir)| socket_dir),
+        },
         bin_dir,
         sandboxed,
         &net_args,
@@ -120,9 +144,48 @@ fn run() -> io::Result<bool> {
         Background(log.as_ref()),
     )?);
 
+    children.extend(spawn_core_and_ui(
+        wayland_display,
+        data_dir,
+        bin_dir,
+        sandboxed,
+        &core_net,
+        log.as_ref(),
+    )?);
+    // The launcher's copies of the sockets close here, so each child sees EOF when its peer
+    // exits.
+    drop((core_net, net_core));
+
+    let mut all_ok = true;
+    for (name, mut child) in children {
+        let status = child.wait()?;
+        if !status.success() {
+            eprintln!("purple: {name} exited with {status}");
+            all_ok = false;
+        }
+    }
+    // kpclientd doesn't exit on its own. Killing its bwrap tears down the whole sandbox.
+    if let Some((_, mut child)) = kp_child {
+        child.kill().ok();
+        child.wait()?;
+    }
+    Ok(all_ok)
+}
+
+/// Start `purple-core`, and `purple-ui` when there's a display. With no display, core runs
+/// its self-test.
+fn spawn_core_and_ui(
+    wayland_display: Option<OsString>,
+    data_dir: PathBuf,
+    bin_dir: &Path,
+    sandboxed: bool,
+    core_net: &UnixStream,
+    log: Option<&File>,
+) -> io::Result<Vec<(String, Child)>> {
+    let mut out = Vec::new();
     match wayland_display {
         None => {
-            children.push(spawn(
+            out.push(spawn(
                 &Profile::Core { data_dir },
                 bin_dir,
                 sandboxed,
@@ -146,30 +209,133 @@ fn run() -> io::Result<bool> {
                     .ok_or_else(|| io::Error::other("data directory path is not UTF-8"))?
                     .to_owned()
             };
-            children.push(spawn(
+            out.push(spawn(
                 &Profile::Core { data_dir },
                 bin_dir,
                 sandboxed,
                 &["--data-dir", &data_arg],
                 &core_fds,
-                Background(log.as_ref()),
+                Background(log),
             )?);
-            children.push(spawn_ui(wayland_display, bin_dir, sandboxed, &ui_core)?);
+            out.push(spawn_ui(wayland_display, bin_dir, sandboxed, &ui_core)?);
         }
     }
-    // The launcher's copies of the sockets close here, so each child sees EOF when its peer
-    // exits.
-    drop((core_net, net_core));
+    Ok(out)
+}
 
-    let mut all_ok = true;
-    for (name, mut child) in children {
-        let status = child.wait()?;
-        if !status.success() {
-            eprintln!("purple: {name} exited with {status}");
-            all_ok = false;
-        }
+/// A `kpclientd` to run: its binary, its config, and the private directory for its socket.
+type KpSetup = (PathBuf, PathBuf, PathBuf);
+
+/// Check `--kpclientd`/`--kp-config` and prepare the socket directory.
+fn prepare_kpclientd(
+    binary: Option<PathBuf>,
+    config: Option<PathBuf>,
+    sandboxed: bool,
+) -> io::Result<Option<KpSetup>> {
+    let (binary, config) = match (binary, config) {
+        (Some(binary), Some(config)) => (binary, config),
+        (None, None) => return Ok(None),
+        _ => return Err(io::Error::other("--kpclientd and --kp-config go together")),
+    };
+    if !sandboxed {
+        return Err(io::Error::other(
+            "purple won't run kpclientd without bubblewrap around it",
+        ));
     }
-    Ok(all_ok)
+    check_kp_config(&fs::read_to_string(&config)?)?;
+    let socket_dir = private_dir(&runtime_dir()?.join("purple/kp"))?;
+    // A socket left by an earlier run would make kpclientd's bind fail.
+    match fs::remove_file(socket_dir.join("kpclientd.sock")) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+        Ok(()) | Err(_) => {}
+    }
+    Ok(Some((binary, config, socket_dir)))
+}
+
+/// Arguments for `purple-net`.
+fn net_args<'a>(
+    dev_provider: Option<&'a str>,
+    send_interval_ms: Option<&'a str>,
+    no_ui: bool,
+) -> Vec<&'a str> {
+    let mut args = Vec::new();
+    if let Some(addr) = dev_provider {
+        args.extend(["--dev-provider", addr]);
+    }
+    let send_interval = match (send_interval_ms, no_ui) {
+        (Some(ms), _) => Some(ms),
+        (None, true) => Some(SELF_TEST_SEND_INTERVAL_MS),
+        (None, false) => None,
+    };
+    if let Some(ms) = send_interval {
+        args.extend(["--send-interval-ms", ms]);
+    }
+    args
+}
+
+/// Run Katzenpost's client daemon sandboxed, with purple's seccomp filters installed by
+/// bwrap from pipes.
+fn spawn_kpclientd(
+    binary: &Path,
+    config: &Path,
+    socket_dir: &Path,
+    bin_dir: &Path,
+    background: Background<'_>,
+) -> io::Result<(String, Child)> {
+    let profile = Profile::KpClientd {
+        binary: binary.to_owned(),
+        config: config.to_owned(),
+        socket_dir: socket_dir.to_owned(),
+    };
+    let mut cmd = sandbox::command(&profile, bin_dir, true, &["-c", sandbox::KP_CONFIG]);
+    let mut readers = Vec::new();
+    for program in seccomp_programs(Network::Allowed)? {
+        let (reader, mut writer) = io::pipe()?;
+        writer.write_all(&program)?;
+        readers.push(reader);
+    }
+    let fds: Vec<(RawFd, RawFd)> = readers
+        .iter()
+        .map(AsRawFd::as_raw_fd)
+        .zip(sandbox::KP_SECCOMP_FDS)
+        .collect();
+    sandbox::pass_fds(&mut cmd, &fds)?;
+    cmd.stdin(Stdio::null());
+    if let Background(Some(log)) = background {
+        cmd.stdout(log.try_clone()?).stderr(log.try_clone()?);
+    }
+    let child = cmd.spawn()?;
+    drop(readers);
+    Ok((profile.binary().to_owned(), child))
+}
+
+/// Refuse a `kpclientd` config that wouldn't listen where `purple-net` connects, or that
+/// also listens on an abstract socket, which any local process could connect to.
+fn check_kp_config(text: &str) -> io::Result<()> {
+    if !text.contains(sandbox::KP_SOCKET) {
+        return Err(io::Error::other(format!(
+            "kpclientd config must set [Listen.Unix] Address = \"{}\"",
+            sandbox::KP_SOCKET
+        )));
+    }
+    let abstract_listen = text
+        .lines()
+        .map(str::trim)
+        .any(|line| line.starts_with("Address") && line.contains("\"@"));
+    if abstract_listen {
+        return Err(io::Error::other(
+            "kpclientd config listens on an abstract socket (\"@...\"); remove it",
+        ));
+    }
+    Ok(())
+}
+
+/// `$XDG_RUNTIME_DIR`, which must be set to an absolute path.
+fn runtime_dir() -> io::Result<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))
 }
 
 /// Stdio for a process that doesn't own the terminal: no stdin, and stdout/stderr to `log`
@@ -242,6 +408,16 @@ mod tests {
     }
 
     #[test]
+    fn kp_config_must_use_purples_socket_and_no_abstract_one() {
+        let good = "[Listen]\n  [Listen.Unix]\n    Addresses = [\"/run/kp/kpclientd.sock\"]\n";
+        assert!(check_kp_config(good).is_ok());
+        let wrong_path = "[Listen.Unix]\n    Addresses = [\"/tmp/k.sock\"]\n";
+        assert!(check_kp_config(wrong_path).is_err());
+        let with_abstract = format!("{good}    Address = \"@katzenpost\"\n");
+        assert!(check_kp_config(&with_abstract).is_err());
+    }
+
+    #[test]
     fn parses_flags() {
         assert!(!parse(&[]).unwrap().no_ui);
         assert!(parse(&["--no-ui"]).unwrap().no_ui);
@@ -249,6 +425,9 @@ mod tests {
         assert_eq!(opts.dev_provider.as_deref(), Some("127.0.0.1:7878"));
         assert!(opts.no_ui);
         assert!(parse(&["--dev-provider"]).is_err());
+        let kp = parse(&["--kpclientd", "/k", "--kp-config", "/c"]).unwrap();
+        assert_eq!(kp.kpclientd.as_deref(), Some(Path::new("/k")));
+        assert_eq!(kp.kp_config.as_deref(), Some(Path::new("/c")));
         let fast = parse(&["--send-interval-ms", "20"]).unwrap();
         assert_eq!(fast.send_interval_ms.as_deref(), Some("20"));
         assert!(parse(&["--bogus"]).is_err());

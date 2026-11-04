@@ -86,9 +86,51 @@ fn restrict_landlock(policy: &Policy<'_>) -> io::Result<RulesetStatus> {
 }
 
 fn restrict_syscalls(network: Network) -> io::Result<()> {
+    for program in filters(network, Exec::Deny)? {
+        seccompiler::apply_filter(&program).map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// Whether the filter denies `execve`/`execveat`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exec {
+    Deny,
+    Allow,
+}
+
+/// The seccomp filters [`restrict`] installs, as raw BPF programs.
+///
+/// Each is a `struct sock_filter` array in native byte order. They're for processes purple
+/// can't modify, such as `kpclientd`: bubblewrap installs them with `--add-seccomp-fd`
+/// and then has to exec the program, so these leave `execve` and `execveat` allowed.
+/// Everything else on the deny-list still applies.
+///
+/// # Errors
+/// Fails only if a filter can't be compiled.
+pub fn seccomp_programs(network: Network) -> io::Result<Vec<Vec<u8>>> {
+    Ok(filters(network, Exec::Allow)?
+        .iter()
+        .map(|program| {
+            program
+                .iter()
+                .flat_map(|insn| {
+                    let mut bytes = Vec::with_capacity(8);
+                    bytes.extend_from_slice(&insn.code.to_ne_bytes());
+                    bytes.push(insn.jt);
+                    bytes.push(insn.jf);
+                    bytes.extend_from_slice(&insn.k.to_ne_bytes());
+                    bytes
+                })
+                .collect()
+        })
+        .collect())
+}
+
+fn filters(network: Network, exec: Exec) -> io::Result<[BpfProgram; 2]> {
     let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(io::Error::other)?;
     let deny = SeccompFilter::new(
-        denied_syscalls(network)?,
+        denied_syscalls(network, exec)?,
         SeccompAction::Allow,
         SeccompAction::KillProcess,
         arch,
@@ -103,18 +145,15 @@ fn restrict_syscalls(network: Network) -> io::Result<()> {
         arch,
     )
     .map_err(io::Error::other)?;
-    for filter in [deny, clone3] {
-        let program = BpfProgram::try_from(filter).map_err(io::Error::other)?;
-        seccompiler::apply_filter(&program).map_err(io::Error::other)?;
-    }
-    Ok(())
+    Ok([
+        BpfProgram::try_from(deny).map_err(io::Error::other)?,
+        BpfProgram::try_from(clone3).map_err(io::Error::other)?,
+    ])
 }
 
 /// Syscalls no purple process needs once running.
 const ALWAYS_DENIED: &[libc::c_long] = &[
-    // Running other programs or reading other processes.
-    libc::SYS_execve,
-    libc::SYS_execveat,
+    // Reading or controlling other processes. (`execve` is added separately: see `Exec`.)
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
     libc::SYS_process_vm_writev,
@@ -182,14 +221,23 @@ const NAMESPACE_FLAGS: &[libc::c_int] = &[
     libc::CLONE_NEWCGROUP,
 ];
 
-fn denied_syscalls(network: Network) -> io::Result<BTreeMap<i64, Vec<SeccompRule>>> {
+fn denied_syscalls(network: Network, exec: Exec) -> io::Result<BTreeMap<i64, Vec<SeccompRule>>> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     let network_denied = if network == Network::Denied {
         NETWORK_DENIED
     } else {
         &[]
     };
-    for &nr in ALWAYS_DENIED.iter().chain(network_denied) {
+    let exec_denied: &[libc::c_long] = if exec == Exec::Deny {
+        &[libc::SYS_execve, libc::SYS_execveat]
+    } else {
+        &[]
+    };
+    for &nr in ALWAYS_DENIED
+        .iter()
+        .chain(network_denied)
+        .chain(exec_denied)
+    {
         // An empty rule list matches every call to the syscall.
         rules.insert(nr, Vec::new());
     }
@@ -391,6 +439,18 @@ mod tests {
             return;
         }
         assert!(run_child(SOCKETPAIR_TEST).success());
+    }
+
+    #[test]
+    fn exported_programs_are_whole_bpf_instructions() {
+        for network in [Network::Allowed, Network::Denied] {
+            let programs = seccomp_programs(network).unwrap();
+            assert_eq!(programs.len(), 2);
+            for program in programs {
+                assert!(!program.is_empty());
+                assert_eq!(program.len() % 8, 0);
+            }
+        }
     }
 
     const NET_TEST: &str = "sandbox::tests::network_process_keeps_tcp";
