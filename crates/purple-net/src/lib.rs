@@ -1,10 +1,14 @@
-//! Transports that carry packets between mailboxes, and the request loop that serves
-//! them to `purple-core` (or, in `purple-devprovider`, to other purple instances).
+//! Transports that carry packets between mailboxes, the request loop that serves them to
+//! `purple-core` (or, in `purple-devprovider`, to other purple instances), and the
+//! cover-traffic [`scheduler`].
+
+pub mod scheduler;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use purple_ipc::{MailboxId, NetMsg, Packet};
 
@@ -28,23 +32,75 @@ pub trait Transport {
 /// two clients talking through the same providers.
 #[derive(Clone, Debug, Default)]
 pub struct FakeTransport {
-    mailboxes: Arc<Mutex<HashMap<MailboxId, VecDeque<Packet>>>>,
+    network: Arc<Mutex<FakeNetwork>>,
+}
+
+#[derive(Debug, Default)]
+struct FakeNetwork {
+    mailboxes: HashMap<MailboxId, VecDeque<(Instant, Packet)>>,
+    retention: Option<Duration>,
+    sends: u64,
+}
+
+/// How many sends between sweeps for expired packets.
+const SWEEP_EVERY: u64 = 1024;
+
+impl FakeTransport {
+    /// A network that drops packets older than `retention`. Cover traffic goes to random
+    /// mailboxes nobody fetches, so without a limit those packets pile up forever.
+    #[must_use]
+    pub fn with_retention(retention: Duration) -> Self {
+        Self {
+            network: Arc::new(Mutex::new(FakeNetwork {
+                retention: Some(retention),
+                ..FakeNetwork::default()
+            })),
+        }
+    }
+}
+
+impl FakeNetwork {
+    fn sweep(&mut self, now: Instant) {
+        let retention = self.retention;
+        self.mailboxes.retain(|_, packets| {
+            packets.retain(|(stored, _)| !expired(retention, *stored, now));
+            !packets.is_empty()
+        });
+    }
+}
+
+fn expired(retention: Option<Duration>, stored: Instant, now: Instant) -> bool {
+    retention.is_some_and(|retention| now.saturating_duration_since(stored) > retention)
 }
 
 impl Transport for FakeTransport {
     fn send(&mut self, mailbox: &MailboxId, packet: Packet) -> io::Result<()> {
-        self.mailboxes
-            .lock()
-            .map_err(poisoned)?
+        let mut network = self.network.lock().map_err(poisoned)?;
+        let now = Instant::now();
+        network
+            .mailboxes
             .entry(*mailbox)
             .or_default()
-            .push_back(packet);
+            .push_back((now, packet));
+        network.sends = network.sends.wrapping_add(1);
+        if network.sends.is_multiple_of(SWEEP_EVERY) {
+            network.sweep(now);
+        }
+        drop(network);
         Ok(())
     }
 
     fn fetch(&mut self, mailbox: &MailboxId) -> io::Result<Vec<Packet>> {
-        let mut mailboxes = self.mailboxes.lock().map_err(poisoned)?;
-        Ok(mailboxes.remove(mailbox).map(Vec::from).unwrap_or_default())
+        let mut network = self.network.lock().map_err(poisoned)?;
+        let now = Instant::now();
+        let stored = network.mailboxes.remove(mailbox).unwrap_or_default();
+        let retention = network.retention;
+        drop(network);
+        Ok(stored
+            .into_iter()
+            .filter(|(at, _)| !expired(retention, *at, now))
+            .map(|(_, packet)| packet)
+            .collect())
     }
 }
 
@@ -161,6 +217,31 @@ mod tests {
         let mut net = FakeTransport::default();
         net.send(&MailboxId([1; 32]), packet(1)).unwrap();
         assert!(net.fetch(&MailboxId([2; 32])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expired_packets_are_dropped() {
+        let mailbox = MailboxId([5; 32]);
+        let mut instant = FakeTransport::with_retention(Duration::ZERO);
+        instant.send(&mailbox, packet(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(instant.fetch(&mailbox).unwrap().is_empty());
+
+        let mut lasting = FakeTransport::with_retention(Duration::from_hours(1));
+        lasting.send(&mailbox, packet(1)).unwrap();
+        assert_eq!(lasting.fetch(&mailbox).unwrap(), vec![packet(1)]);
+    }
+
+    #[test]
+    fn sweeps_unfetched_mailboxes() {
+        let mut net = FakeTransport::with_retention(Duration::ZERO);
+        for i in 0..SWEEP_EVERY {
+            let id = i.to_be_bytes();
+            let mut mailbox = [0u8; 32];
+            mailbox[..8].copy_from_slice(&id);
+            net.send(&MailboxId(mailbox), packet(0)).unwrap();
+        }
+        assert!(net.network.lock().unwrap().mailboxes.len() < 2);
     }
 
     #[test]

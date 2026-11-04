@@ -1,8 +1,10 @@
 //! purple launcher: starts `purple-net`, `purple-core` and `purple-ui`, each in its own
 //! bubblewrap sandbox, connected only by the sockets passed in here.
 //!
-//! Usage: `purple [--no-ui] [--dev-provider <addr>]`. `--no-ui` runs the self-test instead
-//! of the TUI. `--dev-provider` points `purple-net` at a local `purple-devprovider`.
+//! Usage: `purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>]`. `--no-ui`
+//! runs the self-test instead of the TUI. `--dev-provider` points `purple-net` at a local
+//! `purple-devprovider`. `--send-interval-ms` sets the mean gap between packets in the
+//! cover stream (default 1000; the self-test uses 50 unless told otherwise).
 
 mod sandbox;
 
@@ -18,7 +20,9 @@ use std::process::{Child, ExitCode, Stdio};
 use purple_ipc::{CORE_NET_FD, CORE_UI_FD, NET_CORE_FD, UI_CORE_FD};
 use sandbox::Profile;
 
-const USAGE: &str = "usage: purple [--no-ui] [--dev-provider <addr>]";
+const USAGE: &str = "usage: purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>]";
+/// Mean send gap for the self-test, so it finishes in seconds.
+const SELF_TEST_SEND_INTERVAL_MS: &str = "50";
 
 fn main() -> ExitCode {
     match run() {
@@ -35,6 +39,7 @@ fn main() -> ExitCode {
 struct Options {
     no_ui: bool,
     dev_provider: Option<String>,
+    send_interval_ms: Option<String>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
@@ -44,6 +49,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
             "--no-ui" => options.no_ui = true,
             "--dev-provider" => {
                 options.dev_provider = Some(args.next().ok_or_else(|| io::Error::other(USAGE))?);
+            }
+            "--send-interval-ms" => {
+                options.send_interval_ms =
+                    Some(args.next().ok_or_else(|| io::Error::other(USAGE))?);
             }
             _ => return Err(io::Error::other(USAGE)),
         }
@@ -87,10 +96,18 @@ fn run() -> io::Result<bool> {
         None => None,
     };
 
-    let net_args: Vec<&str> = options
-        .dev_provider
-        .as_deref()
-        .map_or_else(Vec::new, |addr| vec!["--dev-provider", addr]);
+    let mut net_args: Vec<&str> = Vec::new();
+    if let Some(addr) = options.dev_provider.as_deref() {
+        net_args.extend(["--dev-provider", addr]);
+    }
+    let send_interval = match (options.send_interval_ms.as_deref(), options.no_ui) {
+        (Some(ms), _) => Some(ms),
+        (None, true) => Some(SELF_TEST_SEND_INTERVAL_MS),
+        (None, false) => None,
+    };
+    if let Some(ms) = send_interval {
+        net_args.extend(["--send-interval-ms", ms]);
+    }
 
     let mut children = Vec::new();
     let (core_net, net_core) = UnixStream::pair()?;
@@ -232,6 +249,8 @@ mod tests {
         assert_eq!(opts.dev_provider.as_deref(), Some("127.0.0.1:7878"));
         assert!(opts.no_ui);
         assert!(parse(&["--dev-provider"]).is_err());
+        let fast = parse(&["--send-interval-ms", "20"]).unwrap();
+        assert_eq!(fast.send_interval_ms.as_deref(), Some("20"));
         assert!(parse(&["--bogus"]).is_err());
     }
 }

@@ -8,6 +8,7 @@ use std::io;
 use std::net::TcpListener;
 use std::process::ExitCode;
 use std::thread;
+use std::time::Duration;
 
 use landlock::RulesetStatus;
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
@@ -45,7 +46,8 @@ fn run() -> io::Result<()> {
         listener.local_addr()?
     );
 
-    let network = FakeTransport::default();
+    // Cover traffic goes to mailboxes nobody fetches; drop it after an hour.
+    let network = FakeTransport::with_retention(Duration::from_hours(1));
     for stream in listener.incoming() {
         let mut stream = stream?;
         let mut transport = network.clone();

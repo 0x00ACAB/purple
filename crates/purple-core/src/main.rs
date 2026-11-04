@@ -9,13 +9,14 @@
 //! Otherwise a crash after sending but before saving would restart from an older ratchet
 //! state and could reuse a message key.
 
+use std::collections::HashSet;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use landlock::RulesetStatus;
 use purple_core::invite::Invite;
@@ -24,11 +25,19 @@ use purple_core::session;
 use purple_core::vault::{HistoryEntry, KdfParams, Vault};
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_ipc::ui::{MAX_BODY_LEN, MAX_ERROR_LEN, UiCmd, UiEvent};
-use purple_ipc::{CORE_NET_FD, CORE_UI_FD, MailboxId, NetMsg, Packet, inherited_stream};
+use purple_ipc::{
+    CORE_NET_FD, CORE_UI_FD, MAILBOX_ID_LEN, MailboxId, NetMsg, Packet, inherited_stream,
+};
+use rand::RngCore;
+use rand::seq::SliceRandom;
 use zeroize::Zeroizing;
 
 const NAME: &str = "purple-core";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Fetches per poll round come in multiples of this.
+const POLL_ROUND: usize = 16;
+const SELF_TEST_POLLS: u32 = 200;
+const SELF_TEST_WAIT: Duration = Duration::from_millis(100);
 const USAGE: &str = "usage: purple-core (--no-ui | --data-dir <dir>)";
 
 fn main() -> ExitCode {
@@ -107,8 +116,12 @@ fn serve_ui(net: &mut UnixStream, mut ui: UnixStream, data_dir: &Path) -> io::Re
     );
     replay(&messenger, &vault, &mut ui)?;
 
+    // Polls run on a fixed clock, never in response to what the user does, so their
+    // timing says nothing about activity.
+    let mut next_poll = Instant::now();
     loop {
-        match commands.recv_timeout(POLL_INTERVAL) {
+        let wait = next_poll.saturating_duration_since(Instant::now());
+        match commands.recv_timeout(wait) {
             Ok(Ok(cmd)) => match handle(cmd, &mut messenger) {
                 Ok(effects) => commit(effects, &messenger, &mut vault, net, &mut ui)?,
                 Err(err) => report(&mut ui, &err.to_string())?,
@@ -117,12 +130,48 @@ fn serve_ui(net: &mut UnixStream, mut ui: UnixStream, data_dir: &Path) -> io::Re
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
-        let (effects, errors) = poll(net, &mut messenger, now()?)?;
-        commit(effects, &messenger, &mut vault, net, &mut ui)?;
-        for err in errors {
-            report(&mut ui, &format!("dropped a packet: {err}"))?;
+        if Instant::now() >= next_poll {
+            let (effects, errors) = poll(net, &mut messenger, now()?)?;
+            commit(effects, &messenger, &mut vault, net, &mut ui)?;
+            for err in errors {
+                report(&mut ui, &format!("dropped a packet: {err}"))?;
+            }
+            next_poll = next_on_grid(next_poll);
         }
     }
+}
+
+/// The next poll time on the fixed grid. If polling fell behind, skip the missed slots
+/// rather than polling in a burst.
+fn next_on_grid(previous: Instant) -> Instant {
+    let now = Instant::now();
+    let mut next = previous;
+    while next <= now {
+        next = next.checked_add(POLL_INTERVAL).unwrap_or(now);
+        if next == now {
+            break;
+        }
+    }
+    next
+}
+
+/// Pad `real` with random mailboxes up to a multiple of [`POLL_ROUND`] and shuffle, so the
+/// number and order of fetches don't reveal how many contacts or invites exist.
+fn padded_round(real: &[MailboxId]) -> Vec<MailboxId> {
+    let mut rng = rand::rng();
+    let target = real
+        .len()
+        .div_ceil(POLL_ROUND)
+        .max(1)
+        .saturating_mul(POLL_ROUND);
+    let mut round = real.to_vec();
+    while round.len() < target {
+        let mut mailbox = [0u8; MAILBOX_ID_LEN];
+        rng.fill_bytes(&mut mailbox);
+        round.push(MailboxId(mailbox));
+    }
+    round.shuffle(&mut rng);
+    round
 }
 
 /// Ask for the passphrase until the vault opens (or is created). `None` if the UI closes
@@ -303,8 +352,18 @@ fn poll(
 ) -> io::Result<(Effects, Vec<session::Error>)> {
     let mut effects = Effects::default();
     let mut errors = Vec::new();
-    for mailbox in messenger.mailboxes(now).map_err(io::Error::other)? {
-        for packet in fetch(net, mailbox)? {
+    let real: HashSet<MailboxId> = messenger
+        .mailboxes(now)
+        .map_err(io::Error::other)?
+        .into_iter()
+        .collect();
+    let round = padded_round(&real.iter().copied().collect::<Vec<_>>());
+    for mailbox in round {
+        let packets = fetch(net, mailbox)?;
+        if !real.contains(&mailbox) {
+            continue;
+        }
+        for packet in packets {
             effects.changed = true;
             match messenger.receive(mailbox, &packet, now) {
                 Ok(step) => {
@@ -412,19 +471,26 @@ fn self_test(net: &mut UnixStream) -> io::Result<()> {
 }
 
 /// [`poll`] for the self-test: no vault, and any rejected packet is a failure.
+/// Packets now wait for a send slot in purple-net, so poll until something arrives.
 fn self_test_poll(
     net: &mut UnixStream,
     messenger: &mut Messenger,
     now: u64,
 ) -> io::Result<Vec<UiEvent>> {
-    let (effects, errors) = poll(net, messenger, now)?;
-    if let Some(err) = errors.into_iter().next() {
-        return Err(io::Error::other(err));
+    for _ in 0..SELF_TEST_POLLS {
+        let (effects, errors) = poll(net, messenger, now)?;
+        if let Some(err) = errors.into_iter().next() {
+            return Err(io::Error::other(err));
+        }
+        for out in effects.outgoing {
+            deliver(net, out)?;
+        }
+        if !effects.events.is_empty() {
+            return Ok(effects.events);
+        }
+        thread::sleep(SELF_TEST_WAIT);
     }
-    for out in effects.outgoing {
-        deliver(net, out)?;
-    }
-    Ok(effects.events)
+    Err(io::Error::other("self-test timed out waiting for a packet"))
 }
 
 fn now() -> io::Result<u64> {
@@ -458,5 +524,32 @@ fn note_sandbox(report: &Report) {
             "{NAME}: warning: Landlock only {:?} on this kernel",
             report.landlock
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounds_are_padded_to_a_multiple_of_sixteen_and_keep_every_real_mailbox() {
+        for count in [0, 1, 15, 16, 17, 40] {
+            let real: Vec<MailboxId> = (0..count)
+                .map(|i| MailboxId([u8::try_from(i).unwrap(); MAILBOX_ID_LEN]))
+                .collect();
+            let round = padded_round(&real);
+            assert_eq!(round.len() % POLL_ROUND, 0, "{count}");
+            assert!(!round.is_empty());
+            assert!(round.len() < count + POLL_ROUND + 1);
+            assert!(real.iter().all(|m| round.contains(m)));
+        }
+    }
+
+    #[test]
+    fn grid_skips_missed_slots() {
+        let long_ago = Instant::now().checked_sub(POLL_INTERVAL * 5).unwrap();
+        let next = next_on_grid(long_ago);
+        assert!(next > Instant::now());
+        assert!(next <= Instant::now() + POLL_INTERVAL);
     }
 }
