@@ -281,6 +281,11 @@ impl Messenger {
     }
 
     fn check_name_free(&self, name: &str) -> Result<()> {
+        if !valid_name(name) {
+            return Err(Error::State(
+                "contact names are 1 to 32 characters: letters, digits, - and _",
+            ));
+        }
         if self.contacts.contains_key(name)
             || self.invites.contains_key(name)
             || self.accepting.contains_key(name)
@@ -289,6 +294,19 @@ impl Messenger {
         }
         Ok(())
     }
+}
+
+/// Longest contact name, in characters.
+pub const MAX_NAME_CHARS: usize = 32;
+
+/// Contact names are local labels: 1 to [`MAX_NAME_CHARS`] ASCII letters, digits, `-` and
+/// `_`. Keeping them plain means they are always safe to show in a terminal.
+#[must_use]
+pub fn valid_name(name: &str) -> bool {
+    (1..=MAX_NAME_CHARS).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The previous, current and next epoch at `now`.
@@ -468,6 +486,15 @@ mod tests {
                 .is_err()
         );
         assert!(bob.create_invite("alice").is_err());
+        for bad in [
+            "",
+            "has space",
+            "\u{1b}[2J",
+            "ünïcode",
+            &"x".repeat(MAX_NAME_CHARS + 1),
+        ] {
+            assert!(bob.create_invite(bad).is_err(), "{bad:?}");
+        }
         assert!(alice.send("carol", b"x", NOW).is_err());
     }
 }

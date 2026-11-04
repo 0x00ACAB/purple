@@ -1,10 +1,14 @@
-//! purple-net: relays packets between `purple-core` and the mixnet.
+//! purple-net: relays packets between `purple-core` and the network.
+//!
+//! With `--dev-provider <addr>` it forwards to a local `purple-devprovider`, so several
+//! purple instances on one machine can talk. Without it, it uses an in-memory network that
+//! only this instance can see.
 
 use std::io;
 use std::process::ExitCode;
 
-use purple_ipc::{NET_CORE_FD, NetMsg, inherited_stream};
-use purple_net::{FakeTransport, Transport};
+use purple_ipc::{NET_CORE_FD, inherited_stream};
+use purple_net::{DevProviderTransport, FakeTransport, serve};
 
 fn main() -> ExitCode {
     match run() {
@@ -19,27 +23,23 @@ fn main() -> ExitCode {
 #[expect(unsafe_code, reason = "adopting the socket the launcher passed in")]
 fn run() -> io::Result<()> {
     purple_harden::harden()?;
+    let dev_provider = dev_provider_arg()?;
     // SAFETY: the launcher hands this fd to purple-net and nothing else here uses it.
     let mut core = unsafe { inherited_stream(NET_CORE_FD)? };
-    // Swapped for the Nym client in build step 3.
-    let mut transport = FakeTransport::default();
-
-    while let Some(msg) = NetMsg::read_from(&mut core)? {
-        match msg {
-            NetMsg::Send { mailbox, packet } => transport.send(&mailbox, packet)?,
-            NetMsg::Fetch { mailbox } => {
-                for packet in transport.fetch(&mailbox)? {
-                    NetMsg::Delivered { mailbox, packet }.write_to(&mut core)?;
-                }
-                NetMsg::FetchDone { mailbox }.write_to(&mut core)?;
-            }
-            NetMsg::Delivered { .. } | NetMsg::FetchDone { .. } => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "purple-core sent a message only purple-net may send",
-                ));
-            }
-        }
+    // The mixnet transport replaces these once the Nym/Katzenpost choice is made.
+    match dev_provider {
+        Some(addr) => serve(&mut core, &mut DevProviderTransport::connect(&addr)?),
+        None => serve(&mut core, &mut FakeTransport::default()),
     }
-    Ok(())
+}
+
+fn dev_provider_arg() -> io::Result<Option<String>> {
+    let mut args = std::env::args().skip(1);
+    match (args.next().as_deref(), args.next(), args.next()) {
+        (None, _, _) => Ok(None),
+        (Some("--dev-provider"), Some(addr), None) => Ok(Some(addr)),
+        _ => Err(io::Error::other(
+            "usage: purple-net [--dev-provider <addr>]",
+        )),
+    }
 }

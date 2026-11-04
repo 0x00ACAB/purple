@@ -1,4 +1,5 @@
-//! Messages between purple's processes, and the framing that carries them.
+//! Messages between purple's processes, and the framing that carries them. Messages
+//! between `purple-core` and `purple-net` are here; those with `purple-ui` are in [`ui`].
 //!
 //! Every message has a fixed layout and the decoder rejects anything else: unknown tags,
 //! wrong lengths, oversized frames. Keep it that way, since `purple-core` parses these
@@ -8,6 +9,8 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+
+pub mod ui;
 
 /// Size of every packet on the wire. Placeholder until the Nym packet size is wired in.
 pub const PACKET_LEN: usize = 2048;
@@ -23,7 +26,7 @@ pub const CORE_NET_FD: RawFd = 4;
 /// Fd where `purple-net` finds its socket to `purple-core`.
 pub const NET_CORE_FD: RawFd = 3;
 
-const MAX_FRAME: usize = 1 + MAILBOX_ID_LEN + PACKET_LEN;
+const MAX_NET_FRAME: usize = 1 + MAILBOX_ID_LEN + PACKET_LEN;
 
 const TAG_SEND: u8 = 1;
 const TAG_FETCH: u8 = 2;
@@ -102,7 +105,7 @@ impl NetMsg {
             Self::Delivered { mailbox, packet } => (TAG_DELIVERED, mailbox, Some(packet)),
             Self::FetchDone { mailbox } => (TAG_FETCH_DONE, mailbox, None),
         };
-        let mut out = Vec::with_capacity(MAX_FRAME);
+        let mut out = Vec::with_capacity(MAX_NET_FRAME);
         out.push(tag);
         out.extend_from_slice(&mailbox.0);
         if let Some(packet) = packet {
@@ -144,7 +147,7 @@ impl NetMsg {
     /// # Errors
     /// Fails if the write fails.
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
-        write_frame(w, &self.encode())
+        write_frame(w, &self.encode(), MAX_NET_FRAME)
     }
 
     /// Read one message. Returns `None` on a clean EOF between frames.
@@ -152,16 +155,18 @@ impl NetMsg {
     /// # Errors
     /// Fails on a read error, a truncated or oversized frame, or an invalid message.
     pub fn read_from(r: &mut impl Read) -> io::Result<Option<Self>> {
-        read_frame(r)?.map(|frame| Self::decode(&frame)).transpose()
+        read_frame(r, MAX_NET_FRAME)?
+            .map(|frame| Self::decode(&frame))
+            .transpose()
     }
 }
 
 /// Write `body` with a 4-byte big-endian length prefix.
 ///
 /// # Errors
-/// Fails if `body` is larger than the biggest message, or if the write fails.
-pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
-    if body.len() > MAX_FRAME {
+/// Fails if `body` is longer than `max`, or if the write fails.
+pub fn write_frame(w: &mut impl Write, body: &[u8], max: usize) -> io::Result<()> {
+    if body.len() > max {
         return Err(invalid("frame too large"));
     }
     let len = u32::try_from(body.len()).map_err(|_| invalid("frame too large"))?;
@@ -173,8 +178,9 @@ pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
 /// Read one length-prefixed frame. Returns `None` on a clean EOF before the frame starts.
 ///
 /// # Errors
-/// Fails on a read error, a truncated frame, or a length over the biggest message.
-pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+/// Fails on a read error, a truncated frame, or a length over `max`. The length is checked
+/// before anything is allocated.
+pub fn read_frame(r: &mut impl Read, max: usize) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
     let first = loop {
         match r.read(&mut header) {
@@ -193,7 +199,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     }
     let len =
         usize::try_from(u32::from_be_bytes(header)).map_err(|_| invalid("frame too large"))?;
-    if len > MAX_FRAME {
+    if len > max {
         return Err(invalid("frame too large"));
     }
     let mut body = vec![0u8; len];
@@ -233,7 +239,7 @@ pub unsafe fn inherited_stream(fd: RawFd) -> io::Result<UnixStream> {
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
-fn invalid(msg: &'static str) -> io::Error {
+pub(crate) fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
@@ -303,15 +309,15 @@ mod tests {
     #[test]
     fn rejects_oversized_frame_before_allocating() {
         let header = u32::MAX.to_be_bytes();
-        assert!(read_frame(&mut &header[..]).is_err());
+        assert!(read_frame(&mut &header[..], MAX_NET_FRAME).is_err());
     }
 
     #[test]
     fn rejects_truncated_frame() {
         let mut bytes = Vec::new();
-        write_frame(&mut bytes, &[1, 2, 3]).unwrap();
+        write_frame(&mut bytes, &[1, 2, 3], MAX_NET_FRAME).unwrap();
         bytes.pop();
-        assert!(read_frame(&mut &bytes[..]).is_err());
-        assert!(read_frame(&mut &bytes[..2]).is_err());
+        assert!(read_frame(&mut &bytes[..], MAX_NET_FRAME).is_err());
+        assert!(read_frame(&mut &bytes[..2], MAX_NET_FRAME).is_err());
     }
 }

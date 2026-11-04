@@ -13,9 +13,6 @@ const APP_DIR: &str = "/app";
 const NET_STATE_DIR: &str = "/state";
 /// Where `purple-core` keeps its database inside its sandbox.
 const CORE_DATA_DIR: &str = "/data";
-/// Runtime dir and socket name `purple-ui` sees inside its sandbox.
-const UI_RUNTIME_DIR: &str = "/run/purple";
-const UI_WAYLAND_NAME: &str = "wayland-0";
 
 const MAX_PASSED_FDS: usize = 4;
 
@@ -26,8 +23,9 @@ pub(crate) enum Profile {
     Net { state_dir: PathBuf },
     /// Its own data directory. No network, no display.
     Core { data_dir: PathBuf },
-    /// The Wayland socket only. No network, nothing writable.
-    Ui { wayland_socket: PathBuf },
+    /// The terminal it inherits only. No network, nothing writable. `WAYLAND_DISPLAY` is
+    /// passed through so `purple-ui` can refuse to run outside a Wayland session.
+    Ui { wayland_display: OsString },
 }
 
 impl Profile {
@@ -115,11 +113,12 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
         Profile::Core { data_dir } => {
             out.extend(["--bind".into(), data_dir.into(), CORE_DATA_DIR.into()]);
         }
-        Profile::Ui { wayland_socket } => {
-            let inner = Path::new(UI_RUNTIME_DIR).join(UI_WAYLAND_NAME);
-            out.extend(["--ro-bind".into(), wayland_socket.into(), inner.into()]);
-            out.extend(["--setenv", "XDG_RUNTIME_DIR", UI_RUNTIME_DIR].map(OsString::from));
-            out.extend(["--setenv", "WAYLAND_DISPLAY", UI_WAYLAND_NAME].map(OsString::from));
+        Profile::Ui { wayland_display } => {
+            out.extend([
+                "--setenv".into(),
+                "WAYLAND_DISPLAY".into(),
+                wayland_display.clone(),
+            ]);
         }
     }
 
@@ -147,8 +146,8 @@ pub(crate) fn command(
     }
     let mut cmd = Command::new(bin_dir.join(profile.binary()));
     cmd.env_clear().args(args);
-    if let Profile::Ui { wayland_socket } = profile {
-        cmd.env("WAYLAND_DISPLAY", wayland_socket);
+    if let Profile::Ui { wayland_display } = profile {
+        cmd.env("WAYLAND_DISPLAY", wayland_display);
     }
     cmd
 }
@@ -215,7 +214,7 @@ mod tests {
                 data_dir: "/d".into(),
             },
             Profile::Ui {
-                wayland_socket: "/w".into(),
+                wayland_display: "wayland-1".into(),
             },
         ];
         for profile in &profiles {
@@ -249,7 +248,7 @@ mod tests {
         );
         let ui = bwrap_args(
             &Profile::Ui {
-                wayland_socket: "/w".into(),
+                wayland_display: "wayland-1".into(),
             },
             Path::new("/b"),
             &[],
@@ -260,10 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn only_ui_gets_the_wayland_socket() {
+    fn ui_gets_wayland_display_but_nothing_to_bind() {
         let ui = bwrap_args(
             &Profile::Ui {
-                wayland_socket: "/w".into(),
+                wayland_display: "wayland-1".into(),
             },
             Path::new("/b"),
             &[],
@@ -275,8 +274,8 @@ mod tests {
             Path::new("/b"),
             &[],
         );
-        assert!(has(&ui, "/w"));
         assert!(has(&ui, "WAYLAND_DISPLAY"));
+        assert!(!has(&ui, "--bind"));
         assert!(!has(&core, "WAYLAND_DISPLAY"));
     }
 

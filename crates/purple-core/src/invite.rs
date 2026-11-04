@@ -27,6 +27,11 @@ const KEY_LEN: usize = 32;
 /// Length of an encoded invite.
 pub const INVITE_LEN: usize = 1 + IDENTITY_LEN + KEY_LEN;
 
+/// Prefix of an invite's text form.
+pub const TEXT_PREFIX: &str = "purple1";
+/// Length of an invite's text form.
+pub const TEXT_LEN: usize = TEXT_PREFIX.len() + 2 * INVITE_LEN;
+
 /// What goes in the QR code or link.
 #[derive(Clone)]
 pub struct Invite {
@@ -76,6 +81,39 @@ impl Invite {
         let key = Zeroizing::new(r.take::<KEY_LEN>()?);
         r.finish()?;
         Ok(Self { identity, key })
+    }
+
+    /// Text form for pasting: [`TEXT_PREFIX`] followed by the encoded invite in lowercase hex.
+    #[must_use]
+    pub fn to_text(&self) -> Zeroizing<String> {
+        let mut out = Zeroizing::new(String::with_capacity(TEXT_LEN));
+        out.push_str(TEXT_PREFIX);
+        for byte in self.encode().iter() {
+            out.push(hex_digit(byte >> 4));
+            out.push(hex_digit(byte & 0x0F));
+        }
+        out
+    }
+
+    /// Parse the text form. Surrounding whitespace is ignored; hex may be either case.
+    ///
+    /// # Errors
+    /// Fails on a missing prefix, non-hex characters, or an invalid invite.
+    pub fn from_text(text: &str) -> Result<Self> {
+        let hex = text
+            .trim()
+            .strip_prefix(TEXT_PREFIX)
+            .ok_or(Error::Malformed("invite text must start with purple1"))?;
+        let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+            hex.as_bytes()
+                .chunks(2)
+                .map(|pair| match pair {
+                    [high, low] => Ok(hex_value(*high)? << 4 | hex_value(*low)?),
+                    _ => Err(Error::Malformed("invite text has an odd length")),
+                })
+                .collect::<Result<_>>()?,
+        );
+        Self::decode(&bytes)
     }
 
     /// Queue where the inviter stores the prekey bundle.
@@ -134,6 +172,34 @@ pub(crate) fn encode_bundle(bundle: &PreKeyBundle) -> Result<Vec<u8>> {
     put_bytes(&mut out, &bundle.kyber_pre_key_public()?.serialize())?;
     put_bytes(&mut out, bundle.kyber_pre_key_signature()?)?;
     Ok(out)
+}
+
+const fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0 => '0',
+        1 => '1',
+        2 => '2',
+        3 => '3',
+        4 => '4',
+        5 => '5',
+        6 => '6',
+        7 => '7',
+        8 => '8',
+        9 => '9',
+        10 => 'a',
+        11 => 'b',
+        12 => 'c',
+        13 => 'd',
+        14 => 'e',
+        _ => 'f',
+    }
+}
+
+fn hex_value(digit: u8) -> Result<u8> {
+    char::from(digit)
+        .to_digit(16)
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or(Error::Malformed("invite text has a non-hex character"))
 }
 
 fn curve_key(bytes: &[u8]) -> Result<PublicKey> {
@@ -232,6 +298,28 @@ mod tests {
         let mut bad_identity = good.to_vec();
         bad_identity[1] = 0xFF;
         assert!(Invite::decode(&bad_identity).is_err());
+    }
+
+    #[test]
+    fn text_form_round_trips_and_rejects_garbage() {
+        let (invite, _) = Account::generate().unwrap().create_invite().unwrap();
+        let text = invite.to_text();
+        assert!(text.starts_with(TEXT_PREFIX));
+        assert_eq!(text.len(), TEXT_LEN);
+        let pasted = format!(
+            "  {}\n",
+            text.to_uppercase().replacen("PURPLE1", "purple1", 1)
+        );
+        assert_eq!(
+            *Invite::from_text(&pasted).unwrap().encode(),
+            *invite.encode()
+        );
+
+        let cut = |range: std::ops::Range<usize>| text.get(range).unwrap().to_owned();
+        assert!(Invite::from_text(&cut(TEXT_PREFIX.len()..TEXT_LEN)).is_err());
+        assert!(Invite::from_text(&cut(0..TEXT_LEN - 1)).is_err());
+        assert!(Invite::from_text(&(cut(0..TEXT_LEN - 2) + "zz")).is_err());
+        assert!(Invite::from_text(&(cut(0..TEXT_LEN - 2) + "é")).is_err());
     }
 
     #[test]
