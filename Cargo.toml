@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+# libsignal is AGPL, so purple is too.
+license = "AGPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+libc = "0.2"
+purple-harden = { path = "crates/purple-harden" }
+purple-ipc = { path = "crates/purple-ipc" }
+
+[workspace.lints.rust]
+# Every unsafe operation is opted into explicitly with #[expect(unsafe_code, reason = "...")].
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+non_ascii_idents = "deny"
+unused_must_use = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+let_underscore_drop = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Panics: errors are returned, never unwrapped. clippy.toml relaxes these in tests.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+exit = "deny"
+# Silent truncation and overflow.
+as_conversions = "deny"
+arithmetic_side_effects = "deny"
+# Unsafe hygiene.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+mem_forget = "deny"
+# Lint suppressions must say why.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+# Misc.
+let_underscore_must_use = "deny"
+string_slice = "deny"
+wildcard_enum_match_arm = "warn"
+shadow_unrelated = "warn"
+unwrap_in_result = "warn"
+# Contradicts rustc's unreachable_pub in binary crates; unreachable_pub wins.
+redundant_pub_crate = "allow"
+
+[profile.release]
+# Overflow panics (then aborts) instead of wrapping silently.
+overflow-checks = true
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = "symbols"

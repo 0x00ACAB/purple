@@ -1,0 +1,7 @@
+/target
+
+# AI-assistant artifacts stay local.
+.claude/
+CLAUDE.md
+AGENTS.md
+docs/superpowers/
