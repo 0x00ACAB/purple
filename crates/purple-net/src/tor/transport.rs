@@ -23,6 +23,12 @@ const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_mins(1);
 /// Read attempts before a read counts as finding nothing; core asks again next poll.
 const READ_ATTEMPTS: u32 = 2;
+/// Most requests sent on one connection before reading their answers. Keeps what's
+/// written ahead (about 25 KB of puts) well inside socket buffers.
+const MAX_BATCH: usize = 16;
+/// How long one connection may sit on a connect, read or write. Building a circuit to an
+/// onion service can take tens of seconds; minutes means it's gone.
+pub const CONN_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// A connection to the store.
 pub trait Conn: Read + Write + Send {}
@@ -46,15 +52,17 @@ pub struct OnionDial {
     pub host: String,
     /// The onion service's port.
     pub port: u16,
+    /// How long a connect, read or write may take before the connection counts as dead.
+    pub timeout: Duration,
 }
 
 impl Dial for OnionDial {
     fn dial(&self, isolation: &str) -> io::Result<Box<dyn Conn>> {
+        let stream = UnixStream::connect(&self.socks)?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        stream.set_write_timeout(Some(self.timeout))?;
         Ok(Box::new(socks_connect(
-            &self.socks,
-            isolation,
-            &self.host,
-            self.port,
+            stream, isolation, &self.host, self.port,
         )?))
     }
 }
@@ -71,10 +79,10 @@ pub struct DirectDial {
 
 impl Dial for DirectDial {
     fn dial(&self, _isolation: &str) -> io::Result<Box<dyn Conn>> {
-        Ok(Box::new(NoiseStream::client(
-            UnixStream::connect(&self.relay)?,
-            &self.key,
-        )?))
+        let stream = UnixStream::connect(&self.relay)?;
+        stream.set_read_timeout(Some(CONN_TIMEOUT))?;
+        stream.set_write_timeout(Some(CONN_TIMEOUT))?;
+        Ok(Box::new(NoiseStream::client(stream, &self.key)?))
     }
 }
 
@@ -111,11 +119,77 @@ enum Job {
         at: BoxRef,
         packet: Packet,
         done: Option<Sink>,
+        /// Cover traffic: one attempt, dropped if it fails, so cover can't pile up while
+        /// the store is unreachable.
+        cover: bool,
     },
     Read {
         at: BoxRef,
         done: Sink,
+        /// Attempts so far.
+        tries: u32,
     },
+}
+
+impl Job {
+    fn request(&self) -> ProviderMsg {
+        match self {
+            Self::Write { at, packet, .. } => ProviderMsg::Put {
+                addr: box_address(at),
+                packet: packet.clone(),
+            },
+            Self::Read { at, .. } => ProviderMsg::Get {
+                addr: box_address(at),
+            },
+        }
+    }
+
+    /// Report the store's `answer`; false if it doesn't answer this job.
+    fn answer(&self, answer: ProviderMsg) -> bool {
+        match (self, answer) {
+            (Self::Write { at, done, .. }, ProviderMsg::Stored { addr })
+                if addr == box_address(at) =>
+            {
+                report_write(done.as_ref(), at, true);
+            }
+            (Self::Write { at, done, .. }, ProviderMsg::Taken { addr })
+                if addr == box_address(at) =>
+            {
+                report_write(done.as_ref(), at, false);
+            }
+            (Self::Read { at, done, .. }, ProviderMsg::Found { addr, packet })
+                if addr == box_address(at) =>
+            {
+                report(done, at, Ok(Some(packet)));
+            }
+            (Self::Read { at, done, .. }, ProviderMsg::Empty { addr })
+                if addr == box_address(at) =>
+            {
+                report(done, at, Ok(None));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// What's left of a job that got no answer: real writes are tried again until they
+    /// land, reads up to [`READ_ATTEMPTS`] times and then count as finding nothing (core
+    /// asks again next poll), cover writes are dropped.
+    fn failed(self) -> Option<Self> {
+        match self {
+            Self::Write { cover: true, .. } => None,
+            write @ Self::Write { .. } => Some(write),
+            Self::Read { at, done, tries } => {
+                let tries = tries.saturating_add(1);
+                if tries >= READ_ATTEMPTS {
+                    report(&done, &at, Ok(None));
+                    None
+                } else {
+                    Some(Self::Read { at, done, tries })
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -183,6 +257,7 @@ impl Transport for TorTransport {
             at: *at,
             packet,
             done: done.cloned(),
+            cover: false,
         };
         self.send(isolation_key(&at.stream), job)
     }
@@ -193,6 +268,7 @@ impl Transport for TorTransport {
             Job::Read {
                 at: *at,
                 done: done.clone(),
+                tries: 0,
             },
         )
     }
@@ -204,6 +280,7 @@ impl Transport for TorTransport {
             Job::Read {
                 at: *at,
                 done: done.clone(),
+                tries: 0,
             },
         )
     }
@@ -217,84 +294,80 @@ impl Transport for TorTransport {
                 at,
                 packet,
                 done: None,
+                cover: true,
             },
         )
     }
 }
 
-/// One connection's thread: run its jobs in order, reconnecting as needed.
+/// One connection's thread. It sends every job waiting (up to [`MAX_BATCH`]) before reading
+/// the answers, which come back in order, so one round trip through the circuit carries
+/// many requests. Jobs without an answer are retried after a backoff, reconnecting first.
 fn work(key: &str, dialer: &Dialer, retry: Retry, jobs: &mpsc::Receiver<Job>) {
     let mut conn = None;
-    for job in jobs {
-        match job {
-            Job::Write { at, packet, done } => {
-                let addr = box_address(&at);
-                let mut wait = retry.first;
-                loop {
-                    let put = ProviderMsg::Put {
-                        addr,
-                        packet: packet.clone(),
-                    };
-                    match exchange(&mut conn, dialer, key, &put) {
-                        Ok(ProviderMsg::Stored { addr: got }) if got == addr => {
-                            report_write(done.as_ref(), &at, true);
-                            break;
-                        }
-                        Ok(ProviderMsg::Taken { addr: got }) if got == addr => {
-                            report_write(done.as_ref(), &at, false);
-                            break;
-                        }
-                        Ok(_) => {
-                            conn = None;
-                            eprintln!(
-                                "purple-net: the store answered a write wrongly; retrying in {wait:?}"
-                            );
-                        }
-                        Err(err) => {
-                            conn = None;
-                            eprintln!(
-                                "purple-net: a box write failed, retrying in {wait:?}: {err}"
-                            );
-                        }
-                    }
-                    thread::sleep(wait);
-                    wait = wait.saturating_mul(2).min(retry.max);
-                }
+    let mut retrying: Vec<Job> = Vec::new();
+    let mut wait = retry.first;
+    loop {
+        let mut batch = std::mem::take(&mut retrying);
+        if batch.is_empty() {
+            match jobs.recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => return,
             }
-            Job::Read { at, done } => {
-                let addr = box_address(&at);
-                let mut found = None;
-                for _ in 0..READ_ATTEMPTS {
-                    match exchange(&mut conn, dialer, key, &ProviderMsg::Get { addr }) {
-                        Ok(ProviderMsg::Found { addr: got, packet }) if got == addr => {
-                            found = Some(packet);
-                            break;
-                        }
-                        Ok(ProviderMsg::Empty { addr: got }) if got == addr => break,
-                        Ok(_) | Err(_) => conn = None,
-                    }
-                }
-                report(&done, &at, Ok(found));
+        }
+        while batch.len() < MAX_BATCH {
+            match jobs.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
             }
+        }
+        let answered = run_batch(&mut conn, dialer, key, &batch);
+        let unanswered = batch.split_off(answered.min(batch.len()));
+        if unanswered.is_empty() {
+            wait = retry.first;
+            continue;
+        }
+        conn = None;
+        retrying = unanswered.into_iter().filter_map(Job::failed).collect();
+        if !retrying.is_empty() {
+            eprintln!("purple-net: the store didn't answer; retrying in {wait:?}");
+            thread::sleep(wait);
+            wait = wait.saturating_mul(2).min(retry.max);
         }
     }
 }
 
-/// Send `msg` and wait for the answer, connecting first if needed.
-fn exchange(
-    conn: &mut Option<Box<dyn Conn>>,
-    dialer: &Dialer,
-    key: &str,
-    msg: &ProviderMsg,
-) -> io::Result<ProviderMsg> {
+/// Send every job's request, then read answers in order. Returns how many jobs were
+/// answered before the connection failed or answered wrongly.
+fn run_batch(conn: &mut Option<Box<dyn Conn>>, dialer: &Dialer, key: &str, batch: &[Job]) -> usize {
     let c = match conn {
         Some(c) => c,
-        None => conn.insert(dialer.current().dial(key)?),
+        None => match dialer.current().dial(key) {
+            Ok(fresh) => conn.insert(fresh),
+            Err(err) => {
+                eprintln!("purple-net: can't reach the store: {err}");
+                return 0;
+            }
+        },
     };
-    msg.write_to(c)?;
-    c.flush()?;
-    ProviderMsg::read_from(c)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the store hung up"))
+    let sent = batch
+        .iter()
+        .try_for_each(|job| job.request().write_to(c))
+        .and_then(|()| c.flush());
+    if sent.is_err() {
+        return 0;
+    }
+    let mut answered: usize = 0;
+    for job in batch {
+        let Ok(Some(answer)) = ProviderMsg::read_from(c) else {
+            break;
+        };
+        if !job.answer(answer) {
+            break;
+        }
+        answered = answered.saturating_add(1);
+    }
+    answered
 }
 
 #[cfg(test)]
@@ -319,6 +392,32 @@ mod tests {
         slow: Mutex<Option<String>>,
         dialed: Mutex<Vec<String>>,
         dials: AtomicUsize,
+        /// One-way delay on every byte, like a circuit's.
+        latency: Option<Duration>,
+    }
+
+    /// Copy `from` to `to`, delivering each chunk `delay` after it was read.
+    fn delayed_copy(mut from: UnixStream, mut to: UnixStream, delay: Duration) {
+        let (tx, rx) = mpsc::channel::<(std::time::Instant, Vec<u8>)>();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = from.read(&mut buf) {
+                if tx
+                    .send((std::time::Instant::now(), buf[..n].to_vec()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        thread::spawn(move || {
+            for (at, bytes) in rx {
+                thread::sleep(delay.saturating_sub(at.elapsed()));
+                if to.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        });
     }
 
     impl Dial for MemDial {
@@ -344,6 +443,12 @@ mod tests {
                 thread::sleep(Duration::from_secs(2));
             }
             let (ours, mut theirs) = UnixStream::pair()?;
+            if let Some(delay) = self.latency {
+                let (near, far) = UnixStream::pair()?;
+                delayed_copy(theirs.try_clone()?, far.try_clone()?, delay);
+                delayed_copy(far, theirs, delay);
+                theirs = near;
+            }
             let store = self.store.clone();
             if self.drop_after_put.swap(false, Ordering::SeqCst) {
                 thread::spawn(move || {
@@ -485,6 +590,57 @@ mod tests {
             dial.store.get(&box_address(&at(1, 0))).unwrap(),
             Some(packet(1))
         );
+    }
+
+    #[test]
+    fn requests_on_one_stream_share_round_trips() {
+        let dial = Arc::new(MemDial {
+            latency: Some(Duration::from_millis(100)),
+            ..MemDial::default()
+        });
+        let mut t = net(&dial);
+        let (tx, rx) = mpsc::channel();
+        let start = std::time::Instant::now();
+        for i in 0..20 {
+            t.read(&at(1, i), &tx).unwrap();
+        }
+        for _ in 0..20 {
+            next(&rx);
+        }
+        // One at a time would take 20 round trips of 200 ms.
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn cover_writes_are_sent_once() {
+        let dial = Arc::new(MemDial::default());
+        dial.refuse.store(true, Ordering::SeqCst);
+        let mut t = net(&dial);
+        t.cover().unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(dial.dials.load(Ordering::SeqCst), 1, "no retries for cover");
+    }
+
+    #[test]
+    fn a_silent_tor_times_out() {
+        let path = std::env::temp_dir().join(format!("purple-silent-{}", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let hold = thread::spawn(move || listener.accept().map(|(c, _)| c));
+        let dial = OnionDial {
+            socks: path,
+            host: "x.onion".into(),
+            port: 80,
+            timeout: Duration::from_millis(100),
+        };
+        let start = std::time::Instant::now();
+        assert!(dial.dial("k").is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(hold);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use purple_ipc::{NetChoice, NetStatus, Route};
 use super::bridges;
 use super::control::Control;
 use super::fallback::{Action, Fallback};
-use super::transport::{Dialer, DirectDial, OnionDial};
+use super::transport::{CONN_TIMEOUT, Dialer, DirectDial, OnionDial};
 
 /// Where tor's sockets are and how to reach the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +39,7 @@ impl TorSetup {
             socks: self.socks.clone(),
             host: self.host.clone(),
             port: self.port,
+            timeout: CONN_TIMEOUT,
         }
     }
 }
@@ -204,6 +205,7 @@ mod tests {
             socks: setup.socks.clone(),
             host: setup.host.clone(),
             port: 80,
+            timeout: CONN_TIMEOUT,
         }));
         let (status_tx, status_rx) = mpsc::channel();
         let (choice_tx, choice_rx) = mpsc::channel();

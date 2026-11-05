@@ -4,7 +4,6 @@
 use std::fmt::Write as _;
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 
 use hkdf::Hkdf;
 use purple_ipc::StreamSeed;
@@ -28,18 +27,17 @@ pub fn isolation_key(stream: &StreamSeed) -> String {
     })
 }
 
-/// Open a stream to `host:port` through tor's SOCKS socket at `socket`, on the circuit for
-/// `isolation`.
+/// Open a stream to `host:port` through `s`, a fresh connection to tor's SOCKS socket, on
+/// the circuit for `isolation`. The caller sets its timeouts.
 ///
 /// # Errors
 /// Fails if tor refuses or can't reach the host; onion-service failures say which step.
 pub fn socks_connect(
-    socket: &Path,
+    mut s: UnixStream,
     isolation: &str,
     host: &str,
     port: u16,
 ) -> io::Result<UnixStream> {
-    let mut s = UnixStream::connect(socket)?;
     s.write_all(&[5, 1, 2])?;
     let mut choice = [0u8; 2];
     s.read_exact(&mut choice)?;
@@ -115,7 +113,7 @@ fn socks_error(rep: u8) -> String {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use purple_ipc::{SEED_LEN, StreamSeed};
 
@@ -170,7 +168,13 @@ mod tests {
     fn connects_with_the_isolation_key_as_username() {
         let path = socket("ok");
         let server = fake_tor(&path, 0);
-        let mut s = socks_connect(&path, "abcd", "example.onion", 80).unwrap();
+        let mut s = socks_connect(
+            UnixStream::connect(&path).unwrap(),
+            "abcd",
+            "example.onion",
+            80,
+        )
+        .unwrap();
         s.write_all(b"ping").unwrap();
         let mut back = [0u8; 4];
         s.read_exact(&mut back).unwrap();
@@ -185,7 +189,13 @@ mod tests {
     fn onion_errors_are_reported() {
         let path = socket("err");
         let server = fake_tor(&path, 0xF2);
-        let err = socks_connect(&path, "k", "example.onion", 80).unwrap_err();
+        let err = socks_connect(
+            UnixStream::connect(&path).unwrap(),
+            "k",
+            "example.onion",
+            80,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("introduction failed"), "{err}");
         server.join().unwrap();
     }
