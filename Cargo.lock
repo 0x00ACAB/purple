@@ -2942,6 +2942,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "purple-relay"
+version = "0.1.0"
+dependencies = [
+ "landlock",
+ "purple-harden",
+]
+
+[[package]]
 name = "purple-store"
 version = "0.1.0"
 dependencies = [
