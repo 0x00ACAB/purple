@@ -10,6 +10,8 @@ use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
+/// Messages between purple-core and purple-torctl or the launcher.
+pub mod torctl;
 pub mod ui;
 
 /// Size of every packet (one box). Must fit the transport's box payload: Namenlos boxes
@@ -26,6 +28,12 @@ pub const CORE_UI_FD: RawFd = 3;
 pub const CORE_NET_FD: RawFd = 4;
 /// Fd where `purple-net` finds its socket to `purple-core`.
 pub const NET_CORE_FD: RawFd = 3;
+/// Fd where `purple-torctl` finds its socket to `purple-core`.
+pub const TORCTL_CORE_FD: RawFd = 3;
+/// Fd where `purple-core` finds its socket to `purple-torctl`, when started with `--torctl`.
+pub const CORE_TORCTL_FD: RawFd = 5;
+/// Fd where `purple-core` finds its socket to the launcher, when started with `--torctl`.
+pub const CORE_LAUNCHER_FD: RawFd = 6;
 
 const MAX_NET_FRAME: usize = 1 + SEED_LEN + 8 + PACKET_LEN;
 
@@ -38,6 +46,7 @@ const TAG_TAKEN: u8 = 6;
 const TAG_READ_COVER: u8 = 7;
 const TAG_STATUS: u8 = 8;
 const TAG_CHOOSE: u8 = 9;
+const TAG_USE_DIRECT: u8 = 10;
 
 /// Longest bridge text the user may paste: a few bridge lines.
 pub const MAX_BRIDGE_TEXT: usize = 1400;
@@ -250,6 +259,8 @@ pub enum NetMsg {
     Status(NetStatus),
     /// core to net: the user's answer to [`NetStatus::Blocked`].
     Choose(NetChoice),
+    /// core to net: the user chose direct and purple-relay is up; switch to it.
+    UseDirect,
 }
 
 impl NetMsg {
@@ -283,6 +294,10 @@ impl NetMsg {
                 }
                 return out;
             }
+            Self::UseDirect => {
+                out.push(TAG_USE_DIRECT);
+                return out;
+            }
         };
         out.push(tag);
         out.extend_from_slice(&at.stream.0);
@@ -312,6 +327,8 @@ impl NetMsg {
                 return Ok(Self::Choose(NetChoice::Bridges(lines.to_owned())));
             }
             [TAG_CHOOSE, ..] => return Err(invalid("malformed choice")),
+            [TAG_USE_DIRECT] => return Ok(Self::UseDirect),
+            [TAG_USE_DIRECT, ..] => return Err(invalid("use-direct takes no body")),
             _ => {}
         }
         let (&tag, rest) = bytes
@@ -596,5 +613,14 @@ mod tests {
         );
         let long = NetMsg::Choose(NetChoice::Bridges("a".repeat(MAX_BRIDGE_TEXT + 1)));
         assert!(long.write_to(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn use_direct_round_trips_and_takes_no_body() {
+        assert_eq!(
+            NetMsg::decode(&NetMsg::UseDirect.encode()).unwrap(),
+            NetMsg::UseDirect
+        );
+        assert!(NetMsg::decode(&[TAG_USE_DIRECT, 0]).is_err());
     }
 }

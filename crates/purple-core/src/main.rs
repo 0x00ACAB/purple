@@ -741,7 +741,8 @@ impl Reads {
             NetMsg::Read { .. }
             | NetMsg::ReadCover { .. }
             | NetMsg::Write { .. }
-            | NetMsg::Choose(_) => {
+            | NetMsg::Choose(_)
+            | NetMsg::UseDirect => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "purple-net sent a message only purple-core may send",
@@ -1211,7 +1212,8 @@ mod tests {
                 | NetMsg::Written { .. }
                 | NetMsg::Taken { .. }
                 | NetMsg::Status(_)
-                | NetMsg::Choose(_)) => {
+                | NetMsg::Choose(_)
+                | NetMsg::UseDirect) => {
                     panic!("not a read: {other:?}")
                 }
             })

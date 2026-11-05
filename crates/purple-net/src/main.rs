@@ -284,6 +284,7 @@ fn serve(
                 }
                 None => eprintln!("{NAME}: no fallback to choose for"),
             },
+            Ok(Event::Core(Ok(NetMsg::UseDirect))) => eprintln!("{NAME}: no direct route yet"),
             Ok(Event::Core(Ok(
                 NetMsg::Found { .. }
                 | NetMsg::Empty { .. }

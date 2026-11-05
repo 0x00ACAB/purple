@@ -60,6 +60,7 @@ const EVENT_GROUP_NOTICE: u8 = 15;
 const EVENT_GROUP_LEFT: u8 = 16;
 const EVENT_GROUP_MEMBERS: u8 = 17;
 const EVENT_NETWORK: u8 = 18;
+const EVENT_NOTICE: u8 = 19;
 
 /// What the user asked for, sent from `purple-ui` to `purple-core`.
 #[derive(Clone, PartialEq, Eq)]
@@ -256,6 +257,11 @@ pub enum UiEvent {
         /// What went wrong.
         message: String,
     },
+    /// Something about the connection that changes nothing.
+    Notice {
+        /// What to tell the user.
+        text: String,
+    },
     /// This user is in a group: just created or joined, or replayed at unlock.
     GroupJoined {
         /// The group's name.
@@ -347,6 +353,7 @@ impl std::fmt::Debug for UiEvent {
                 .field("body", body)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+            Self::Notice { text } => f.debug_struct("Notice").field("text", text).finish(),
             Self::GroupJoined { group, creator } => f
                 .debug_struct("GroupJoined")
                 .field("group", group)
@@ -579,6 +586,10 @@ impl UiEvent {
                 out.tag(EVENT_ERROR);
                 out.str(message, MAX_ERROR_LEN)?;
             }
+            Self::Notice { text } => {
+                out.tag(EVENT_NOTICE);
+                out.str(text, MAX_ERROR_LEN)?;
+            }
             Self::GroupJoined { group, creator } => {
                 out.tag(EVENT_GROUP_JOINED);
                 out.str(group, MAX_NAME_LEN)?;
@@ -673,6 +684,9 @@ impl UiEvent {
             },
             EVENT_ERROR => Self::Error {
                 message: d.str(MAX_ERROR_LEN)?,
+            },
+            EVENT_NOTICE => Self::Notice {
+                text: d.str(MAX_ERROR_LEN)?,
             },
             EVENT_GROUP_JOINED => Self::GroupJoined {
                 group: d.str(MAX_NAME_LEN)?,
@@ -1091,5 +1105,15 @@ mod tests {
             cmd.write_to(&mut cmd_frame).unwrap();
             assert_eq!(UiCmd::read_from(&mut &cmd_frame[..]).unwrap(), Some(cmd));
         }
+    }
+
+    #[test]
+    fn notices_round_trip() {
+        let event = UiEvent::Notice {
+            text: "already connected directly to the store".into(),
+        };
+        let mut frame = Vec::new();
+        event.write_to(&mut frame).unwrap();
+        assert_eq!(UiEvent::read_from(&mut &frame[..]).unwrap(), Some(event));
     }
 }

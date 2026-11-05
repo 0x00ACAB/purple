@@ -504,6 +504,7 @@ fn on_core_event(model: &mut Model, event: UiEvent) {
             });
         }
         UiEvent::Error { message } => model.log(format!("error: {}", sanitize(&message))),
+        UiEvent::Notice { text } => model.log(format!("network: {}", sanitize(&text))),
         UiEvent::GroupJoined { .. }
         | UiEvent::GroupRequest { .. }
         | UiEvent::GroupMessage { .. }
@@ -1247,5 +1248,17 @@ mod tests {
             }),
         );
         assert_eq!(m.chats["#team"][0].from, "me (alice's contact)");
+    }
+
+    #[test]
+    fn notices_are_shown_as_network_lines() {
+        let mut m = open_model();
+        core_event(
+            &mut m,
+            UiEvent::Notice {
+                text: "no bridge lines in that".into(),
+            },
+        );
+        assert_eq!(m.system.last().unwrap(), "network: no bridge lines in that");
     }
 }
