@@ -3,6 +3,7 @@
 
 pub mod bridges;
 pub mod control;
+pub mod driver;
 pub mod fallback;
 pub mod socks;
 pub mod transport;
