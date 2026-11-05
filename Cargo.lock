@@ -2941,6 +2941,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "purple-store"
+version = "0.1.0"
+dependencies = [
+ "landlock",
+ "purple-harden",
+ "purple-ipc",
+ "purple-net",
+]
+
+[[package]]
 name = "purple-ui"
 version = "0.1.0"
 dependencies = [

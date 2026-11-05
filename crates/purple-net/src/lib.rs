@@ -129,6 +129,32 @@ pub fn box_address(at: &BoxRef) -> BoxAddr {
     BoxAddr(addr)
 }
 
+/// Somewhere to keep boxes: [`BoxStore`] in memory, or purple-store's disk store.
+pub trait Boxes: Send + Sync {
+    /// Store `packet` at `addr` unless something live is already there. Returns whether
+    /// it was stored.
+    ///
+    /// # Errors
+    /// Fails if the store can't be written.
+    fn put(&self, addr: BoxAddr, packet: Packet) -> io::Result<bool>;
+
+    /// The packet at `addr`, if any.
+    ///
+    /// # Errors
+    /// Fails if the store can't be read.
+    fn get(&self, addr: &BoxAddr) -> io::Result<Option<Packet>>;
+}
+
+impl Boxes for BoxStore {
+    fn put(&self, addr: BoxAddr, packet: Packet) -> io::Result<bool> {
+        Self::put(self, addr, packet)
+    }
+
+    fn get(&self, addr: &BoxAddr) -> io::Result<Option<Packet>> {
+        Self::get(self, addr)
+    }
+}
+
 /// Write-once boxes in memory, with optional expiry. Clones share one store. Used by the
 /// in-memory network and by `purple-devprovider`.
 #[derive(Clone, Debug, Default)]
