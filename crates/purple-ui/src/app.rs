@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use purple_ipc::ui::{MAX_BODY_LEN, UiCmd, UiEvent};
+use purple_ipc::{NetStatus, Route};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -34,6 +35,8 @@ const HELP: &[&str] = &[
     "/group join CREATOR NAME     accept a request to join a group",
     "/group leave NAME            leave a group",
     "/group members NAME          list members: ✓ for your contacts",
+    "/bridges LINE         try a Tor bridge line, once Tor can't connect",
+    "/direct               connect to the store without Tor, once Tor can't connect",
     "/quit                 exit (also Esc or Ctrl-C)",
     "Up/Down or Tab switch conversation; anything else you type is sent to the selected one.",
 ];
@@ -106,6 +109,8 @@ pub(crate) struct Model {
     system: Vec<String>,
     input: String,
     quit: bool,
+    /// purple-net's latest connection status.
+    network: Option<NetStatus>,
 }
 
 /// Debug without the input line or passphrase.
@@ -235,6 +240,16 @@ fn submit(model: &mut Model) -> Vec<UiCmd> {
     let Some(command) = typed.strip_prefix('/') else {
         return send(model, typed);
     };
+    if let Some(line) = command.strip_prefix("bridges ") {
+        let line = line.trim();
+        if !safe_bridge_line(line) {
+            model.log("that isn't a bridge line purple can use");
+            return Vec::new();
+        }
+        return vec![UiCmd::AddBridges {
+            lines: line.to_owned(),
+        }];
+    }
     let mut words = command.split_whitespace();
     match (words.next(), words.next(), words.next(), words.next()) {
         (Some("invite"), Some(name), None, None) => {
@@ -250,6 +265,15 @@ fn submit(model: &mut Model) -> Vec<UiCmd> {
                 contact: name.to_owned(),
                 invite: invite.to_owned(),
             }]
+        }
+        (Some("direct"), None, None, None) => {
+            if model.network == Some(NetStatus::Blocked) {
+                model.log("network: connecting directly to the store...");
+                vec![UiCmd::UseDirect]
+            } else {
+                model.log("purple is still trying Tor; /direct is offered if every route fails");
+                Vec::new()
+            }
         }
         (Some("quit"), None, None, None) => {
             model.quit = true;
@@ -487,8 +511,7 @@ fn on_core_event(model: &mut Model, event: UiEvent) {
         | UiEvent::GroupNotice { .. }
         | UiEvent::GroupLeft { .. }
         | UiEvent::GroupMembers { .. } => on_group_event(model, event),
-        // Shown from Task 14 on; nothing sends it yet.
-        UiEvent::Network { .. } => {}
+        UiEvent::Network { status } => on_network(model, status),
     }
 }
 
@@ -557,6 +580,67 @@ fn on_group_event(model: &mut Model, event: UiEvent) {
         }
         _ => {}
     }
+}
+
+/// What the user reads about the route, and when to say it.
+fn on_network(model: &mut Model, status: NetStatus) {
+    let previous = model.network.replace(status);
+    match status {
+        NetStatus::Connecting { route, percent } => {
+            let last = match previous {
+                Some(NetStatus::Connecting {
+                    route: was,
+                    percent: p,
+                }) if was == route => Some(p),
+                _ => None,
+            };
+            // A line when the route changes, then one per quarter.
+            if last.is_none_or(|last| percent / 25 > last / 25) {
+                model.log(format!(
+                    "network: connecting {} ({percent}%)",
+                    route_name(route)
+                ));
+            }
+        }
+        NetStatus::Connected { route } => {
+            model.log(format!("network: connected {}", route_name(route)));
+        }
+        NetStatus::Blocked => {
+            for line in BLOCKED_HELP {
+                model.log(*line);
+            }
+        }
+    }
+}
+
+const fn route_name(route: Route) -> &'static str {
+    match route {
+        Route::Tor => "over Tor",
+        Route::Obfs4 => "over Tor with obfs4 bridges",
+        Route::Snowflake => "over Tor with Snowflake",
+        Route::WebTunnel => "over Tor with WebTunnel bridges",
+        Route::Pasted => "over Tor with your bridges",
+        Route::Direct => "directly to the store (not over Tor)",
+    }
+}
+
+/// Shown when every automatic route failed. The last line must stay whole.
+const BLOCKED_HELP: &[&str] = &[
+    "network: Tor can't connect from here, with or without the built-in bridges.",
+    "  /bridges LINE   try a bridge line from bridges.torproject.org (one per command)",
+    "  /direct         connect to the store directly until purple exits:",
+    "    The store will see your IP address and when you're online. Your ISP will see that you use this store. Nobody learns who you talk to.",
+];
+
+/// The rule purple-net applies to bridge lines (`check_bridge_line`), checked here too so
+/// the user hears at once: not empty, at most 1000 bytes, printable ASCII without quotes
+/// or backslashes.
+fn safe_bridge_line(line: &str) -> bool {
+    !line.is_empty()
+        && line.len() <= 1000
+        && line
+            .bytes()
+            .all(|b| (b' '..=b'~').contains(&b) && b != b'"' && b != b'\\')
 }
 
 /// How a group message's sender is shown: a check mark for your contacts, otherwise whose
@@ -716,6 +800,91 @@ mod tests {
             update(model, key(KeyCode::Char(c)));
         }
         update(model, key(KeyCode::Enter))
+    }
+
+    fn core_event(model: &mut Model, event: UiEvent) {
+        update(model, Msg::Core(event));
+    }
+
+    #[test]
+    fn blocked_tor_explains_the_cost_and_offers_both_choices() {
+        let mut m = open_model();
+        core_event(
+            &mut m,
+            UiEvent::Network {
+                status: NetStatus::Blocked,
+            },
+        );
+        let log = m.system.join("\n");
+        assert!(log.contains(
+            "The store will see your IP address and when you're online. Your ISP will see that \
+             you use this store. Nobody learns who you talk to."
+        ));
+        assert!(log.contains("/direct") && log.contains("/bridges"));
+        assert_eq!(type_line(&mut m, "/direct"), [UiCmd::UseDirect]);
+    }
+
+    #[test]
+    fn direct_command_without_prompt_says_so() {
+        let mut m = open_model();
+        core_event(
+            &mut m,
+            UiEvent::Network {
+                status: NetStatus::Connecting {
+                    route: Route::Tor,
+                    percent: 20,
+                },
+            },
+        );
+        assert!(type_line(&mut m, "/direct").is_empty());
+        assert!(m.system.last().unwrap().contains("still trying Tor"));
+    }
+
+    #[test]
+    fn bridges_command_checks_the_line() {
+        let mut m = open_model();
+        core_event(
+            &mut m,
+            UiEvent::Network {
+                status: NetStatus::Blocked,
+            },
+        );
+        assert_eq!(
+            type_line(
+                &mut m,
+                "/bridges obfs4 192.0.2.1:443 F00 cert=abc iat-mode=0"
+            ),
+            [UiCmd::AddBridges {
+                lines: "obfs4 192.0.2.1:443 F00 cert=abc iat-mode=0".into()
+            }]
+        );
+        assert!(type_line(&mut m, "/bridges x\" Bridge=\"y").is_empty());
+    }
+
+    #[test]
+    fn progress_is_logged_sparingly() {
+        let mut m = open_model();
+        let before = m.system.len();
+        for percent in 0..=99 {
+            core_event(
+                &mut m,
+                UiEvent::Network {
+                    status: NetStatus::Connecting {
+                        route: Route::Tor,
+                        percent,
+                    },
+                },
+            );
+        }
+        core_event(
+            &mut m,
+            UiEvent::Network {
+                status: NetStatus::Connected { route: Route::Tor },
+            },
+        );
+        let added = m.system.len() - before;
+        assert!((2..=6).contains(&added), "{added} lines");
+        assert!(m.system.last().unwrap().contains("connected over Tor"));
     }
 
     fn unlock_cmd(passphrase: &str) -> Vec<UiCmd> {
