@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Patched third-party code; see [patch.crates-io] below.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +23,11 @@ hmac = "0.12"
 landlock = "0.4"
 libc = "0.2"
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+# Groups. Only the libcrux backend has the X-Wing suite.
+openmls = { version = "0.9.2", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_libcrux_crypto = { version = "0.4.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_memory_storage = { version = "0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
 # Must match the rand major version libsignal-protocol uses.
 rand = "0.9"
 # line_count gives the exact wrapped height, so long chat messages stay scrolled to the end.
@@ -88,3 +95,9 @@ panic = "abort"
 lto = true
 codegen-units = 1
 strip = "symbols"
+
+# libcrux-ml-kem 0.0.10's incremental API (used by libsignal's SPQR) still imports
+# rand 0.9's trait names, so it breaks once OpenMLS turns on its "rand" feature. libsignal
+# pins exactly 0.0.10. The vendored copy renames those imports and changes nothing else.
+[patch.crates-io]
+libcrux-ml-kem = { path = "vendor/libcrux-ml-kem-0.0.10" }

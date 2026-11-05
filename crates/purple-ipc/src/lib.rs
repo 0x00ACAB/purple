@@ -34,6 +34,7 @@ const TAG_READ: u8 = 2;
 const TAG_FOUND: u8 = 3;
 const TAG_EMPTY: u8 = 4;
 const TAG_WRITTEN: u8 = 5;
+const TAG_TAKEN: u8 = 6;
 
 /// Identifies one append-only stream of boxes to the transport.
 ///
@@ -120,6 +121,13 @@ pub enum NetMsg {
         /// The box.
         at: BoxRef,
     },
+    /// net to core: box `at` already held a packet when this write arrived, so the write
+    /// changed nothing. It may be core's own packet from before a restart, or someone
+    /// else's; core reads the box to tell.
+    Taken {
+        /// The box.
+        at: BoxRef,
+    },
 }
 
 impl NetMsg {
@@ -133,6 +141,7 @@ impl NetMsg {
             Self::Found { at, packet } => (TAG_FOUND, at, Some(packet)),
             Self::Empty { at } => (TAG_EMPTY, at, None),
             Self::Written { at } => (TAG_WRITTEN, at, None),
+            Self::Taken { at } => (TAG_TAKEN, at, None),
         };
         let mut out = Vec::with_capacity(MAX_NET_FRAME);
         out.push(tag);
@@ -171,12 +180,13 @@ impl NetMsg {
                 at,
                 packet: Packet::from_slice(body)?,
             }),
-            TAG_READ | TAG_EMPTY | TAG_WRITTEN if !body.is_empty() => {
+            TAG_READ | TAG_EMPTY | TAG_WRITTEN | TAG_TAKEN if !body.is_empty() => {
                 Err(invalid("trailing bytes"))
             }
             TAG_READ => Ok(Self::Read { at }),
             TAG_EMPTY => Ok(Self::Empty { at }),
             TAG_WRITTEN => Ok(Self::Written { at }),
+            TAG_TAKEN => Ok(Self::Taken { at }),
             _ => Err(invalid("unknown message tag")),
         }
     }
@@ -311,6 +321,7 @@ mod tests {
             },
             NetMsg::Empty { at: at(3) },
             NetMsg::Written { at: at(4) },
+            NetMsg::Taken { at: at(5) },
         ];
         let (mut a, mut b) = UnixStream::pair().unwrap();
         for msg in &msgs {

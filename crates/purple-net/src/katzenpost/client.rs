@@ -35,6 +35,17 @@ const MAX_HANDSHAKE_MESSAGES: usize = 16;
 /// Replica error codes in a `start_resending_encrypted_message` reply.
 const BOX_NOT_FOUND: u64 = 1;
 const TOMBSTONE: u64 = 11;
+const BOX_ALREADY_EXISTS: u64 = 10;
+
+/// What a box write found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stored {
+    /// The box now holds the packet.
+    Written,
+    /// The box already held a packet: another member's, or this one from an attempt whose
+    /// answer was lost.
+    Taken,
+}
 
 type QueryId = [u8; QUERY_ID_LEN];
 /// Callers waiting for replies, by query ID. `None` once the connection is gone.
@@ -170,16 +181,20 @@ impl Client {
     }
 
     /// Send an encrypted write and wait for the courier's acknowledgement. The daemon
-    /// retransmits until it gets one. A box that already exists counts as written.
+    /// retransmits until it gets one.
     ///
     /// # Errors
     /// Fails if the write is refused or the connection is gone.
-    pub fn send_write(&self, envelope: &Envelope, write_cap: &[u8]) -> io::Result<()> {
+    pub fn send_write(&self, envelope: &Envelope, write_cap: &[u8]) -> io::Result<Stored> {
         let mut fields = resend_fields(envelope);
         fields.push(("write_cap", Value::Bytes(write_cap.to_vec())));
+        // By default the daemon calls an existing box written. In a group stream that box
+        // may hold another member's packet, so ask to be told.
+        fields.push(("no_idempotent_box_already_exists", Value::Bool(true)));
         let reply = self.call_resend(fields, None, &envelope.hash)?;
         match error_code(&reply) {
-            0 => Ok(()),
+            0 => Ok(Stored::Written),
+            BOX_ALREADY_EXISTS => Ok(Stored::Taken),
             code => Err(io::Error::other(format!("box write failed: error {code}"))),
         }
     }
@@ -491,6 +506,14 @@ mod tests {
                     _ => None, // never answered
                 }
             }
+            "start_resending_encrypted_message"
+                if request.get("write_cap").and_then(Value::as_bytes) == Some(&b"taken"[..]) =>
+            {
+                Some(Value::map([(
+                    "error_code",
+                    Value::Uint(BOX_ALREADY_EXISTS),
+                )]))
+            }
             "start_resending_encrypted_message" => Some(Value::map([])),
             _ => None,
         }
@@ -517,7 +540,8 @@ mod tests {
         assert!(read(b"broken").is_err());
 
         let write = client.encrypt_write(b"x", b"w", b"i").unwrap();
-        client.send_write(&write, b"w").unwrap();
+        assert_eq!(client.send_write(&write, b"w").unwrap(), Stored::Written);
+        assert_eq!(client.send_write(&write, b"taken").unwrap(), Stored::Taken);
     }
 
     #[test]

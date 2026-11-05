@@ -12,7 +12,9 @@ use std::io;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
+use crate::codec::{Reader, Writer};
 use crate::queue::SEALED_LEN;
+use crate::session;
 
 const ID_LEN: usize = 8;
 const HEADER_LEN: usize = ID_LEN + 2 + 2 + 2;
@@ -126,12 +128,15 @@ fn decode(fragment: &[u8]) -> io::Result<Fragment<'_>> {
 #[derive(Debug, Default)]
 pub struct Reassembler {
     in_flight: HashMap<MessageId, Partial>,
+    /// Arrival order of the next new message, so the oldest can be dropped when full.
+    next_order: u64,
 }
 
 #[derive(Debug)]
 struct Partial {
     parts: Vec<Option<Vec<u8>>>,
     missing: usize,
+    order: u64,
 }
 
 impl Reassembler {
@@ -139,23 +144,35 @@ impl Reassembler {
     /// Exact duplicates of a fragment already held are ignored.
     ///
     /// # Errors
-    /// Fails on a malformed fragment, one that conflicts with fragments already held, or a
-    /// new message when [`MAX_IN_FLIGHT`] messages are already incomplete.
+    /// Fails on a malformed fragment or one that conflicts with fragments already held.
+    /// A new message when [`MAX_IN_FLIGHT`] are already incomplete drops the oldest
+    /// incomplete one, so messages nobody finishes can't block the stream for good.
     pub fn push(&mut self, fragment: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let fragment = decode(fragment)?;
         if fragment.count == 1 {
             return Ok(Some(fragment.data.to_vec()));
         }
 
-        let full = self.in_flight.len() >= MAX_IN_FLIGHT;
+        if !self.in_flight.contains_key(&fragment.id) && self.in_flight.len() >= MAX_IN_FLIGHT {
+            let oldest = self
+                .in_flight
+                .iter()
+                .min_by_key(|(_, partial)| partial.order)
+                .map(|(id, _)| *id);
+            if let Some(oldest) = oldest {
+                self.in_flight.remove(&oldest);
+            }
+        }
+        let order = self.next_order;
         let partial = match self.in_flight.entry(fragment.id) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(_) if full => return Err(invalid("too many messages in flight")),
             Entry::Vacant(entry) => {
+                self.next_order = order.wrapping_add(1);
                 let count = usize::from(fragment.count);
                 entry.insert(Partial {
                     parts: vec![None; count],
                     missing: count,
+                    order,
                 })
             }
         };
@@ -183,6 +200,88 @@ impl Reassembler {
             .remove(&fragment.id)
             .ok_or_else(|| invalid("completed message vanished"))?;
         Ok(Some(done.parts.into_iter().flatten().flatten().collect()))
+    }
+
+    /// Fragments still missing from the messages held incomplete.
+    #[must_use]
+    pub fn missing(&self) -> usize {
+        self.in_flight.values().map(|partial| partial.missing).sum()
+    }
+
+    /// Write the incomplete messages into a snapshot, oldest first.
+    pub(crate) fn encode(&self, w: &mut Writer) -> session::Result<()> {
+        // Oldest first, so the restored reassembler drops the same message next.
+        let mut held: Vec<_> = self.in_flight.iter().collect();
+        held.sort_by_key(|(_, partial)| partial.order);
+        w.len(held.len())?;
+        for (id, partial) in held {
+            w.bytes(id)?;
+            w.len(partial.parts.len())?;
+            for part in &partial.parts {
+                match part {
+                    Some(data) => {
+                        w.u8(1);
+                        w.bytes(data)?;
+                    }
+                    None => w.u8(0),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore what [`Self::encode`] wrote, checking the same limits [`Self::push`] keeps.
+    pub(crate) fn decode(r: &mut Reader<'_>) -> session::Result<Self> {
+        let bad = session::Error::Malformed;
+        let count = r.len()?;
+        if count > MAX_IN_FLIGHT {
+            return Err(bad("too many incomplete messages in snapshot"));
+        }
+        let mut in_flight = HashMap::new();
+        for order in 0..count {
+            let order = u64::try_from(order).map_err(|_| bad("too many incomplete messages"))?;
+            let id: MessageId = r
+                .bytes()?
+                .try_into()
+                .map_err(|_| bad("message ID has the wrong length"))?;
+            let len = r.len()?;
+            if !(2..=usize::from(MAX_FRAGMENTS)).contains(&len) {
+                return Err(bad("incomplete message has an impossible fragment count"));
+            }
+            let mut parts = Vec::with_capacity(len);
+            for _ in 0..len {
+                parts.push(match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let data = r.bytes()?;
+                        if data.len() > FRAGMENT_DATA_LEN {
+                            return Err(bad("fragment too long"));
+                        }
+                        Some(data.to_vec())
+                    }
+                    _ => return Err(bad("bad fragment marker")),
+                });
+            }
+            let missing = parts.iter().filter(|part| part.is_none()).count();
+            if missing == 0
+                || in_flight
+                    .insert(
+                        id,
+                        Partial {
+                            parts,
+                            missing,
+                            order,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(bad("incomplete message is complete or repeated"));
+            }
+        }
+        Ok(Self {
+            in_flight,
+            next_order: u64::try_from(count).map_err(|_| bad("too many incomplete messages"))?,
+        })
     }
 }
 
@@ -282,21 +381,57 @@ mod tests {
     }
 
     #[test]
-    fn limits_messages_in_flight() {
+    fn a_full_reassembler_drops_its_oldest_message_instead_of_refusing_new_ones() {
+        // Junk partials (from a member who never finishes them) must not block real
+        // messages for good.
         let mut r = Reassembler::default();
         for i in 0..MAX_IN_FLIGHT {
             let id = [u8::try_from(i).unwrap(); ID_LEN];
             r.push(&encode(id, 0, 2, &[0; N]).unwrap()).unwrap();
         }
+        let real = [0xFF; ID_LEN];
+        assert_eq!(r.push(&encode(real, 0, 2, &[0; N]).unwrap()).unwrap(), None);
+        assert_eq!(r.in_flight.len(), MAX_IN_FLIGHT, "memory stays bounded");
         assert!(
-            r.push(&encode([0xFF; ID_LEN], 0, 2, &[0; N]).unwrap())
-                .is_err()
-        );
-        // Messages already in flight can still finish.
-        assert!(
-            r.push(&encode([0; ID_LEN], 1, 2, &[1]).unwrap())
+            r.push(&encode(real, 1, 2, &[1]).unwrap())
                 .unwrap()
                 .is_some()
         );
+        // The oldest junk partial is the one that went.
+        assert!(!r.in_flight.contains_key(&[0; ID_LEN]));
+        // A younger one can still finish.
+        assert!(
+            r.push(&encode([5; ID_LEN], 1, 2, &[1]).unwrap())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn counts_missing_fragments_and_survives_encoding() {
+        let mut r = Reassembler::default();
+        let message = message(3 * N);
+        let fragments = split(&message).unwrap();
+        assert_eq!(r.missing(), 0);
+        assert_eq!(r.push(&fragments[0]).unwrap(), None);
+        assert_eq!(r.missing(), 2);
+
+        let mut w = Writer::default();
+        r.encode(&mut w).unwrap();
+        let bytes = w.finish();
+        let mut restored = Reassembler::decode(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!(restored.missing(), 2);
+        assert_eq!(restored.push(&fragments[2]).unwrap(), None);
+        assert_eq!(restored.push(&fragments[1]).unwrap(), Some(message));
+    }
+
+    #[test]
+    fn decoding_rejects_impossible_partials() {
+        let mut w = Writer::default();
+        w.len(1).unwrap();
+        w.bytes(&[0; ID_LEN]).unwrap();
+        w.len(usize::from(MAX_FRAGMENTS) + 1).unwrap();
+        let bytes = w.finish();
+        assert!(Reassembler::decode(&mut Reader::new(&bytes)).is_err());
     }
 }

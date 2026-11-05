@@ -104,6 +104,11 @@ impl<'a> Reader<'a> {
             .map_err(|_| Error::Malformed("snapshot string is not UTF-8"))
     }
 
+    /// Whether everything has been read.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub(crate) const fn finish(self) -> Result<()> {
         if self.0.is_empty() {
             Ok(())

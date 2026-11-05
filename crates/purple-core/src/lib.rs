@@ -3,9 +3,12 @@
 
 mod codec;
 pub mod content;
+pub mod credential;
 pub mod fragment;
+pub mod group;
 pub mod invite;
 pub mod messenger;
+pub mod mls;
 pub mod queue;
 pub mod session;
 mod signal_store;

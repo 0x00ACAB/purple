@@ -40,6 +40,8 @@ pub enum Done {
     Read(ReadDone),
     /// A write reached the store, so the box now holds the packet.
     Written(BoxRef),
+    /// A write found its box already holding a packet, so nothing changed.
+    Taken(BoxRef),
 }
 
 /// Where a transport reports finished reads and writes.
@@ -47,9 +49,9 @@ pub type Sink = Sender<Done>;
 
 /// Stores and fetches write-once boxes.
 pub trait Transport {
-    /// Write `packet` into box `at`. Writing a box that already exists leaves it as it is.
-    /// May return before the write reaches the network; once it has, [`Done::Written`] goes
-    /// to `done`, if given. A write that never lands is never reported.
+    /// Write `packet` into box `at`. Writing a box that already holds a packet changes nothing.
+    /// May return before the write reaches the network; once the network has answered,
+    /// [`Done::Written`] or [`Done::Taken`] goes to `done`, if given. A write that never lands is never reported.
     ///
     /// # Errors
     /// Fails if the packet can't be handed to the network.
@@ -148,29 +150,30 @@ impl BoxStore {
         }
     }
 
-    /// Store `packet` at `addr` unless something is already there.
+    /// Store `packet` at `addr` unless something is already there. Returns whether it was
+    /// stored.
     ///
     /// # Errors
     /// Fails only if the lock is poisoned.
-    pub fn put(&self, addr: BoxAddr, packet: Packet) -> io::Result<()> {
+    pub fn put(&self, addr: BoxAddr, packet: Packet) -> io::Result<bool> {
         let mut inner = self.inner.lock().map_err(poisoned)?;
         let now = Instant::now();
         let retention = inner.retention;
-        let occupied = inner
+        let stored = inner
             .boxes
             .get(&addr)
-            .is_some_and(|(stored, _)| !expired(retention, *stored, now));
-        if !occupied {
+            .is_none_or(|(at, _)| expired(retention, *at, now));
+        if stored {
             inner.boxes.insert(addr, (now, packet));
         }
         inner.writes = inner.writes.wrapping_add(1);
         if inner.writes.is_multiple_of(SWEEP_EVERY) {
             inner
                 .boxes
-                .retain(|_, (stored, _)| !expired(retention, *stored, now));
+                .retain(|_, (at, _)| !expired(retention, *at, now));
         }
         drop(inner);
-        Ok(())
+        Ok(stored)
     }
 
     /// The packet at `addr`, if it's there and hasn't expired.
@@ -213,8 +216,8 @@ impl FakeTransport {
 
 impl Transport for FakeTransport {
     fn write(&mut self, at: &BoxRef, packet: Packet, done: Option<&Sink>) -> io::Result<()> {
-        self.store.put(box_address(at), packet)?;
-        report_written(done, at);
+        let stored = self.store.put(box_address(at), packet)?;
+        report_write(done, at, stored);
         Ok(())
     }
 
@@ -253,6 +256,16 @@ pub enum ProviderMsg {
         /// Which box.
         addr: BoxAddr,
     },
+    /// The put was stored.
+    Stored {
+        /// Which box.
+        addr: BoxAddr,
+    },
+    /// The box already held a packet, so the put changed nothing.
+    Taken {
+        /// Which box.
+        addr: BoxAddr,
+    },
 }
 
 const MAX_PROVIDER_FRAME: usize = 1 + 32 + PACKET_LEN;
@@ -260,6 +273,8 @@ const TAG_PUT: u8 = 1;
 const TAG_GET: u8 = 2;
 const TAG_FOUND: u8 = 3;
 const TAG_EMPTY: u8 = 4;
+const TAG_STORED: u8 = 5;
+const TAG_TAKEN: u8 = 6;
 
 impl ProviderMsg {
     /// Write as one frame: tag, address, then the packet if there is one.
@@ -272,6 +287,8 @@ impl ProviderMsg {
             Self::Get { addr } => (TAG_GET, addr, None),
             Self::Found { addr, packet } => (TAG_FOUND, addr, Some(packet)),
             Self::Empty { addr } => (TAG_EMPTY, addr, None),
+            Self::Stored { addr } => (TAG_STORED, addr, None),
+            Self::Taken { addr } => (TAG_TAKEN, addr, None),
         };
         let mut out = Vec::with_capacity(MAX_PROVIDER_FRAME);
         out.push(tag);
@@ -306,9 +323,13 @@ impl ProviderMsg {
                 addr,
                 packet: Packet::from_slice(body)?,
             },
-            TAG_GET | TAG_EMPTY if !body.is_empty() => return Err(invalid("trailing bytes")),
+            TAG_GET | TAG_EMPTY | TAG_STORED | TAG_TAKEN if !body.is_empty() => {
+                return Err(invalid("trailing bytes"));
+            }
             TAG_GET => Self::Get { addr },
             TAG_EMPTY => Self::Empty { addr },
+            TAG_STORED => Self::Stored { addr },
+            TAG_TAKEN => Self::Taken { addr },
             _ => return Err(invalid("unknown message tag")),
         };
         Ok(Some(msg))
@@ -322,12 +343,22 @@ impl ProviderMsg {
 pub fn serve_provider(peer: &mut (impl Read + Write), store: &BoxStore) -> io::Result<()> {
     while let Some(msg) = ProviderMsg::read_from(peer)? {
         match msg {
-            ProviderMsg::Put { addr, packet } => store.put(addr, packet)?,
+            ProviderMsg::Put { addr, packet } => {
+                let reply = if store.put(addr, packet)? {
+                    ProviderMsg::Stored { addr }
+                } else {
+                    ProviderMsg::Taken { addr }
+                };
+                reply.write_to(peer)?;
+            }
             ProviderMsg::Get { addr } => match store.get(&addr)? {
                 Some(packet) => ProviderMsg::Found { addr, packet }.write_to(peer)?,
                 None => ProviderMsg::Empty { addr }.write_to(peer)?,
             },
-            ProviderMsg::Found { .. } | ProviderMsg::Empty { .. } => {
+            ProviderMsg::Found { .. }
+            | ProviderMsg::Empty { .. }
+            | ProviderMsg::Stored { .. }
+            | ProviderMsg::Taken { .. } => {
                 return Err(invalid("client sent a message only the provider may send"));
             }
         }
@@ -356,13 +387,20 @@ impl DevProviderTransport {
 
 impl Transport for DevProviderTransport {
     fn write(&mut self, at: &BoxRef, packet: Packet, done: Option<&Sink>) -> io::Result<()> {
-        ProviderMsg::Put {
-            addr: box_address(at),
-            packet,
-        }
-        .write_to(&mut self.stream)?;
-        // The provider doesn't answer puts; one the connection took counts as stored.
-        report_written(done, at);
+        let addr = box_address(at);
+        ProviderMsg::Put { addr, packet }.write_to(&mut self.stream)?;
+        let stored = match ProviderMsg::read_from(&mut self.stream)? {
+            Some(ProviderMsg::Stored { addr: got }) if got == addr => true,
+            Some(ProviderMsg::Taken { addr: got }) if got == addr => false,
+            Some(_) => return Err(invalid("unexpected reply from the dev provider")),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "dev provider closed the connection",
+                ));
+            }
+        };
+        report_write(done, at, stored);
         Ok(())
     }
 
@@ -394,10 +432,15 @@ fn report(done: &Sink, at: &BoxRef, packet: io::Result<Option<Packet>>) {
     done.send(Done::Read(ReadDone { at: *at, packet })).ok();
 }
 
-/// Tell `done`, if given, that box `at` was written.
-fn report_written(done: Option<&Sink>, at: &BoxRef) {
+/// Tell `done`, if given, how the write to box `at` went.
+fn report_write(done: Option<&Sink>, at: &BoxRef, stored: bool) {
     if let Some(done) = done {
-        done.send(Done::Written(*at)).ok();
+        let report = if stored {
+            Done::Written(*at)
+        } else {
+            Done::Taken(*at)
+        };
+        done.send(report).ok();
     }
 }
 
@@ -424,7 +467,7 @@ mod tests {
                 assert_eq!(done.at, *at);
                 done.packet.unwrap()
             }
-            Done::Written(_) => panic!("a read reported a write"),
+            Done::Written(_) | Done::Taken(_) => panic!("a read reported a write"),
         }
     }
 
@@ -442,8 +485,11 @@ mod tests {
     #[test]
     fn boxes_are_write_once_and_reads_do_not_consume() {
         let mut net = FakeTransport::default();
-        net.write(&at(1, 0), packet(1), None).unwrap();
-        net.write(&at(1, 0), packet(2), None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        net.write(&at(1, 0), packet(1), Some(&tx)).unwrap();
+        net.write(&at(1, 0), packet(2), Some(&tx)).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Done::Written(got)) if got == at(1, 0)));
+        assert!(matches!(rx.try_recv(), Ok(Done::Taken(got)) if got == at(1, 0)));
         assert_eq!(read_now(&mut net, &at(1, 0)), Some(packet(1)));
         assert_eq!(read_now(&mut net, &at(1, 0)), Some(packet(1)));
         assert_eq!(read_now(&mut net, &at(1, 1)), None);
@@ -518,6 +564,9 @@ mod tests {
         let mut client = DevProviderTransport::connect(&addr).unwrap();
         client.write(&at(4, 0), packet(1), None).unwrap();
         client.write(&at(4, 1), packet(2), None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        client.write(&at(4, 0), packet(9), Some(&tx)).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Done::Taken(got)) if got == at(4, 0)));
         assert_eq!(read_now(&mut client, &at(4, 0)), Some(packet(1)));
         assert_eq!(read_now(&mut client, &at(4, 1)), Some(packet(2)));
         assert_eq!(read_now(&mut client, &at(4, 2)), None);

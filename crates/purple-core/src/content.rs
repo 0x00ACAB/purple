@@ -4,12 +4,17 @@
 
 use zeroize::Zeroizing;
 
+use crate::codec::{Reader, Writer};
 use crate::queue::QueueSecret;
 use crate::session::{Error, Result};
 
 const VERSION: u8 = 1;
 const KIND_HELLO: u8 = 1;
 const KIND_TEXT: u8 = 2;
+const KIND_GROUP_REQUEST: u8 = 3;
+const KIND_GROUP_ACCEPT: u8 = 4;
+const KIND_GROUP_WELCOME: u8 = 5;
+const KIND_GROUP_LEAVE: u8 = 6;
 const SECRET_LEN: usize = 32;
 
 /// One message's contents.
@@ -25,13 +30,42 @@ pub enum Content {
     },
     /// A text message.
     Text(Vec<u8>),
+    /// The creator asks this contact to join a group.
+    GroupRequest {
+        /// The group's name.
+        group: String,
+    },
+    /// The contact agrees, sending a key package for the creator to add.
+    GroupAccept {
+        /// The group's name.
+        group: String,
+        /// The MLS key package.
+        key_package: Vec<u8>,
+    },
+    /// The creator added this contact.
+    GroupWelcome {
+        /// The group's name.
+        group: String,
+        /// The MLS Welcome.
+        welcome: Vec<u8>,
+        /// The creator's names for members, by identity key.
+        names: Vec<(Vec<u8>, String)>,
+    },
+    /// A member asks the creator to remove them.
+    GroupLeave {
+        /// The group's name.
+        group: String,
+    },
 }
 
 impl Content {
     /// Encode for encryption.
-    #[must_use]
-    pub fn encode(&self) -> Zeroizing<Vec<u8>> {
+    ///
+    /// # Errors
+    /// Fails only on absurd lengths.
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut out = Zeroizing::new(vec![VERSION]);
+        let mut w = Writer::default();
         match self {
             Self::Hello {
                 to_inviter,
@@ -45,8 +79,36 @@ impl Content {
                 out.push(KIND_TEXT);
                 out.extend_from_slice(body);
             }
+            Self::GroupRequest { group } => {
+                out.push(KIND_GROUP_REQUEST);
+                w.bytes(group.as_bytes())?;
+            }
+            Self::GroupAccept { group, key_package } => {
+                out.push(KIND_GROUP_ACCEPT);
+                w.bytes(group.as_bytes())?;
+                w.bytes(key_package)?;
+            }
+            Self::GroupWelcome {
+                group,
+                welcome,
+                names,
+            } => {
+                out.push(KIND_GROUP_WELCOME);
+                w.bytes(group.as_bytes())?;
+                w.bytes(welcome)?;
+                w.len(names.len())?;
+                for (identity, name) in names {
+                    w.bytes(identity)?;
+                    w.bytes(name.as_bytes())?;
+                }
+            }
+            Self::GroupLeave { group } => {
+                out.push(KIND_GROUP_LEAVE);
+                w.bytes(group.as_bytes())?;
+            }
         }
-        out
+        out.extend_from_slice(&w.finish());
+        Ok(out)
     }
 
     /// Decode decrypted bytes.
@@ -74,9 +136,40 @@ impl Content {
                 })
             }
             KIND_TEXT => Ok(Self::Text(rest.to_vec())),
+            KIND_GROUP_REQUEST | KIND_GROUP_ACCEPT | KIND_GROUP_WELCOME | KIND_GROUP_LEAVE => {
+                decode_group(*kind, rest)
+            }
             _ => Err(Error::Malformed("unknown content kind")),
         }
     }
+}
+
+/// The group control kinds, whose fields are in the snapshot codec's layout.
+fn decode_group(kind: u8, fields: &[u8]) -> Result<Content> {
+    let mut r = Reader::new(fields);
+    let group = r.string()?;
+    let content = match kind {
+        KIND_GROUP_REQUEST => Content::GroupRequest { group },
+        KIND_GROUP_ACCEPT => Content::GroupAccept {
+            group,
+            key_package: r.bytes()?.to_vec(),
+        },
+        KIND_GROUP_WELCOME => {
+            let welcome = r.bytes()?.to_vec();
+            let mut names = Vec::new();
+            for _ in 0..r.len()? {
+                names.push((r.bytes()?.to_vec(), r.string()?));
+            }
+            Content::GroupWelcome {
+                group,
+                welcome,
+                names,
+            }
+        }
+        _ => Content::GroupLeave { group },
+    };
+    r.finish()?;
+    Ok(content)
 }
 
 #[cfg(test)]
@@ -91,7 +184,8 @@ mod tests {
             to_inviter: to_inviter.clone(),
             to_accepter: to_accepter.clone(),
         }
-        .encode();
+        .encode()
+        .unwrap();
         let Content::Hello {
             to_inviter: a,
             to_accepter: b,
@@ -106,7 +200,7 @@ mod tests {
     #[test]
     fn text_round_trips_including_empty() {
         for body in [&b""[..], b"hello"] {
-            let encoded = Content::Text(body.to_vec()).encode();
+            let encoded = Content::Text(body.to_vec()).encode().unwrap();
             assert!(matches!(Content::decode(&encoded).unwrap(), Content::Text(t) if t == body));
         }
     }
@@ -121,5 +215,42 @@ mod tests {
         let mut long_hello = vec![VERSION, KIND_HELLO];
         long_hello.extend_from_slice(&[0; 2 * SECRET_LEN + 1]);
         assert!(Content::decode(&long_hello).is_err());
+    }
+
+    #[test]
+    fn group_control_messages_round_trip() {
+        let all = [
+            Content::GroupRequest {
+                group: "team".into(),
+            },
+            Content::GroupAccept {
+                group: "team".into(),
+                key_package: vec![1, 2],
+            },
+            Content::GroupWelcome {
+                group: "team".into(),
+                welcome: vec![3],
+                names: vec![(vec![4; 33], "bob".into())],
+            },
+            Content::GroupLeave {
+                group: "team".into(),
+            },
+        ];
+        for content in all {
+            let encoded = content.encode().unwrap();
+            assert_eq!(
+                format!("{:?}", Content::decode(&encoded).unwrap()),
+                format!("{content:?}")
+            );
+        }
+        assert!(Content::decode(&[VERSION, KIND_GROUP_REQUEST]).is_err());
+        let mut trailing = Content::GroupLeave {
+            group: "team".into(),
+        }
+        .encode()
+        .unwrap()
+        .to_vec();
+        trailing.push(0);
+        assert!(Content::decode(&trailing).is_err());
     }
 }

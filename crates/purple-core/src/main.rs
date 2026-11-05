@@ -21,10 +21,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use landlock::RulesetStatus;
 use purple_core::invite::Invite;
-use purple_core::messenger::{Event, Messenger, Outgoing};
+use purple_core::messenger::{Event, Messenger, Outgoing, Taken};
 use purple_core::session;
 use purple_core::tpm::{Sealer, TPM_DEVICE, Tpm};
-use purple_core::vault::{HistoryEntry, KdfParams, UnlockedBy, Vault};
+use purple_core::vault::{GroupSender, HistoryEntry, KdfParams, UnlockedBy, Vault};
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_ipc::ui::{MAX_BODY_LEN, MAX_ERROR_LEN, UiCmd, UiEvent};
 use purple_ipc::{
@@ -224,13 +224,10 @@ fn serve_ui(
                     commit(saved, &mut messenger, &mut vault, net, &mut ui)?;
                 }
             }
+            Ok(Input::Net(Ok(Some(NetMsg::Taken { at })))) => reads.check(net, at)?,
             Ok(Input::Net(Ok(Some(reply)))) => {
-                if let Some((at, Some(packet))) = reads.answer(reply)? {
-                    let (effects, error) = receive(&mut messenger, at, &packet, now()?)?;
-                    commit(effects, &mut messenger, &mut vault, net, &mut ui)?;
-                    if let Some(err) = error {
-                        report(&mut ui, &format!("dropped a packet: {err}"))?;
-                    }
+                if let Some(answer) = reads.answer(reply)? {
+                    answered(answer, &mut messenger, &mut vault, net, &mut ui)?;
                     reads.follow(net, &messenger.reads().map_err(io::Error::other)?)?;
                 }
             }
@@ -343,22 +340,42 @@ fn replay(messenger: &Messenger, vault: &Vault, ui: &mut UnixStream) -> io::Resu
         }
         .write_to(ui)?;
     }
+    for (group, creator) in messenger.groups() {
+        UiEvent::GroupJoined {
+            group,
+            creator: creator.unwrap_or_default(),
+        }
+        .write_to(ui)?;
+    }
     for entry in vault.history().map_err(io::Error::other)? {
-        let body = clip(&String::from_utf8_lossy(&entry.body), MAX_BODY_LEN);
-        let event = if entry.outgoing {
-            UiEvent::Sent {
-                to: entry.contact,
-                body,
-            }
-        } else {
-            UiEvent::Message {
-                from: entry.contact,
-                body,
-            }
-        };
-        event.write_to(ui)?;
+        replayed(entry).write_to(ui)?;
     }
     Ok(())
+}
+
+/// How a history entry is shown again at unlock.
+fn replayed(entry: HistoryEntry) -> UiEvent {
+    let body = clip(&String::from_utf8_lossy(&entry.body), MAX_BODY_LEN);
+    match (entry.group_sender, entry.outgoing) {
+        (Some(_), true) => UiEvent::GroupSent {
+            group: entry.contact,
+            body,
+        },
+        (Some(sender), false) => UiEvent::GroupMessage {
+            group: entry.contact,
+            from: sender.name,
+            verified: sender.verified,
+            body,
+        },
+        (None, true) => UiEvent::Sent {
+            to: entry.contact,
+            body,
+        },
+        (None, false) => UiEvent::Message {
+            from: entry.contact,
+            body,
+        },
+    }
 }
 
 /// Send again whatever the network never confirmed storing. Boxes are write-once, so a
@@ -459,10 +476,102 @@ fn handle(cmd: UiCmd, messenger: &mut Messenger) -> session::Result<Effects> {
                 outgoing: true,
                 at,
                 body: body.into_bytes(),
+                group_sender: None,
             });
         }
+        group @ (UiCmd::GroupNew { .. }
+        | UiCmd::GroupAdd { .. }
+        | UiCmd::GroupRemove { .. }
+        | UiCmd::GroupJoin { .. }
+        | UiCmd::GroupLeave { .. }
+        | UiCmd::GroupMembers { .. }
+        | UiCmd::GroupSend { .. }) => handle_group(group, messenger, &mut effects)?,
     }
     Ok(effects)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "handle passes only group commands here"
+)]
+fn handle_group(
+    cmd: UiCmd,
+    messenger: &mut Messenger,
+    effects: &mut Effects,
+) -> session::Result<()> {
+    let notice = |group, text| UiEvent::GroupNotice { group, text };
+    match cmd {
+        UiCmd::GroupNew { group } => {
+            messenger.create_group(&group)?;
+            effects.events.push(UiEvent::GroupJoined {
+                group,
+                creator: String::new(),
+            });
+        }
+        UiCmd::GroupAdd { group, contact } => {
+            effects
+                .outgoing
+                .push(messenger.ask_to_join(&group, &contact)?);
+            effects
+                .events
+                .push(notice(group, format!("asked {contact} to join")));
+        }
+        UiCmd::GroupRemove { group, member } => {
+            let out = messenger.remove_from_group(&group, &member)?;
+            let text = if out.is_empty() {
+                format!("cancelled the request to {member}")
+            } else {
+                format!("removing {member}")
+            };
+            effects.outgoing.extend(out);
+            effects.events.push(notice(group, text));
+        }
+        UiCmd::GroupJoin { creator, group } => {
+            effects
+                .outgoing
+                .push(messenger.join_group(&creator, &group)?);
+            effects.events.push(notice(
+                group,
+                format!("accepted; waiting for {creator} to add you"),
+            ));
+        }
+        UiCmd::GroupLeave { group } => {
+            effects.outgoing.extend(messenger.leave_group(&group)?);
+            effects.events.push(UiEvent::GroupLeft {
+                group,
+                reason: "you left".into(),
+            });
+        }
+        UiCmd::GroupMembers { group } => {
+            effects.changed = false;
+            let members = messenger
+                .group_members(&group)?
+                .into_iter()
+                .map(|member| (member.name, member.verified))
+                .collect();
+            effects
+                .events
+                .push(UiEvent::GroupMembers { group, members });
+        }
+        UiCmd::GroupSend { group, body } => {
+            let at = now()?;
+            effects
+                .outgoing
+                .push(messenger.send_group(&group, body.as_bytes())?);
+            effects.history.push(HistoryEntry {
+                contact: group,
+                outgoing: true,
+                at,
+                body: body.into_bytes(),
+                group_sender: Some(GroupSender {
+                    name: "me".into(),
+                    verified: true,
+                }),
+            });
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn report(ui: &mut UnixStream, message: &str) -> io::Result<()> {
@@ -481,16 +590,33 @@ fn clip(text: &str, max: usize) -> String {
     text.get(..end).unwrap_or_default().to_owned()
 }
 
+/// Why a read is in flight. Padding has neither flag set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Purpose {
+    /// The messenger wants what the box holds.
+    real: bool,
+    /// A write to this box was reported taken, and core needs to see what's there.
+    check: bool,
+}
+
+/// A read purple-net answered that core wanted for something.
+#[derive(Debug, PartialEq, Eq)]
+struct Answer {
+    at: BoxRef,
+    packet: Option<Packet>,
+    purpose: Purpose,
+}
+
 /// Box reads sent to purple-net and not yet answered.
 ///
-/// Each stream has at most one read in flight, so a slow transport never holds up the
-/// loop. A box that turns up is followed at once by a read of the stream's next box; an
-/// empty one is tried again on the next poll.
+/// Each box is read at most once at a time; a stream may have several boxes in flight
+/// while it reads ahead. A slow transport never holds up the loop. A box that turns up is
+/// followed at once by reads of whatever the messenger wants next; an empty one is tried
+/// again on the next poll.
 struct Reads {
     /// Whether polls are padded with reads of random boxes (see [`padded_round`]).
     padded: bool,
-    /// Each read in flight, and whether it is real rather than padding.
-    in_flight: HashMap<BoxRef, bool>,
+    in_flight: HashMap<BoxRef, Purpose>,
 }
 
 impl Reads {
@@ -501,8 +627,8 @@ impl Reads {
         }
     }
 
-    /// A poll: read the next box of each stream in `wanted` that has no read in flight,
-    /// padded if this transport needs it.
+    /// A poll: read each box in `wanted` that isn't already in flight, padded if this
+    /// transport needs it.
     fn poll(&mut self, net: &mut impl Write, wanted: &[BoxRef]) -> io::Result<()> {
         if self.in_flight.len() >= MAX_READS_IN_FLIGHT {
             return Ok(());
@@ -514,37 +640,57 @@ impl Reads {
             real.clone()
         };
         for at in round {
-            self.send(net, at, real.contains(&at))?;
+            let purpose = Purpose {
+                real: real.contains(&at),
+                check: false,
+            };
+            self.send(net, at, purpose)?;
         }
         Ok(())
     }
 
-    /// After a box turns up: read on in the streams in `wanted` with no read in flight,
-    /// without waiting for the next poll.
+    /// After a box turns up: read what the messenger wants now, without waiting for the
+    /// next poll.
     fn follow(&mut self, net: &mut impl Write, wanted: &[BoxRef]) -> io::Result<()> {
         for at in self.idle(wanted) {
-            self.send(net, at, true)?;
+            let purpose = Purpose {
+                real: true,
+                check: false,
+            };
+            self.send(net, at, purpose)?;
         }
         Ok(())
+    }
+
+    /// See what box `at` holds after a write to it was reported taken.
+    fn check(&mut self, net: &mut impl Write, at: BoxRef) -> io::Result<()> {
+        if let Some(purpose) = self.in_flight.get_mut(&at) {
+            purpose.check = true;
+            return Ok(());
+        }
+        let purpose = Purpose {
+            real: false,
+            check: true,
+        };
+        self.send(net, at, purpose)
     }
 
     fn idle(&self, wanted: &[BoxRef]) -> Vec<BoxRef> {
         wanted
             .iter()
-            .filter(|at| !self.in_flight.keys().any(|busy| busy.stream == at.stream))
+            .filter(|at| !self.in_flight.contains_key(at))
             .copied()
             .collect()
     }
 
-    fn send(&mut self, net: &mut impl Write, at: BoxRef, real: bool) -> io::Result<()> {
+    fn send(&mut self, net: &mut impl Write, at: BoxRef, purpose: Purpose) -> io::Result<()> {
         NetMsg::Read { at }.write_to(net)?;
-        self.in_flight.insert(at, real);
+        self.in_flight.insert(at, purpose);
         Ok(())
     }
 
-    /// Match a reply from purple-net to its read. Real reads give the box and what it
-    /// held; padding gives `None`.
-    fn answer(&mut self, reply: NetMsg) -> io::Result<Option<(BoxRef, Option<Packet>)>> {
+    /// Match a reply from purple-net to its read. Padding gives `None`.
+    fn answer(&mut self, reply: NetMsg) -> io::Result<Option<Answer>> {
         let (at, packet) = match reply {
             NetMsg::Found { at, packet } => (at, Some(packet)),
             NetMsg::Empty { at } => (at, None),
@@ -554,16 +700,20 @@ impl Reads {
                     "purple-net sent a message only purple-core may send",
                 ));
             }
-            NetMsg::Written { .. } => {
+            NetMsg::Written { .. } | NetMsg::Taken { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "a write confirmation isn't a read reply",
+                    "a write report isn't a read reply",
                 ));
             }
         };
         match self.in_flight.remove(&at) {
-            Some(true) => Ok(Some((at, packet))),
-            Some(false) => Ok(None),
+            Some(purpose) if purpose == Purpose::default() => Ok(None),
+            Some(purpose) => Ok(Some(Answer {
+                at,
+                packet,
+                purpose,
+            })),
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "purple-net answered a read core didn't send",
@@ -598,11 +748,112 @@ fn receive(
                 outgoing: false,
                 at: now,
                 body: body.clone(),
+                group_sender: None,
+            });
+        }
+        if let Event::GroupMessage { group, from, body } = &event {
+            effects.history.push(HistoryEntry {
+                contact: group.clone(),
+                outgoing: false,
+                at: now,
+                body: body.clone(),
+                group_sender: Some(GroupSender {
+                    name: from.name.clone(),
+                    verified: from.verified,
+                }),
             });
         }
         effects.events.push(to_ui_event(event));
     }
     Ok((effects, None))
+}
+
+/// Act on a read core wanted: settle a taken write, and hand over what was found.
+fn answered(
+    answer: Answer,
+    messenger: &mut Messenger,
+    vault: &mut Vault,
+    net: &mut UnixStream,
+    ui: &mut UnixStream,
+) -> io::Result<()> {
+    let Answer {
+        at,
+        packet,
+        purpose,
+    } = answer;
+    if purpose.check {
+        resolve_taken(at, packet.as_ref(), messenger, vault, net, ui)?;
+    }
+    match (purpose.real, packet) {
+        (true, Some(packet)) => receive_in_order(at, packet, messenger, vault, net, ui)?,
+        // An old group stream that stays quiet is dropped; that needs saving.
+        (true, None) if messenger.empty(&at, now()?).map_err(io::Error::other)? => {
+            let saved = Effects {
+                changed: true,
+                ..Effects::default()
+            };
+            commit(saved, messenger, vault, net, ui)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Hand the messenger box `at`, then every box read ahead that is now next in its stream.
+fn receive_in_order(
+    at: BoxRef,
+    packet: Packet,
+    messenger: &mut Messenger,
+    vault: &mut Vault,
+    net: &mut UnixStream,
+    ui: &mut UnixStream,
+) -> io::Result<()> {
+    let mut pending = Some((at, packet));
+    while let Some((box_at, box_packet)) = pending {
+        let (effects, error) = receive(messenger, box_at, &box_packet, now()?)?;
+        commit(effects, messenger, vault, net, ui)?;
+        if let Some(err) = error {
+            report(ui, &format!("dropped a packet: {err}"))?;
+        }
+        pending = messenger.buffered_next().map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// A write to box `at` was reported taken and the box holds `found`: write again, write
+/// elsewhere, or just save that it landed.
+fn resolve_taken(
+    at: BoxRef,
+    found: Option<&Packet>,
+    messenger: &mut Messenger,
+    vault: &mut Vault,
+    net: &mut UnixStream,
+    ui: &mut UnixStream,
+) -> io::Result<()> {
+    let saved = |outgoing| Effects {
+        outgoing,
+        changed: true,
+        ..Effects::default()
+    };
+    match messenger.taken(&at, found) {
+        Ok(Taken::Ours) => {
+            eprintln!("purple-core: a box reported full already held this packet");
+            commit(saved(Vec::new()), messenger, vault, net, ui)
+        }
+        Ok(Taken::Resend(again, packet)) => {
+            eprintln!("purple-core: a box reported full reads as empty; writing it again");
+            NetMsg::Write { at: again, packet }.write_to(net)
+        }
+        Ok(Taken::Moved(out)) => {
+            eprintln!("purple-core: another member filled a box first; moving the packet on");
+            commit(saved(vec![out]), messenger, vault, net, ui)
+        }
+        Ok(Taken::Unknown) => Ok(()),
+        Err(err) => {
+            commit(saved(Vec::new()), messenger, vault, net, ui)?;
+            report(ui, &err.to_string())
+        }
+    }
 }
 
 fn net_closed() -> io::Error {
@@ -615,6 +866,25 @@ fn to_ui_event(event: Event) -> UiEvent {
         Event::Message { from, body } => UiEvent::Message {
             from,
             body: clip(&String::from_utf8_lossy(&body), MAX_BODY_LEN),
+        },
+        Event::GroupRequest { creator, group } => UiEvent::GroupRequest { creator, group },
+        Event::GroupJoined { group, creator } => UiEvent::GroupJoined {
+            group,
+            creator: creator.unwrap_or_default(),
+        },
+        Event::GroupMessage { group, from, body } => UiEvent::GroupMessage {
+            group,
+            from: from.name,
+            verified: from.verified,
+            body: clip(&String::from_utf8_lossy(&body), MAX_BODY_LEN),
+        },
+        Event::GroupNotice { group, text } => UiEvent::GroupNotice {
+            group,
+            text: clip(&text, MAX_ERROR_LEN),
+        },
+        Event::GroupLeft { group, reason } => UiEvent::GroupLeft {
+            group,
+            reason: clip(&reason, MAX_ERROR_LEN),
         },
     }
 }
@@ -659,8 +929,87 @@ fn self_test(net: &mut UnixStream) -> io::Result<()> {
     deliver(net, to_bob)?;
     expect(self_test_poll(net, &mut bob, now)? == [message("alice", "hello bob")])?;
 
-    eprintln!("purple-core: self-test ok (invite, hello, messages both ways through purple-net)");
+    // Carol connects with Alice; Alice makes a group and adds Bob, then Carol. Bob and
+    // Carol aren't each other's contacts. Each step finishes before the next starts, so no
+    // two members ever write the same box.
+    let mut carol = Messenger::new().map_err(io::Error::other)?;
+    let (carol_invite, carol_bundle) = carol.create_invite("alice").map_err(io::Error::other)?;
+    deliver(net, carol_bundle)?;
+    alice
+        .accept_invite("carol", carol_invite)
+        .map_err(io::Error::other)?;
+    let carol_connected = UiEvent::Connected {
+        contact: "carol".into(),
+    };
+    expect(self_test_poll(net, &mut alice, now)? == [carol_connected])?;
+    let carol_sees_alice = UiEvent::Connected {
+        contact: "alice".into(),
+    };
+    expect(self_test_poll(net, &mut carol, now)? == [carol_sees_alice])?;
+    alice.create_group("team").map_err(io::Error::other)?;
+    self_test_add(net, &mut alice, "bob", &mut bob, now)?;
+    self_test_add(net, &mut alice, "carol", &mut carol, now)?;
+    expect(self_test_poll(net, &mut bob, now)? == [group_notice("carol joined")])?;
+
+    let to_team = carol
+        .send_group("team", b"hello team")
+        .map_err(io::Error::other)?;
+    deliver(net, to_team)?;
+    expect(self_test_poll(net, &mut alice, now)? == [group_message("carol", true)])?;
+    expect(self_test_poll(net, &mut bob, now)? == [group_message("carol", false)])?;
+
+    eprintln!(
+        "purple-core: self-test ok (invite, hello, messages both ways, a three-member group, \
+         through purple-net)"
+    );
     Ok(())
+}
+
+/// Alice asks `member` (her contact `name`) to join "team", and they accept.
+fn self_test_add(
+    net: &mut UnixStream,
+    alice: &mut Messenger,
+    name: &str,
+    member: &mut Messenger,
+    now: u64,
+) -> io::Result<()> {
+    deliver(
+        net,
+        alice.ask_to_join("team", name).map_err(io::Error::other)?,
+    )?;
+    let request = UiEvent::GroupRequest {
+        creator: "alice".into(),
+        group: "team".into(),
+    };
+    expect(self_test_poll(net, member, now)? == [request])?;
+    deliver(
+        net,
+        member
+            .join_group("alice", "team")
+            .map_err(io::Error::other)?,
+    )?;
+    expect(self_test_poll(net, alice, now)? == [group_notice(&format!("{name} joined"))])?;
+    let joined = UiEvent::GroupJoined {
+        group: "team".into(),
+        creator: "alice".into(),
+    };
+    expect(self_test_poll(net, member, now)? == [joined])
+}
+
+fn group_notice(text: &str) -> UiEvent {
+    UiEvent::GroupNotice {
+        group: "team".into(),
+        text: text.into(),
+    }
+}
+
+fn group_message(from: &str, verified: bool) -> UiEvent {
+    UiEvent::GroupMessage {
+        group: "team".into(),
+        from: from.into(),
+        verified,
+        body: "hello team".into(),
+    }
 }
 
 /// A poll for the self-test, run until every read is answered: no vault, and any rejected
@@ -677,20 +1026,27 @@ fn self_test_poll(
         let mut events = Vec::new();
         while !reads.in_flight.is_empty() {
             let reply = NetMsg::read_from(net)?.ok_or_else(net_closed)?;
-            if matches!(reply, NetMsg::Written { .. }) {
+            if matches!(reply, NetMsg::Written { .. } | NetMsg::Taken { .. }) {
                 continue;
             }
-            let Some((at, Some(packet))) = reads.answer(reply)? else {
+            let Some(answer) = reads.answer(reply)? else {
                 continue;
             };
-            let (effects, error) = receive(messenger, at, &packet, now)?;
-            if let Some(err) = error {
-                return Err(io::Error::other(err));
+            let (true, Some(found)) = (answer.purpose.real, answer.packet) else {
+                continue;
+            };
+            let mut pending = Some((answer.at, found));
+            while let Some((at, packet)) = pending {
+                let (effects, error) = receive(messenger, at, &packet, now)?;
+                if let Some(err) = error {
+                    return Err(io::Error::other(err));
+                }
+                for out in effects.outgoing {
+                    deliver(net, out)?;
+                }
+                events.extend(effects.events);
+                pending = messenger.buffered_next().map_err(io::Error::other)?;
             }
-            for out in effects.outgoing {
-                deliver(net, out)?;
-            }
-            events.extend(effects.events);
             reads.follow(net, &messenger.reads().map_err(io::Error::other)?)?;
         }
         if !events.is_empty() {
@@ -747,6 +1103,8 @@ fn note_sandbox(report: &Report) {
 
 #[cfg(test)]
 mod tests {
+    use purple_core::messenger::GroupMember;
+
     use super::*;
 
     #[test]
@@ -781,7 +1139,8 @@ mod tests {
                 other @ (NetMsg::Write { .. }
                 | NetMsg::Found { .. }
                 | NetMsg::Empty { .. }
-                | NetMsg::Written { .. }) => {
+                | NetMsg::Written { .. }
+                | NetMsg::Taken { .. }) => {
                     panic!("not a read: {other:?}")
                 }
             })
@@ -790,18 +1149,32 @@ mod tests {
         reads
     }
 
+    fn real(at: BoxRef, packet: Option<Packet>) -> Answer {
+        Answer {
+            at,
+            packet,
+            purpose: Purpose {
+                real: true,
+                check: false,
+            },
+        }
+    }
+
     #[test]
-    fn unpadded_polls_keep_one_read_in_flight_per_stream() {
+    fn unpadded_polls_read_each_wanted_box_once() {
         let mut reads = Reads::new(false);
         let mut net = Vec::new();
-        reads.poll(&mut net, &[at(1, 0), at(2, 5)]).unwrap();
-        assert_eq!(sent(&mut net), [at(1, 0), at(2, 5)]);
+        reads
+            .poll(&mut net, &[at(1, 0), at(1, 1), at(2, 5)])
+            .unwrap();
+        assert_eq!(sent(&mut net), [at(1, 0), at(1, 1), at(2, 5)]);
 
-        // Both still in flight: the next poll sends nothing.
-        reads.poll(&mut net, &[at(1, 0), at(2, 5)]).unwrap();
+        // All still in flight: the next poll sends nothing.
+        reads
+            .poll(&mut net, &[at(1, 0), at(1, 1), at(2, 5)])
+            .unwrap();
         assert!(sent(&mut net).is_empty());
 
-        // Stream 1's box turns up: its next box is read at once, stream 2 stays as it was.
         let packet = Packet::from_slice(&[7; purple_ipc::PACKET_LEN]).unwrap();
         let got = reads
             .answer(NetMsg::Found {
@@ -809,17 +1182,51 @@ mod tests {
                 packet: packet.clone(),
             })
             .unwrap();
-        assert_eq!(got, Some((at(1, 0), Some(packet))));
-        reads.follow(&mut net, &[at(1, 1), at(2, 5)]).unwrap();
-        assert_eq!(sent(&mut net), [at(1, 1)]);
+        assert_eq!(got, Some(real(at(1, 0), Some(packet))));
+        reads
+            .follow(&mut net, &[at(1, 1), at(1, 2), at(2, 5)])
+            .unwrap();
+        assert_eq!(sent(&mut net), [at(1, 2)]);
 
-        // An empty box waits for the next poll.
         assert_eq!(
             reads.answer(NetMsg::Empty { at: at(2, 5) }).unwrap(),
-            Some((at(2, 5), None))
+            Some(real(at(2, 5), None))
         );
-        reads.poll(&mut net, &[at(1, 1), at(2, 5)]).unwrap();
-        assert_eq!(sent(&mut net), [at(2, 5)]);
+    }
+
+    #[test]
+    fn checks_ride_along_with_reads_already_in_flight() {
+        let mut reads = Reads::new(false);
+        let mut net = Vec::new();
+        reads.poll(&mut net, &[at(1, 0)]).unwrap();
+        sent(&mut net);
+        reads.check(&mut net, at(1, 0)).unwrap();
+        assert!(sent(&mut net).is_empty(), "no second read of the same box");
+        reads.check(&mut net, at(3, 9)).unwrap();
+        assert_eq!(sent(&mut net), [at(3, 9)]);
+
+        let both = reads
+            .answer(NetMsg::Empty { at: at(1, 0) })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            both.purpose,
+            Purpose {
+                real: true,
+                check: true
+            }
+        );
+        let check = reads
+            .answer(NetMsg::Empty { at: at(3, 9) })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            check.purpose,
+            Purpose {
+                real: false,
+                check: true
+            }
+        );
     }
 
     #[test]
@@ -832,7 +1239,7 @@ mod tests {
         for read in round {
             let got = reads.answer(NetMsg::Empty { at: read }).unwrap();
             if read == at(1, 0) {
-                assert_eq!(got, Some((read, None)));
+                assert_eq!(got, Some(real(read, None)));
             } else {
                 assert_eq!(got, None);
             }
@@ -851,6 +1258,156 @@ mod tests {
             reads.answer(NetMsg::Empty { at: at(1, 0) }).is_err(),
             "answered twice"
         );
+    }
+
+    #[test]
+    fn group_events_reach_the_ui_with_their_sender() {
+        let joined = to_ui_event(Event::GroupJoined {
+            group: "team".into(),
+            creator: None,
+        });
+        assert_eq!(
+            joined,
+            UiEvent::GroupJoined {
+                group: "team".into(),
+                creator: String::new()
+            }
+        );
+        let said = to_ui_event(Event::GroupMessage {
+            group: "team".into(),
+            from: GroupMember {
+                name: "dana".into(),
+                verified: false,
+            },
+            body: b"hi".to_vec(),
+        });
+        assert_eq!(
+            said,
+            UiEvent::GroupMessage {
+                group: "team".into(),
+                from: "dana".into(),
+                verified: false,
+                body: "hi".into()
+            }
+        );
+    }
+
+    #[test]
+    fn replayed_history_tells_groups_from_contacts() {
+        let entry = |outgoing, group_sender| HistoryEntry {
+            contact: "team".into(),
+            outgoing,
+            at: 1,
+            body: b"hi".to_vec(),
+            group_sender,
+        };
+        let dana = GroupSender {
+            name: "dana".into(),
+            verified: false,
+        };
+        let me = GroupSender {
+            name: "me".into(),
+            verified: true,
+        };
+        assert_eq!(
+            replayed(entry(false, Some(dana))),
+            UiEvent::GroupMessage {
+                group: "team".into(),
+                from: "dana".into(),
+                verified: false,
+                body: "hi".into()
+            }
+        );
+        assert_eq!(
+            replayed(entry(true, Some(me))),
+            UiEvent::GroupSent {
+                group: "team".into(),
+                body: "hi".into()
+            }
+        );
+        assert_eq!(
+            replayed(entry(false, None)),
+            UiEvent::Message {
+                from: "team".into(),
+                body: "hi".into()
+            }
+        );
+    }
+
+    #[test]
+    fn group_commands_change_the_messenger_and_tell_the_ui() {
+        let mut messenger = Messenger::new().unwrap();
+        let created = handle(
+            UiCmd::GroupNew {
+                group: "team".into(),
+            },
+            &mut messenger,
+        )
+        .unwrap();
+        assert!(created.changed);
+        assert_eq!(
+            created.events,
+            [UiEvent::GroupJoined {
+                group: "team".into(),
+                creator: String::new()
+            }]
+        );
+
+        let sent = handle(
+            UiCmd::GroupSend {
+                group: "team".into(),
+                body: "hi".into(),
+            },
+            &mut messenger,
+        )
+        .unwrap();
+        assert_eq!(sent.outgoing.len(), 1);
+        let entry = &sent.history[0];
+        assert_eq!(entry.contact, "team");
+        assert!(entry.outgoing);
+        assert_eq!(
+            entry.group_sender,
+            Some(GroupSender {
+                name: "me".into(),
+                verified: true
+            })
+        );
+
+        let members = handle(
+            UiCmd::GroupMembers {
+                group: "team".into(),
+            },
+            &mut messenger,
+        )
+        .unwrap();
+        assert!(!members.changed, "listing members changes nothing");
+        assert_eq!(
+            members.events,
+            [UiEvent::GroupMembers {
+                group: "team".into(),
+                members: vec![("me".into(), true)]
+            }]
+        );
+
+        assert!(
+            handle(
+                UiCmd::GroupAdd {
+                    group: "team".into(),
+                    contact: "nobody".into(),
+                },
+                &mut messenger,
+            )
+            .is_err()
+        );
+        let left = handle(
+            UiCmd::GroupLeave {
+                group: "team".into(),
+            },
+            &mut messenger,
+        )
+        .unwrap();
+        assert!(left.outgoing.is_empty(), "the creator tells nobody");
+        assert!(messenger.groups().is_empty());
     }
 
     #[test]

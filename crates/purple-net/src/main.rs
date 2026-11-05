@@ -140,7 +140,10 @@ fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::
             Ok(Event::Core(Ok(NetMsg::Write { at, packet }))) => scheduler.enqueue(at, packet),
             Ok(Event::Core(Ok(NetMsg::Read { at }))) => scheduler.read(&at, &done_sink)?,
             Ok(Event::Core(Ok(
-                NetMsg::Found { .. } | NetMsg::Empty { .. } | NetMsg::Written { .. },
+                NetMsg::Found { .. }
+                | NetMsg::Empty { .. }
+                | NetMsg::Written { .. }
+                | NetMsg::Taken { .. },
             ))) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -154,6 +157,7 @@ fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::
                         packet?.map_or(NetMsg::Empty { at }, |packet| NetMsg::Found { at, packet })
                     }
                     Done::Written(at) => NetMsg::Written { at },
+                    Done::Taken(at) => NetMsg::Taken { at },
                 };
                 match reply.write_to(&mut core) {
                     // Core closed its socket and the reader hasn't noticed yet.

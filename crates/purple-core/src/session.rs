@@ -10,11 +10,11 @@ use std::time::SystemTime;
 use futures_executor::block_on;
 use libsignal_protocol::kem::KeyType;
 use libsignal_protocol::{
-    CiphertextMessage, DeviceId, GenericSignedPreKey, IdentityKeyPair, KeyPair, KyberPreKeyId,
-    KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeySignalMessage,
-    PreKeyStore, ProtocolAddress, SignalMessage, SignalProtocolError, SignedPreKeyId,
-    SignedPreKeyRecord, SignedPreKeyStore, Timestamp, message_decrypt, message_encrypt,
-    process_prekey_bundle,
+    CiphertextMessage, DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair,
+    IdentityKeyStore, KeyPair, KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle,
+    PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore, ProtocolAddress, SignalMessage,
+    SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
+    message_decrypt, message_encrypt, process_prekey_bundle,
 };
 use rand::TryRngCore;
 use rand::rngs::OsRng;
@@ -47,6 +47,8 @@ pub enum Error {
     Io(std::io::Error),
     /// A name, invite or contact the call refers to doesn't exist or is already taken.
     State(&'static str),
+    /// OpenMLS rejected a group operation; its own description of why.
+    Mls(String),
 }
 
 impl fmt::Display for Error {
@@ -56,6 +58,7 @@ impl fmt::Display for Error {
             Self::Malformed(msg) => write!(f, "malformed: {msg}"),
             Self::Io(err) => write!(f, "{err}"),
             Self::State(msg) => f.write_str(msg),
+            Self::Mls(msg) => write!(f, "group: {msg}"),
         }
     }
 }
@@ -168,6 +171,32 @@ impl Account {
         let bundle = self.new_prekey_bundle()?;
         let identity = *self.stores.identity().identity_key();
         Ok((Invite::create(identity)?, encode_bundle(&bundle)?))
+    }
+
+    /// This account's public identity key.
+    #[must_use]
+    pub fn identity_key(&self) -> IdentityKey {
+        *self.stores.identity().identity_key()
+    }
+
+    /// Sign `message` with the identity key (XEdDSA).
+    pub(crate) fn sign(&self, message: &[u8]) -> Result<Box<[u8]>> {
+        Ok(self
+            .stores
+            .identity()
+            .private_key()
+            .calculate_signature(message, &mut rng())
+            .map_err(SignalProtocolError::from)?)
+    }
+
+    /// The identity key libsignal has for `peer`, once a session with them exists.
+    ///
+    /// # Errors
+    /// Fails only if `peer` isn't a valid address.
+    pub fn peer_identity(&self, peer: &str) -> Result<Option<IdentityKey>> {
+        Ok(block_on(
+            self.stores.identities.get_identity(&address(peer)?),
+        )?)
     }
 
     /// Accept `invite` using the bundle fetched from its bundle queue, and start a session
@@ -335,6 +364,16 @@ mod tests {
         assert_eq!(first[0], TAG_PREKEY);
         assert_eq!(bob.decrypt("alice", &first).unwrap(), b"hi bob");
         (alice, bob)
+    }
+
+    #[test]
+    fn peers_identity_keys_are_known_once_connected() {
+        let (alice, bob) = connected();
+        assert_eq!(
+            alice.peer_identity("bob").unwrap(),
+            Some(bob.identity_key())
+        );
+        assert_eq!(alice.peer_identity("carol").unwrap(), None);
     }
 
     #[test]

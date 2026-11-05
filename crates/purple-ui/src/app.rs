@@ -28,8 +28,14 @@ const HELP: &[&str] = &[
     "/accept NAME INVITE   accept an invite (paste it) from a contact called NAME",
     "/passphrase           change the vault passphrase (Esc cancels)",
     "/tpm                  seal the vault to this machine's TPM; you get a recovery code",
+    "/group new NAME              create a group (shown as #NAME)",
+    "/group add NAME CONTACT      ask a contact to join your group",
+    "/group remove NAME MEMBER    remove a member, or cancel a request (your groups only)",
+    "/group join CREATOR NAME     accept a request to join a group",
+    "/group leave NAME            leave a group",
+    "/group members NAME          list members: ✓ for your contacts",
     "/quit                 exit (also Esc or Ctrl-C)",
-    "Up/Down or Tab switch contact; anything else you type is sent to the selected contact.",
+    "Up/Down or Tab switch conversation; anything else you type is sent to the selected one.",
 ];
 
 /// Input to [`update`].
@@ -95,6 +101,8 @@ pub(crate) struct Model {
     contacts: Vec<String>,
     selected: usize,
     chats: HashMap<String, Vec<ChatLine>>,
+    /// Who created each group this user is in; empty for their own.
+    group_creators: HashMap<String, String>,
     system: Vec<String>,
     input: String,
     quit: bool,
@@ -260,6 +268,9 @@ fn submit(model: &mut Model) -> Vec<UiCmd> {
             );
             Vec::new()
         }
+        (Some("group"), Some(verb), Some(first), second) if words.next().is_none() => {
+            group_command(model, verb, first, second)
+        }
         (Some("help"), None, None, None) => {
             for help in HELP {
                 model.log(*help);
@@ -271,6 +282,27 @@ fn submit(model: &mut Model) -> Vec<UiCmd> {
             Vec::new()
         }
     }
+}
+
+/// `/group VERB FIRST [SECOND]`.
+fn group_command(model: &mut Model, verb: &str, first: &str, second: Option<&str>) -> Vec<UiCmd> {
+    let (a, b) = (first.to_owned(), second.map(str::to_owned));
+    let cmd = match (verb, b) {
+        ("new", None) => UiCmd::GroupNew { group: a },
+        ("leave", None) => UiCmd::GroupLeave { group: a },
+        ("members", None) => UiCmd::GroupMembers { group: a },
+        ("add", Some(contact)) => UiCmd::GroupAdd { group: a, contact },
+        ("remove", Some(member)) => UiCmd::GroupRemove { group: a, member },
+        ("join", Some(group)) => UiCmd::GroupJoin { creator: a, group },
+        _ => {
+            model.log(
+                "usage: /group new|leave|members NAME, /group add|remove NAME CONTACT, \
+                       /group join CREATOR NAME",
+            );
+            return Vec::new();
+        }
+    };
+    vec![cmd]
 }
 
 fn submit_passphrase(model: &mut Model) -> Vec<UiCmd> {
@@ -370,6 +402,17 @@ fn send(model: &mut Model, body: &str) -> Vec<UiCmd> {
         model.log("no contact selected: /invite or /accept someone first");
         return Vec::new();
     };
+    if let Some(group) = contact.strip_prefix('#') {
+        let group = group.to_owned();
+        model.chats.entry(contact).or_default().push(ChatLine {
+            from: "me".to_owned(),
+            body: body.to_owned(),
+        });
+        return vec![UiCmd::GroupSend {
+            group,
+            body: body.to_owned(),
+        }];
+    }
     model
         .chats
         .entry(contact.clone())
@@ -437,7 +480,101 @@ fn on_core_event(model: &mut Model, event: UiEvent) {
             });
         }
         UiEvent::Error { message } => model.log(format!("error: {}", sanitize(&message))),
+        UiEvent::GroupJoined { .. }
+        | UiEvent::GroupRequest { .. }
+        | UiEvent::GroupMessage { .. }
+        | UiEvent::GroupSent { .. }
+        | UiEvent::GroupNotice { .. }
+        | UiEvent::GroupLeft { .. }
+        | UiEvent::GroupMembers { .. } => on_group_event(model, event),
     }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "on_core_event passes only group events here"
+)]
+fn on_group_event(model: &mut Model, event: UiEvent) {
+    match event {
+        UiEvent::GroupJoined { group, creator } => {
+            let (group, creator) = (sanitize(&group), sanitize(&creator));
+            model.log(if creator.is_empty() {
+                format!("created #{group}")
+            } else {
+                format!("joined #{group} (created by {creator})")
+            });
+            model.group_creators.insert(group.clone(), creator);
+            model.add_contact(format!("#{group}"));
+        }
+        UiEvent::GroupRequest { creator, group } => {
+            let (creator, group) = (sanitize(&creator), sanitize(&group));
+            model.log(format!(
+                "{creator} asks you to join #{group}. Accept with: /group join {creator} {group}"
+            ));
+        }
+        UiEvent::GroupMessage {
+            group,
+            from,
+            verified,
+            body,
+        } => {
+            let group = sanitize(&group);
+            let label = sender_label(model, &group, &sanitize(&from), verified);
+            let key = format!("#{group}");
+            model.add_contact(key.clone());
+            model.chats.entry(key).or_default().push(ChatLine {
+                from: label,
+                body: sanitize(&body),
+            });
+        }
+        UiEvent::GroupSent { group, body } => {
+            let key = format!("#{}", sanitize(&group));
+            model.add_contact(key.clone());
+            model.chats.entry(key).or_default().push(ChatLine {
+                from: "me".to_owned(),
+                body: sanitize(&body),
+            });
+        }
+        UiEvent::GroupNotice { group, text } => {
+            model.log(format!("#{}: {}", sanitize(&group), sanitize(&text)));
+        }
+        UiEvent::GroupLeft { group, reason } => {
+            let group = sanitize(&group);
+            model.log(format!("left #{group}: {}", sanitize(&reason)));
+            let key = format!("#{group}");
+            model.contacts.retain(|contact| *contact != key);
+            model.selected = model.selected.min(model.contacts.len().saturating_sub(1));
+        }
+        UiEvent::GroupMembers { group, members } => {
+            let group = sanitize(&group);
+            let shown: Vec<String> = members
+                .iter()
+                .map(|(name, verified)| sender_label(model, &group, &sanitize(name), *verified))
+                .collect();
+            model.log(format!("#{group}: {}", shown.join(", ")));
+        }
+        _ => {}
+    }
+}
+
+/// How a group message's sender is shown: a check mark for your contacts, otherwise whose
+/// contact they are.
+fn sender_label(model: &Model, group: &str, from: &str, verified: bool) -> String {
+    // Only purple-core's own "me" is verified; a name the creator chose never is.
+    if verified && from == "me" {
+        return "me".to_owned();
+    }
+    if verified {
+        return format!("{from} ✓");
+    }
+    model
+        .group_creators
+        .get(group)
+        .filter(|creator| !creator.is_empty())
+        .map_or_else(
+            || format!("{from} (not verified)"),
+            |creator| format!("{from} ({creator}'s contact)"),
+        )
 }
 
 /// Replace every control character (including ESC and newlines) and every bidi control
@@ -790,5 +927,153 @@ mod tests {
         );
         update(&mut m, key(KeyCode::Char('\u{1b}')));
         assert_eq!(m.input, " ");
+    }
+
+    #[test]
+    fn group_events_show_up_under_the_group() {
+        let mut m = open_model();
+        update(
+            &mut m,
+            Msg::Core(UiEvent::GroupJoined {
+                group: "team".into(),
+                creator: "alice".into(),
+            }),
+        );
+        for (from, verified, body) in [("dana", false, "hi"), ("alice", true, "yo")] {
+            update(
+                &mut m,
+                Msg::Core(UiEvent::GroupMessage {
+                    group: "team".into(),
+                    from: from.into(),
+                    verified,
+                    body: body.into(),
+                }),
+            );
+        }
+        assert!(m.contacts.contains(&"#team".to_owned()));
+        let lines = &m.chats["#team"];
+        assert_eq!(lines[0].from, "dana (alice's contact)");
+        assert_eq!(lines[1].from, "alice ✓");
+
+        update(
+            &mut m,
+            Msg::Core(UiEvent::GroupLeft {
+                group: "team".into(),
+                reason: "removed by alice".into(),
+            }),
+        );
+        assert!(!m.contacts.contains(&"#team".to_owned()));
+    }
+
+    #[test]
+    fn group_commands_become_core_requests() {
+        let mut m = open_model();
+        let group = || "team".to_owned();
+        assert_eq!(
+            type_line(&mut m, "/group new team"),
+            [UiCmd::GroupNew { group: group() }]
+        );
+        assert_eq!(
+            type_line(&mut m, "/group add team bob"),
+            [UiCmd::GroupAdd {
+                group: group(),
+                contact: "bob".into()
+            }]
+        );
+        assert_eq!(
+            type_line(&mut m, "/group remove team bob"),
+            [UiCmd::GroupRemove {
+                group: group(),
+                member: "bob".into()
+            }]
+        );
+        assert_eq!(
+            type_line(&mut m, "/group join alice team"),
+            [UiCmd::GroupJoin {
+                creator: "alice".into(),
+                group: group()
+            }]
+        );
+        assert_eq!(
+            type_line(&mut m, "/group leave team"),
+            [UiCmd::GroupLeave { group: group() }]
+        );
+        assert_eq!(
+            type_line(&mut m, "/group members team"),
+            [UiCmd::GroupMembers { group: group() }]
+        );
+        for bad in [
+            "/group",
+            "/group add team",
+            "/group add team bob extra",
+            "/group nope x",
+        ] {
+            assert!(type_line(&mut m, bad).is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn text_typed_in_a_group_goes_to_the_group() {
+        let mut m = open_model();
+        update(
+            &mut m,
+            Msg::Core(UiEvent::GroupJoined {
+                group: "team".into(),
+                creator: String::new(),
+            }),
+        );
+        assert_eq!(
+            type_line(&mut m, "hello team"),
+            [UiCmd::GroupSend {
+                group: "team".into(),
+                body: "hello team".into()
+            }]
+        );
+        assert_eq!(m.chats["#team"][0].from, "me");
+    }
+
+    #[test]
+    fn member_lists_are_logged_with_their_marks() {
+        let mut m = open_model();
+        update(
+            &mut m,
+            Msg::Core(UiEvent::GroupJoined {
+                group: "team".into(),
+                creator: "alice".into(),
+            }),
+        );
+        update(
+            &mut m,
+            Msg::Core(UiEvent::GroupMembers {
+                group: "team".into(),
+                members: vec![("alice".into(), true), ("dana".into(), false)],
+            }),
+        );
+        assert_eq!(
+            m.system.last().unwrap(),
+            "#team: alice ✓, dana (alice's contact)"
+        );
+    }
+
+    #[test]
+    fn an_unverified_sender_called_me_is_not_shown_as_you() {
+        let mut m = open_model();
+        update(
+            &mut m,
+            Msg::Core(UiEvent::GroupJoined {
+                group: "team".into(),
+                creator: "alice".into(),
+            }),
+        );
+        update(
+            &mut m,
+            Msg::Core(UiEvent::GroupMessage {
+                group: "team".into(),
+                from: "me".into(),
+                verified: false,
+                body: "hi".into(),
+            }),
+        );
+        assert_eq!(m.chats["#team"][0].from, "me (alice's contact)");
     }
 }

@@ -19,9 +19,12 @@ pub const MAX_ERROR_LEN: usize = 512;
 pub const MAX_PASSPHRASE_LEN: usize = 1024;
 /// Longest recovery code text, in bytes.
 pub const MAX_RECOVERY_LEN: usize = 64;
+/// Most members a group member list may hold; groups are capped at 50.
+pub const MAX_GROUP_MEMBERS: usize = 50;
 
-/// The largest message is a name plus a body.
-const MAX_UI_FRAME: usize = 1 + 2 + MAX_NAME_LEN + 2 + MAX_BODY_LEN;
+/// The largest message is two names, a flag and a body. A full member list (50 names and
+/// flags) is about 3.4 KB, well under that.
+const MAX_UI_FRAME: usize = 1 + 2 * (2 + MAX_NAME_LEN) + 1 + 2 + MAX_BODY_LEN;
 
 const CMD_CREATE_INVITE: u8 = 1;
 const CMD_ACCEPT_INVITE: u8 = 2;
@@ -29,6 +32,13 @@ const CMD_SEND: u8 = 3;
 const CMD_UNLOCK: u8 = 4;
 const CMD_CHANGE_PASSPHRASE: u8 = 5;
 const CMD_ENROLL_TPM: u8 = 6;
+const CMD_GROUP_NEW: u8 = 7;
+const CMD_GROUP_ADD: u8 = 8;
+const CMD_GROUP_REMOVE: u8 = 9;
+const CMD_GROUP_JOIN: u8 = 10;
+const CMD_GROUP_LEAVE: u8 = 11;
+const CMD_GROUP_MEMBERS: u8 = 12;
+const CMD_GROUP_SEND: u8 = 13;
 
 const EVENT_INVITE_CREATED: u8 = 1;
 const EVENT_CONNECTED: u8 = 2;
@@ -40,6 +50,13 @@ const EVENT_SENT: u8 = 7;
 const EVENT_PASSPHRASE_CHANGED: u8 = 8;
 const EVENT_TPM_ENROLLED: u8 = 9;
 const EVENT_RECOVERY_UNLOCKED: u8 = 10;
+const EVENT_GROUP_JOINED: u8 = 11;
+const EVENT_GROUP_REQUEST: u8 = 12;
+const EVENT_GROUP_MESSAGE: u8 = 13;
+const EVENT_GROUP_SENT: u8 = 14;
+const EVENT_GROUP_NOTICE: u8 = 15;
+const EVENT_GROUP_LEFT: u8 = 16;
+const EVENT_GROUP_MEMBERS: u8 = 17;
 
 /// What the user asked for, sent from `purple-ui` to `purple-core`.
 #[derive(Clone, PartialEq, Eq)]
@@ -80,6 +97,49 @@ pub enum UiCmd {
         /// Message text.
         body: String,
     },
+    /// Create a group.
+    GroupNew {
+        /// The group's name.
+        group: String,
+    },
+    /// Ask a contact to join a group this user created.
+    GroupAdd {
+        /// The group's name.
+        group: String,
+        /// The contact to ask.
+        contact: String,
+    },
+    /// Remove a member from a group this user created, or cancel their request.
+    GroupRemove {
+        /// The group's name.
+        group: String,
+        /// The member, by this user's name for them.
+        member: String,
+    },
+    /// Accept a request to join a group.
+    GroupJoin {
+        /// The contact who created it.
+        creator: String,
+        /// The group's name.
+        group: String,
+    },
+    /// Leave a group.
+    GroupLeave {
+        /// The group's name.
+        group: String,
+    },
+    /// List a group's members.
+    GroupMembers {
+        /// The group's name.
+        group: String,
+    },
+    /// Send text to a group.
+    GroupSend {
+        /// The group's name.
+        group: String,
+        /// Message text.
+        body: String,
+    },
 }
 
 /// Debug without the passphrase.
@@ -100,6 +160,33 @@ impl std::fmt::Debug for UiCmd {
             Self::Send { contact, .. } => f
                 .debug_struct("Send")
                 .field("contact", contact)
+                .finish_non_exhaustive(),
+            Self::GroupNew { group } => f.debug_struct("GroupNew").field("group", group).finish(),
+            Self::GroupAdd { group, contact } => f
+                .debug_struct("GroupAdd")
+                .field("group", group)
+                .field("contact", contact)
+                .finish(),
+            Self::GroupRemove { group, member } => f
+                .debug_struct("GroupRemove")
+                .field("group", group)
+                .field("member", member)
+                .finish(),
+            Self::GroupJoin { creator, group } => f
+                .debug_struct("GroupJoin")
+                .field("creator", creator)
+                .field("group", group)
+                .finish(),
+            Self::GroupLeave { group } => {
+                f.debug_struct("GroupLeave").field("group", group).finish()
+            }
+            Self::GroupMembers { group } => f
+                .debug_struct("GroupMembers")
+                .field("group", group)
+                .finish(),
+            Self::GroupSend { group, .. } => f
+                .debug_struct("GroupSend")
+                .field("group", group)
                 .finish_non_exhaustive(),
         }
     }
@@ -156,6 +243,59 @@ pub enum UiEvent {
         /// What went wrong.
         message: String,
     },
+    /// This user is in a group: just created or joined, or replayed at unlock.
+    GroupJoined {
+        /// The group's name.
+        group: String,
+        /// The contact who created it; empty if this user did.
+        creator: String,
+    },
+    /// A contact asks this user to join a group.
+    GroupRequest {
+        /// The contact who created the group.
+        creator: String,
+        /// The group's name.
+        group: String,
+    },
+    /// A group message arrived.
+    GroupMessage {
+        /// The group's name.
+        group: String,
+        /// Who sent it: your name for a contact, otherwise the creator's name for them.
+        from: String,
+        /// Whether the sender is one of your contacts.
+        verified: bool,
+        /// Message text.
+        body: String,
+    },
+    /// A group message this user sent earlier, replayed from history.
+    GroupSent {
+        /// The group's name.
+        group: String,
+        /// Message text.
+        body: String,
+    },
+    /// Something changed in a group.
+    GroupNotice {
+        /// The group's name.
+        group: String,
+        /// What happened.
+        text: String,
+    },
+    /// This user is no longer in a group.
+    GroupLeft {
+        /// The group's name.
+        group: String,
+        /// Why.
+        reason: String,
+    },
+    /// A group's members, as asked for.
+    GroupMembers {
+        /// The group's name.
+        group: String,
+        /// Each member's name and whether they're one of your contacts.
+        members: Vec<(String, bool)>,
+    },
 }
 
 /// Debug without the recovery code; message text is shown, as the UI shows it anyway.
@@ -189,6 +329,48 @@ impl std::fmt::Debug for UiEvent {
                 .field("body", body)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+            Self::GroupJoined { group, creator } => f
+                .debug_struct("GroupJoined")
+                .field("group", group)
+                .field("creator", creator)
+                .finish(),
+            Self::GroupRequest { creator, group } => f
+                .debug_struct("GroupRequest")
+                .field("creator", creator)
+                .field("group", group)
+                .finish(),
+            Self::GroupMessage {
+                group,
+                from,
+                verified,
+                body,
+            } => f
+                .debug_struct("GroupMessage")
+                .field("group", group)
+                .field("from", from)
+                .field("verified", verified)
+                .field("body", body)
+                .finish(),
+            Self::GroupSent { group, body } => f
+                .debug_struct("GroupSent")
+                .field("group", group)
+                .field("body", body)
+                .finish(),
+            Self::GroupNotice { group, text } => f
+                .debug_struct("GroupNotice")
+                .field("group", group)
+                .field("text", text)
+                .finish(),
+            Self::GroupLeft { group, reason } => f
+                .debug_struct("GroupLeft")
+                .field("group", group)
+                .field("reason", reason)
+                .finish(),
+            Self::GroupMembers { group, members } => f
+                .debug_struct("GroupMembers")
+                .field("group", group)
+                .field("members", members)
+                .finish(),
         }
     }
 }
@@ -228,6 +410,38 @@ impl UiCmd {
                 out.str(contact, MAX_NAME_LEN)?;
                 out.str(body, MAX_BODY_LEN)?;
             }
+            Self::GroupNew { group } => {
+                out.tag(CMD_GROUP_NEW);
+                out.str(group, MAX_NAME_LEN)?;
+            }
+            Self::GroupAdd { group, contact } => {
+                out.tag(CMD_GROUP_ADD);
+                out.str(group, MAX_NAME_LEN)?;
+                out.str(contact, MAX_NAME_LEN)?;
+            }
+            Self::GroupRemove { group, member } => {
+                out.tag(CMD_GROUP_REMOVE);
+                out.str(group, MAX_NAME_LEN)?;
+                out.str(member, MAX_NAME_LEN)?;
+            }
+            Self::GroupJoin { creator, group } => {
+                out.tag(CMD_GROUP_JOIN);
+                out.str(creator, MAX_NAME_LEN)?;
+                out.str(group, MAX_NAME_LEN)?;
+            }
+            Self::GroupLeave { group } => {
+                out.tag(CMD_GROUP_LEAVE);
+                out.str(group, MAX_NAME_LEN)?;
+            }
+            Self::GroupMembers { group } => {
+                out.tag(CMD_GROUP_MEMBERS);
+                out.str(group, MAX_NAME_LEN)?;
+            }
+            Self::GroupSend { group, body } => {
+                out.tag(CMD_GROUP_SEND);
+                out.str(group, MAX_NAME_LEN)?;
+                out.str(body, MAX_BODY_LEN)?;
+            }
         }
         write_frame(w, &out.0, MAX_UI_FRAME)
     }
@@ -261,6 +475,31 @@ impl UiCmd {
             },
             CMD_SEND => Self::Send {
                 contact: d.str(MAX_NAME_LEN)?,
+                body: d.str(MAX_BODY_LEN)?,
+            },
+            CMD_GROUP_NEW => Self::GroupNew {
+                group: d.str(MAX_NAME_LEN)?,
+            },
+            CMD_GROUP_ADD => Self::GroupAdd {
+                group: d.str(MAX_NAME_LEN)?,
+                contact: d.str(MAX_NAME_LEN)?,
+            },
+            CMD_GROUP_REMOVE => Self::GroupRemove {
+                group: d.str(MAX_NAME_LEN)?,
+                member: d.str(MAX_NAME_LEN)?,
+            },
+            CMD_GROUP_JOIN => Self::GroupJoin {
+                creator: d.str(MAX_NAME_LEN)?,
+                group: d.str(MAX_NAME_LEN)?,
+            },
+            CMD_GROUP_LEAVE => Self::GroupLeave {
+                group: d.str(MAX_NAME_LEN)?,
+            },
+            CMD_GROUP_MEMBERS => Self::GroupMembers {
+                group: d.str(MAX_NAME_LEN)?,
+            },
+            CMD_GROUP_SEND => Self::GroupSend {
+                group: d.str(MAX_NAME_LEN)?,
                 body: d.str(MAX_BODY_LEN)?,
             },
             _ => return Err(invalid("unknown UI command")),
@@ -312,6 +551,56 @@ impl UiEvent {
                 out.tag(EVENT_ERROR);
                 out.str(message, MAX_ERROR_LEN)?;
             }
+            Self::GroupJoined { group, creator } => {
+                out.tag(EVENT_GROUP_JOINED);
+                out.str(group, MAX_NAME_LEN)?;
+                out.str(creator, MAX_NAME_LEN)?;
+            }
+            Self::GroupRequest { creator, group } => {
+                out.tag(EVENT_GROUP_REQUEST);
+                out.str(creator, MAX_NAME_LEN)?;
+                out.str(group, MAX_NAME_LEN)?;
+            }
+            Self::GroupMessage {
+                group,
+                from,
+                verified,
+                body,
+            } => {
+                out.tag(EVENT_GROUP_MESSAGE);
+                out.str(group, MAX_NAME_LEN)?;
+                out.str(from, MAX_NAME_LEN)?;
+                out.tag(u8::from(*verified));
+                out.str(body, MAX_BODY_LEN)?;
+            }
+            Self::GroupSent { group, body } => {
+                out.tag(EVENT_GROUP_SENT);
+                out.str(group, MAX_NAME_LEN)?;
+                out.str(body, MAX_BODY_LEN)?;
+            }
+            Self::GroupNotice { group, text } => {
+                out.tag(EVENT_GROUP_NOTICE);
+                out.str(group, MAX_NAME_LEN)?;
+                out.str(text, MAX_ERROR_LEN)?;
+            }
+            Self::GroupLeft { group, reason } => {
+                out.tag(EVENT_GROUP_LEFT);
+                out.str(group, MAX_NAME_LEN)?;
+                out.str(reason, MAX_ERROR_LEN)?;
+            }
+            Self::GroupMembers { group, members } => {
+                out.tag(EVENT_GROUP_MEMBERS);
+                out.str(group, MAX_NAME_LEN)?;
+                let count = u8::try_from(members.len())
+                    .ok()
+                    .filter(|&count| usize::from(count) <= MAX_GROUP_MEMBERS)
+                    .ok_or_else(|| invalid("too many members"))?;
+                out.tag(count);
+                for (name, verified) in members {
+                    out.str(name, MAX_NAME_LEN)?;
+                    out.tag(u8::from(*verified));
+                }
+            }
         }
         write_frame(w, &out.0, MAX_UI_FRAME)
     }
@@ -326,13 +615,7 @@ impl UiEvent {
         };
         let mut d = Decoder(&frame);
         let event = match d.tag()? {
-            EVENT_NEED_PASSPHRASE => Self::NeedPassphrase {
-                new: match d.tag()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(invalid("invalid flag")),
-                },
-            },
+            EVENT_NEED_PASSPHRASE => Self::NeedPassphrase { new: d.flag()? },
             EVENT_UNLOCKED => Self::Unlocked,
             EVENT_PASSPHRASE_CHANGED => Self::PassphraseChanged,
             EVENT_TPM_ENROLLED => Self::TpmEnrolled {
@@ -357,6 +640,44 @@ impl UiEvent {
             EVENT_ERROR => Self::Error {
                 message: d.str(MAX_ERROR_LEN)?,
             },
+            EVENT_GROUP_JOINED => Self::GroupJoined {
+                group: d.str(MAX_NAME_LEN)?,
+                creator: d.str(MAX_NAME_LEN)?,
+            },
+            EVENT_GROUP_REQUEST => Self::GroupRequest {
+                creator: d.str(MAX_NAME_LEN)?,
+                group: d.str(MAX_NAME_LEN)?,
+            },
+            EVENT_GROUP_MESSAGE => Self::GroupMessage {
+                group: d.str(MAX_NAME_LEN)?,
+                from: d.str(MAX_NAME_LEN)?,
+                verified: d.flag()?,
+                body: d.str(MAX_BODY_LEN)?,
+            },
+            EVENT_GROUP_SENT => Self::GroupSent {
+                group: d.str(MAX_NAME_LEN)?,
+                body: d.str(MAX_BODY_LEN)?,
+            },
+            EVENT_GROUP_NOTICE => Self::GroupNotice {
+                group: d.str(MAX_NAME_LEN)?,
+                text: d.str(MAX_ERROR_LEN)?,
+            },
+            EVENT_GROUP_LEFT => Self::GroupLeft {
+                group: d.str(MAX_NAME_LEN)?,
+                reason: d.str(MAX_ERROR_LEN)?,
+            },
+            EVENT_GROUP_MEMBERS => {
+                let group = d.str(MAX_NAME_LEN)?;
+                let count = usize::from(d.tag()?);
+                if count > MAX_GROUP_MEMBERS {
+                    return Err(invalid("too many members"));
+                }
+                let mut members = Vec::with_capacity(count);
+                for _ in 0..count {
+                    members.push((d.str(MAX_NAME_LEN)?, d.flag()?));
+                }
+                Self::GroupMembers { group, members }
+            }
             _ => return Err(invalid("unknown UI event")),
         };
         d.finish()?;
@@ -393,6 +714,14 @@ impl Decoder<'_> {
             .ok_or_else(|| invalid("empty message"))?;
         self.0 = rest;
         Ok(tag)
+    }
+
+    fn flag(&mut self) -> io::Result<bool> {
+        match self.tag()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(invalid("bad flag")),
+        }
     }
 
     fn str(&mut self, max: usize) -> io::Result<String> {
@@ -563,5 +892,143 @@ mod tests {
         assert!(UiEvent::read_from(&mut &frame(&[99])[..]).is_err());
         assert!(UiEvent::read_from(&mut &frame(&[EVENT_NEED_PASSPHRASE, 2])[..]).is_err());
         assert!(UiEvent::read_from(&mut &frame(&[EVENT_UNLOCKED, 0])[..]).is_err());
+    }
+
+    #[test]
+    fn group_message_flags_must_be_zero_or_one() {
+        let mut body = vec![EVENT_GROUP_MESSAGE];
+        for field in ["team", "bob"] {
+            body.extend_from_slice(&u16::try_from(field.len()).unwrap().to_be_bytes());
+            body.extend_from_slice(field.as_bytes());
+        }
+        body.push(2);
+        body.extend_from_slice(&[0, 0]);
+        assert!(UiEvent::read_from(&mut &frame(&body)[..]).is_err());
+    }
+
+    #[test]
+    fn group_events_round_trip() {
+        let events = [
+            UiEvent::GroupJoined {
+                group: s("team"),
+                creator: String::new(),
+            },
+            UiEvent::GroupJoined {
+                group: s("team"),
+                creator: s("alice"),
+            },
+            UiEvent::GroupRequest {
+                creator: s("alice"),
+                group: s("team"),
+            },
+            UiEvent::GroupMessage {
+                group: s("team"),
+                from: s("dana"),
+                verified: false,
+                body: s("hi"),
+            },
+            UiEvent::GroupMessage {
+                group: s("team"),
+                from: s("bob"),
+                verified: true,
+                body: s("yo"),
+            },
+            UiEvent::GroupSent {
+                group: s("team"),
+                body: s("sent"),
+            },
+            UiEvent::GroupNotice {
+                group: s("team"),
+                text: s("bob joined"),
+            },
+            UiEvent::GroupLeft {
+                group: s("team"),
+                reason: s("you left"),
+            },
+        ];
+        let mut buf = Vec::new();
+        for event in &events {
+            event.write_to(&mut buf).unwrap();
+        }
+        let mut reader = &buf[..];
+        for event in &events {
+            assert_eq!(
+                UiEvent::read_from(&mut reader).unwrap().as_ref(),
+                Some(event)
+            );
+        }
+        assert_eq!(UiEvent::read_from(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn group_commands_and_members_round_trip() {
+        let cmds = [
+            UiCmd::GroupNew { group: s("team") },
+            UiCmd::GroupAdd {
+                group: s("team"),
+                contact: s("bob"),
+            },
+            UiCmd::GroupRemove {
+                group: s("team"),
+                member: s("bob"),
+            },
+            UiCmd::GroupJoin {
+                creator: s("alice"),
+                group: s("team"),
+            },
+            UiCmd::GroupLeave { group: s("team") },
+            UiCmd::GroupMembers { group: s("team") },
+            UiCmd::GroupSend {
+                group: s("team"),
+                body: "x".repeat(MAX_BODY_LEN),
+            },
+        ];
+        let mut buf = Vec::new();
+        for cmd in &cmds {
+            cmd.write_to(&mut buf).unwrap();
+        }
+        let mut reader = &buf[..];
+        for cmd in &cmds {
+            assert_eq!(UiCmd::read_from(&mut reader).unwrap().as_ref(), Some(cmd));
+        }
+
+        let full: Vec<(String, bool)> = (0..MAX_GROUP_MEMBERS)
+            .map(|i| {
+                (
+                    "x".repeat(MAX_NAME_LEN - 2) + &format!("{i:02}"),
+                    i % 2 == 0,
+                )
+            })
+            .collect();
+        for members in [Vec::new(), vec![(s("bob"), true), (s("dana"), false)], full] {
+            let event = UiEvent::GroupMembers {
+                group: s("team"),
+                members,
+            };
+            let mut encoded = Vec::new();
+            event.write_to(&mut encoded).unwrap();
+            assert_eq!(UiEvent::read_from(&mut &encoded[..]).unwrap(), Some(event));
+        }
+        let too_many = UiEvent::GroupMembers {
+            group: s("team"),
+            members: vec![(s("bob"), true); MAX_GROUP_MEMBERS + 1],
+        };
+        assert!(too_many.write_to(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn member_lists_over_the_cap_are_refused() {
+        let mut body = vec![EVENT_GROUP_MEMBERS, 0, 1, b't'];
+        body.push(u8::try_from(MAX_GROUP_MEMBERS + 1).unwrap());
+        assert!(UiEvent::read_from(&mut &frame(&body)[..]).is_err());
+    }
+
+    #[test]
+    fn group_sends_hide_their_body_in_debug_output() {
+        let cmd = UiCmd::GroupSend {
+            group: s("team"),
+            body: s("secret words"),
+        };
+        assert!(!format!("{cmd:?}").contains("secret"));
     }
 }

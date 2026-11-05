@@ -25,7 +25,7 @@ use hkdf::Hkdf;
 use purple_ipc::{BoxRef, PACKET_LEN, Packet};
 use sha2::Sha256;
 
-pub use client::{Client, Envelope, Fetched, Keypair};
+pub use client::{Client, Envelope, Fetched, Keypair, Stored};
 
 use crate::{Done, ReadDone, Sink, Transport};
 
@@ -102,9 +102,13 @@ impl Transport for PigeonholeTransport {
                 WRITE_RETRY_FIRST,
                 WRITE_RETRY_MAX,
             ) {
-                Ok(()) => {
+                Ok(stored) => {
                     if let Some(done) = done {
-                        done.send(Done::Written(at)).ok();
+                        let report = match stored {
+                            Stored::Written => Done::Written(at),
+                            Stored::Taken => Done::Taken(at),
+                        };
+                        done.send(report).ok();
                     }
                 }
                 Err(err) => eprintln!("purple-net: lost a box write: {err}"),
@@ -166,7 +170,7 @@ pub fn box_seed(at: &BoxRef) -> [u8; 32] {
     seed
 }
 
-fn write_box(client: &Client, seed: &[u8; 32], packet: &Packet) -> io::Result<()> {
+fn write_box(client: &Client, seed: &[u8; 32], packet: &Packet) -> io::Result<Stored> {
     let keys = client.new_keypair(seed)?;
     let envelope = client.encrypt_write(packet.as_bytes(), &keys.write_cap, &keys.first_index)?;
     client.send_write(&envelope, &keys.write_cap)
@@ -176,15 +180,15 @@ fn write_box(client: &Client, seed: &[u8; 32], packet: &Packet) -> io::Result<()
 /// long after each one after that, up to `max`. Only a lost daemon connection
 /// (`BrokenPipe`) ends it early: anything else may be the network, and a write that
 /// actually landed the first time succeeds when repeated.
-fn with_retries(
-    mut attempt: impl FnMut() -> io::Result<()>,
+fn with_retries<T>(
+    mut attempt: impl FnMut() -> io::Result<T>,
     first: Duration,
     max: Duration,
-) -> io::Result<()> {
+) -> io::Result<T> {
     let mut wait = first;
     loop {
         match attempt() {
-            Ok(()) => return Ok(()),
+            Ok(done) => return Ok(done),
             Err(err) if err.kind() == io::ErrorKind::BrokenPipe => return Err(err),
             Err(err) => {
                 eprintln!("purple-net: a box write failed, retrying in {wait:?}: {err}");
@@ -290,7 +294,7 @@ mod tests {
         let err = with_retries(
             || {
                 calls += 1;
-                Err(stopped())
+                Err::<(), _>(stopped())
             },
             Duration::from_millis(1),
             Duration::from_millis(1),

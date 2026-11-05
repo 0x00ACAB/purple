@@ -95,7 +95,7 @@ impl KdfParams {
 /// One message in the history log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryEntry {
-    /// The contact the message was exchanged with.
+    /// The contact the message was exchanged with, or the group's name.
     pub contact: String,
     /// Whether this user sent it.
     pub outgoing: bool,
@@ -103,6 +103,18 @@ pub struct HistoryEntry {
     pub at: u64,
     /// Message text.
     pub body: Vec<u8>,
+    /// For a group message (`contact` is then the group's name): who sent it. `None` for
+    /// 1:1 messages.
+    pub group_sender: Option<GroupSender>,
+}
+
+/// Who sent a group message, as shown when it arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupSender {
+    /// The name shown: your name for a contact, otherwise the creator's.
+    pub name: String,
+    /// Whether the sender is one of your contacts.
+    pub verified: bool,
 }
 
 /// The data key wrapped under a key derived from a passphrase.
@@ -797,6 +809,10 @@ impl Vault {
         w.u8(u8::from(entry.outgoing));
         w.u64(entry.at);
         w.bytes(&entry.body)?;
+        if let Some(sender) = &entry.group_sender {
+            w.bytes(sender.name.as_bytes())?;
+            w.u8(u8::from(sender.verified));
+        }
         let plaintext = w.finish();
 
         let mut nonce = [0u8; NONCE_LEN];
@@ -876,11 +892,25 @@ impl Vault {
                     .map_err(|_| Error::Malformed("history record failed to decrypt"))?,
             );
             let mut entry = Reader::new(&plaintext);
+            let contact = entry.string()?;
+            let outgoing = entry.u8()? != 0;
+            let at = entry.u64()?;
+            let body = entry.bytes()?.to_vec();
+            // Records written before groups end here.
+            let group_sender = if entry.is_empty() {
+                None
+            } else {
+                Some(GroupSender {
+                    name: entry.string()?,
+                    verified: entry.u8()? != 0,
+                })
+            };
             entries.push(HistoryEntry {
-                contact: entry.string()?,
-                outgoing: entry.u8()? != 0,
-                at: entry.u64()?,
-                body: entry.bytes()?.to_vec(),
+                contact,
+                outgoing,
+                at,
+                body,
+                group_sender,
             });
             entry.finish()?;
 
@@ -1100,6 +1130,7 @@ mod tests {
             outgoing: false,
             at: 1,
             body: body.as_bytes().to_vec(),
+            group_sender: None,
         }
     }
 
@@ -1476,5 +1507,25 @@ mod tests {
         // The last character carries two bits that must be zero.
         assert!(RecoveryCode::parse("AAAAA-AAAAA-AAAAA-AAAAA-AAAAAB").is_none());
         assert!(RecoveryCode::parse("AAAAA-AAAAA-AAAAA-AAAAA-AAAAAE").is_some());
+    }
+
+    #[test]
+    fn group_messages_keep_their_sender_and_old_records_still_read() {
+        let dir = temp_dir("group-history");
+        let mut vault = Vault::create(&dir, "correct horse", FAST, b"s").unwrap();
+        vault.append(&entry("bob", "one to one")).unwrap();
+        let group = HistoryEntry {
+            group_sender: Some(GroupSender {
+                name: "dana".into(),
+                verified: false,
+            }),
+            ..entry("team", "hi all")
+        };
+        vault.append(&group).unwrap();
+        drop(vault);
+        let (reopened, _) = Vault::open(&dir, "correct horse", None).unwrap();
+        let history = reopened.history().unwrap();
+        assert_eq!(history[0].group_sender, None);
+        assert_eq!(history[1], group);
     }
 }

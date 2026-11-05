@@ -2,3 +2,5 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+# ".." keeps clippy's default list; these are names, not code.
+doc-valid-idents = ["OpenMLS", "XEdDSA", ".."]
