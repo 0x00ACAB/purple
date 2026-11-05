@@ -276,9 +276,7 @@ fn serve(
                 NetMsg::Found { .. }
                 | NetMsg::Empty { .. }
                 | NetMsg::Written { .. }
-                | NetMsg::Taken { .. }
-                | NetMsg::Status(_)
-                | NetMsg::Choose(_),
+                | NetMsg::Taken { .. },
             ))) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

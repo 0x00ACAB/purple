@@ -26,14 +26,19 @@ use purple_core::session;
 use purple_core::tpm::{Sealer, TPM_DEVICE, Tpm};
 use purple_core::vault::{GroupSender, HistoryEntry, KdfParams, UnlockedBy, Vault};
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
+use purple_ipc::torctl::{LauncherMsg, TorCtlMsg};
 use purple_ipc::ui::{MAX_BODY_LEN, MAX_ERROR_LEN, UiCmd, UiEvent};
 use purple_ipc::{
-    BoxRef, CORE_NET_FD, CORE_UI_FD, NetChoice, NetMsg, NetStatus, Packet, SEED_LEN, StreamSeed,
-    inherited_stream,
+    BoxRef, CORE_LAUNCHER_FD, CORE_NET_FD, CORE_TORCTL_FD, CORE_UI_FD, NetMsg, Packet, SEED_LEN,
+    StreamSeed, inherited_stream,
 };
 use rand::seq::SliceRandom;
 use rand::{Rng, RngCore};
 use zeroize::Zeroizing;
+
+mod tor_route;
+
+use tor_route::TorRoute;
 
 const NAME: &str = "purple-core";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -43,8 +48,7 @@ const POLL_ROUND: usize = 16;
 const MAX_READS_IN_FLIGHT: usize = 256;
 const SELF_TEST_POLLS: u32 = 200;
 const SELF_TEST_WAIT: Duration = Duration::from_millis(100);
-const USAGE: &str =
-    "usage: purple-core (--no-ui | --data-dir <dir> --store <store> [--no-read-padding])";
+const USAGE: &str = "usage: purple-core (--no-ui | --data-dir <dir> --store <store> [--no-read-padding] [--torctl])";
 
 fn main() -> ExitCode {
     match run() {
@@ -66,6 +70,8 @@ enum Mode {
         padded: bool,
         /// The store invites name, from the launcher.
         store: StoreRef,
+        /// Whether purple-torctl and the launcher's relay socket are on fds 5 and 6.
+        torctl: bool,
     },
 }
 
@@ -75,17 +81,24 @@ fn parse_args() -> io::Result<Mode> {
 }
 
 fn parse_args_from(args: &[&str]) -> io::Result<Mode> {
-    let serve = |dir: &str, store: &str, padded| {
-        Ok(Mode::Serve {
-            data_dir: PathBuf::from(dir),
-            padded,
-            store: StoreRef::parse(store).map_err(io::Error::other)?,
-        })
-    };
     match args {
         ["--no-ui"] => Ok(Mode::SelfTest),
-        ["--data-dir", dir, "--store", store] => serve(dir, store, true),
-        ["--data-dir", dir, "--store", store, "--no-read-padding"] => serve(dir, store, false),
+        ["--data-dir", dir, "--store", store, rest @ ..] => {
+            let (mut padded, mut torctl) = (true, false);
+            for flag in rest {
+                match *flag {
+                    "--no-read-padding" if padded => padded = false,
+                    "--torctl" if !torctl => torctl = true,
+                    _ => return Err(io::Error::other(USAGE)),
+                }
+            }
+            Ok(Mode::Serve {
+                data_dir: PathBuf::from(dir),
+                padded,
+                store: StoreRef::parse(store).map_err(io::Error::other)?,
+                torctl,
+            })
+        }
         _ => Err(io::Error::other(USAGE)),
     }
 }
@@ -118,10 +131,21 @@ fn run() -> io::Result<()> {
             data_dir,
             padded,
             store,
+            torctl,
         } => {
             // SAFETY: the launcher hands this fd to purple-core and nothing else here uses it.
             let ui = unsafe { inherited_stream(CORE_UI_FD)? };
-            serve_ui(&mut net, ui, &data_dir, Reads::new(padded), store)
+            let route = if torctl {
+                // SAFETY: with --torctl the launcher hands this fd to purple-core and
+                // nothing else here uses it.
+                let to_torctl = unsafe { inherited_stream(CORE_TORCTL_FD)? };
+                // SAFETY: as above, for the launcher's own socket.
+                let to_launcher = unsafe { inherited_stream(CORE_LAUNCHER_FD)? };
+                TorRoute::new(Some(to_torctl), Some(to_launcher))
+            } else {
+                TorRoute::new(None, None)
+            };
+            serve_ui(&mut net, ui, &data_dir, Reads::new(padded), store, route)
         }
     }
 }
@@ -142,6 +166,10 @@ enum Input {
     Ui(io::Result<Option<UiCmd>>),
     /// A reply from purple-net, or `None` once it closes its socket.
     Net(io::Result<Option<NetMsg>>),
+    /// A message from purple-torctl, or `None` once it closes its socket.
+    Tor(io::Result<Option<TorCtlMsg>>),
+    /// A message from the launcher, or `None` once it closes its socket.
+    Launcher(io::Result<Option<LauncherMsg>>),
 }
 
 /// Unlock the vault, replay what it holds, then serve the UI until it closes its socket.
@@ -151,6 +179,7 @@ fn serve_ui(
     data_dir: &Path,
     mut reads: Reads,
     store: StoreRef,
+    mut route: TorRoute,
 ) -> io::Result<()> {
     let (inputs_tx, inputs) = mpsc::channel();
     let mut ui_in = ui.try_clone()?;
@@ -163,8 +192,23 @@ fn serve_ui(
     spawn_reader(
         move || NetMsg::read_from(&mut net_in),
         Input::Net,
-        inputs_tx,
+        inputs_tx.clone(),
     );
+    let (torctl_in, launcher_in) = route.readers()?;
+    if let Some(mut t) = torctl_in {
+        spawn_reader(
+            move || TorCtlMsg::read_from(&mut t),
+            Input::Tor,
+            inputs_tx.clone(),
+        );
+    }
+    if let Some(mut l) = launcher_in {
+        spawn_reader(
+            move || LauncherMsg::read_from(&mut l),
+            Input::Launcher,
+            inputs_tx,
+        );
+    }
     let Some((mut messenger, mut vault)) = unlock(&inputs, &mut ui, data_dir)? else {
         return Ok(());
     };
@@ -182,46 +226,11 @@ fn serve_ui(
     loop {
         let wait = next_poll.saturating_duration_since(Instant::now());
         match inputs.recv_timeout(wait) {
-            Ok(Input::Ui(Ok(Some(UiCmd::ChangePassphrase { old, new })))) => {
-                let (old, new) = (Zeroizing::new(old), Zeroizing::new(new));
-                let mut tpm = vault.sealed_to_tpm().then(open_tpm).flatten();
-                let changed = messenger.to_snapshot().and_then(|snapshot| {
-                    vault.change_passphrase(
-                        &old,
-                        &new,
-                        KdfParams::DEFAULT,
-                        &snapshot,
-                        as_sealer(&mut tpm),
-                    )
-                });
-                match changed {
-                    Ok(()) => UiEvent::PassphraseChanged.write_to(&mut ui)?,
-                    Err(err) => report(&mut ui, &err.to_string())?,
-                }
-            }
-            Ok(Input::Ui(Ok(Some(UiCmd::EnrollTpm { passphrase })))) => {
-                let passphrase = Zeroizing::new(passphrase);
-                let enrolled = Tpm::open()
-                    .map_err(|err| {
-                        session::Error::Io(io::Error::other(format!(
-                            "can't open {TPM_DEVICE}: {err} (if permission is denied, add \
-                             your user to the tss group)"
-                        )))
-                    })
-                    .and_then(|mut tpm| {
-                        let snapshot = messenger.to_snapshot()?;
-                        vault.enroll_tpm(&passphrase, KdfParams::DEFAULT, &snapshot, &mut tpm)
-                    });
-                match enrolled {
-                    Ok(code) => UiEvent::TpmEnrolled {
-                        recovery_code: code.to_text().to_string(),
-                    }
-                    .write_to(&mut ui)?,
-                    Err(err) => report(&mut ui, &err.to_string())?,
-                }
-            }
+            Ok(Input::Ui(Ok(Some(
+                cmd @ (UiCmd::ChangePassphrase { .. } | UiCmd::EnrollTpm { .. }),
+            )))) => on_key_command(cmd, &messenger, &mut vault, &mut ui)?,
             Ok(Input::Ui(Ok(Some(cmd)))) => {
-                on_command(cmd, &mut messenger, &mut vault, net, &mut ui)?;
+                on_command(cmd, &mut messenger, &mut vault, net, &mut ui, &mut route)?;
             }
             Ok(Input::Ui(Ok(None))) => return Ok(()),
             Ok(Input::Net(Ok(Some(NetMsg::Written { at })))) => {
@@ -234,9 +243,8 @@ fn serve_ui(
                 }
             }
             Ok(Input::Net(Ok(Some(NetMsg::Taken { at })))) => reads.check(net, at)?,
-            Ok(Input::Net(Ok(Some(NetMsg::Status(status))))) => {
-                to_ui_network(status).write_to(&mut ui)?;
-            }
+            Ok(Input::Tor(got)) => route.on_torctl(&got, &mut ui)?,
+            Ok(Input::Launcher(got)) => route.on_launcher(&got, net, &mut ui)?,
             Ok(Input::Net(Ok(Some(reply)))) => {
                 if let Some(answer) = reads.answer(reply)? {
                     answered(answer, &mut messenger, &mut vault, net, &mut ui)?;
@@ -255,6 +263,61 @@ fn serve_ui(
             next_poll = next_on_grid(next_poll);
         }
     }
+}
+
+/// A command about the vault's keys: a new passphrase, or sealing to the TPM.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "serve_ui sends only these two here"
+)]
+fn on_key_command(
+    cmd: UiCmd,
+    messenger: &Messenger,
+    vault: &mut Vault,
+    ui: &mut UnixStream,
+) -> io::Result<()> {
+    match cmd {
+        UiCmd::ChangePassphrase { old, new } => {
+            let (old, new) = (Zeroizing::new(old), Zeroizing::new(new));
+            let mut tpm = vault.sealed_to_tpm().then(open_tpm).flatten();
+            let changed = messenger.to_snapshot().and_then(|snapshot| {
+                vault.change_passphrase(
+                    &old,
+                    &new,
+                    KdfParams::DEFAULT,
+                    &snapshot,
+                    as_sealer(&mut tpm),
+                )
+            });
+            match changed {
+                Ok(()) => UiEvent::PassphraseChanged.write_to(ui)?,
+                Err(err) => report(ui, &err.to_string())?,
+            }
+        }
+        UiCmd::EnrollTpm { passphrase } => {
+            let passphrase = Zeroizing::new(passphrase);
+            let enrolled = Tpm::open()
+                .map_err(|err| {
+                    session::Error::Io(io::Error::other(format!(
+                        "can't open {TPM_DEVICE}: {err} (if permission is denied, add \
+                         your user to the tss group)"
+                    )))
+                })
+                .and_then(|mut tpm| {
+                    let snapshot = messenger.to_snapshot()?;
+                    vault.enroll_tpm(&passphrase, KdfParams::DEFAULT, &snapshot, &mut tpm)
+                });
+            match enrolled {
+                Ok(code) => UiEvent::TpmEnrolled {
+                    recovery_code: code.to_text().to_string(),
+                }
+                .write_to(ui)?,
+                Err(err) => report(ui, &err.to_string())?,
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The next poll time on the fixed grid. If polling fell behind, skip the missed slots
@@ -309,10 +372,12 @@ fn unlock(
                 Ok(Input::Ui(Ok(None))) | Err(_) => return Ok(None),
                 Ok(Input::Ui(Err(err)) | Input::Net(Err(err))) => return Err(err),
                 Ok(Input::Net(Ok(None))) => return Err(net_closed()),
-                // purple-net reports how Tor is doing from its first second on.
-                Ok(Input::Net(Ok(Some(NetMsg::Status(status))))) => {
-                    to_ui_network(status).write_to(ui)?;
+                // purple-torctl reports how Tor is doing from its first second on.
+                Ok(Input::Tor(Ok(Some(TorCtlMsg::Status(status))))) => {
+                    UiEvent::Network { status }.write_to(ui)?;
                 }
+                // Nothing can ask for a route before unlock.
+                Ok(Input::Tor(_) | Input::Launcher(_)) => {}
                 Ok(Input::Net(Ok(Some(_)))) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -409,21 +474,18 @@ fn resend_unwritten(messenger: &Messenger, net: &mut UnixStream) -> io::Result<(
     Ok(())
 }
 
-/// Save first, then send packets, then record history and tell the UI. A failed save is
-/// fatal: carrying on could reuse keys after a restart. Packets are saved in the
-/// messenger's outbox before they go out, so one lost on the way is sent again after a
-/// restart.
-/// A UI command: an answer to purple-net's blocked prompt goes to purple-net, anything
-/// else to the messenger.
+/// A UI command: an answer to the blocked prompt goes to purple-torctl, anything else to
+/// the messenger.
 fn on_command(
     cmd: UiCmd,
     messenger: &mut Messenger,
     vault: &mut Vault,
     net: &mut UnixStream,
     ui: &mut UnixStream,
+    route: &mut TorRoute,
 ) -> io::Result<()> {
-    if let Some(choice) = choice_for(&cmd) {
-        return choice.write_to(net);
+    if route.choose(&cmd, ui)? {
+        return Ok(());
     }
     match handle(cmd, messenger) {
         Ok(effects) => commit(effects, messenger, vault, net, ui),
@@ -431,6 +493,10 @@ fn on_command(
     }
 }
 
+/// Save first, then send packets, then record history and tell the UI. A failed save is
+/// fatal: carrying on could reuse keys after a restart. Packets are saved in the
+/// messenger's outbox before they go out, so one lost on the way is sent again after a
+/// restart.
 fn commit(
     effects: Effects,
     messenger: &mut Messenger,
@@ -741,14 +807,13 @@ impl Reads {
             NetMsg::Read { .. }
             | NetMsg::ReadCover { .. }
             | NetMsg::Write { .. }
-            | NetMsg::Choose(_)
             | NetMsg::UseDirect => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "purple-net sent a message only purple-core may send",
                 ));
             }
-            NetMsg::Written { .. } | NetMsg::Taken { .. } | NetMsg::Status(_) => {
+            NetMsg::Written { .. } | NetMsg::Taken { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "a write report isn't a read reply",
@@ -1074,10 +1139,7 @@ fn self_test_poll(
         let mut events = Vec::new();
         while !reads.in_flight.is_empty() {
             let reply = NetMsg::read_from(net)?.ok_or_else(net_closed)?;
-            if matches!(
-                reply,
-                NetMsg::Written { .. } | NetMsg::Taken { .. } | NetMsg::Status(_)
-            ) {
+            if matches!(reply, NetMsg::Written { .. } | NetMsg::Taken { .. }) {
                 continue;
             }
             let Some(answer) = reads.answer(reply)? else {
@@ -1106,24 +1168,6 @@ fn self_test_poll(
         thread::sleep(SELF_TEST_WAIT);
     }
     Err(io::Error::other("self-test timed out waiting for a packet"))
-}
-
-/// purple-net's connection status, for the UI.
-const fn to_ui_network(status: NetStatus) -> UiEvent {
-    UiEvent::Network { status }
-}
-
-/// The message to purple-net for a UI command that answers its blocked prompt.
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "every other command is for the messenger"
-)]
-fn choice_for(cmd: &UiCmd) -> Option<NetMsg> {
-    match cmd {
-        UiCmd::UseDirect => Some(NetMsg::Choose(NetChoice::Direct)),
-        UiCmd::AddBridges { lines } => Some(NetMsg::Choose(NetChoice::Bridges(lines.clone()))),
-        _ => None,
-    }
 }
 
 fn now() -> io::Result<u64> {
@@ -1173,7 +1217,7 @@ fn note_sandbox(report: &Report) {
 #[cfg(test)]
 mod tests {
     use purple_core::messenger::GroupMember;
-    use purple_ipc::Route;
+    use purple_ipc::{NetStatus, Route};
 
     use super::*;
 
@@ -1211,8 +1255,6 @@ mod tests {
                 | NetMsg::Empty { .. }
                 | NetMsg::Written { .. }
                 | NetMsg::Taken { .. }
-                | NetMsg::Status(_)
-                | NetMsg::Choose(_)
                 | NetMsg::UseDirect) => {
                     panic!("not a read: {other:?}")
                 }
@@ -1321,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn status_from_net_during_unlock_goes_to_the_ui() {
+    fn status_from_torctl_during_unlock_goes_to_the_ui() {
         let dir = std::env::temp_dir().join(format!("purple-unlock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (tx, rx) = mpsc::channel();
@@ -1329,7 +1371,7 @@ mod tests {
             route: Route::Tor,
             percent: 5,
         };
-        tx.send(Input::Net(Ok(Some(NetMsg::Status(status)))))
+        tx.send(Input::Tor(Ok(Some(TorCtlMsg::Status(status)))))
             .unwrap();
         tx.send(Input::Ui(Ok(None))).unwrap();
         let (mut ui, mut ui_peer) = UnixStream::pair().unwrap();
@@ -1349,23 +1391,6 @@ mod tests {
             "asked once"
         );
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn network_status_and_choices_pass_through() {
-        let status = NetStatus::Blocked;
-        assert_eq!(to_ui_network(status), UiEvent::Network { status });
-        assert_eq!(
-            choice_for(&UiCmd::UseDirect),
-            Some(NetMsg::Choose(NetChoice::Direct))
-        );
-        assert_eq!(
-            choice_for(&UiCmd::AddBridges {
-                lines: "obfs4 x".into()
-            }),
-            Some(NetMsg::Choose(NetChoice::Bridges("obfs4 x".into())))
-        );
-        assert_eq!(choice_for(&UiCmd::GroupNew { group: "g".into() }), None);
     }
 
     #[test]
@@ -1396,6 +1421,18 @@ mod tests {
         assert!(
             parse_args_from(&["--data-dir", "/d"]).is_err(),
             "--store is required"
+        );
+        assert!(matches!(
+            parse_args_from(&["--data-dir", "/d", "--store", "tor:x.onion", "--torctl"]).unwrap(),
+            Mode::Serve {
+                torctl: true,
+                padded: true,
+                ..
+            }
+        ));
+        assert!(
+            parse_args_from(&["--data-dir", "/d", "--store", "dev", "--torctl", "--torctl"])
+                .is_err()
         );
     }
 
