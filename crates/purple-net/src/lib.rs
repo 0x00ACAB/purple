@@ -12,6 +12,7 @@
 pub mod katzenpost;
 pub mod noise;
 pub mod scheduler;
+pub mod tor;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
