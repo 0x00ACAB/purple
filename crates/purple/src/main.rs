@@ -132,6 +132,7 @@ fn run() -> io::Result<bool> {
         options.no_ui,
     );
 
+    let kp_socket_dir = kp.as_ref().map(|(_, _, socket_dir)| socket_dir.clone());
     let kp_child = match &kp {
         Some((binary, config, socket_dir)) => {
             let mut child = spawn_kpclientd(
@@ -185,6 +186,9 @@ fn run() -> io::Result<bool> {
     if let Some((_, mut child)) = kp_child {
         child.kill().ok();
         child.wait()?;
+    }
+    if let Some(dir) = kp_socket_dir {
+        fs::remove_dir_all(dir)?;
     }
     Ok(all_ok)
 }
@@ -260,13 +264,22 @@ fn prepare_kpclientd(
         ));
     }
     check_kp_config(&fs::read_to_string(&config)?)?;
-    let socket_dir = private_dir(&runtime_dir()?.join("purple/kp"))?;
-    // A socket left by an earlier run would make kpclientd's bind fail.
-    match fs::remove_file(socket_dir.join(KP_SOCKET_NAME)) {
+    // One directory per run: purple instances with different profiles share the runtime
+    // directory, and each must reach only its own daemon.
+    let parent = private_dir(&runtime_dir()?.join("purple"))?;
+    let socket_dir = fresh_private_dir(&parent.join(format!("kp-{}", std::process::id())))?;
+    Ok(Some((binary, config, socket_dir)))
+}
+
+/// Create `dir` empty and readable only by the user. Whatever was there (left by a crashed
+/// run with the same pid) is removed first.
+fn fresh_private_dir(dir: &Path) -> io::Result<PathBuf> {
+    match fs::remove_dir_all(dir) {
         Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
         Ok(()) | Err(_) => {}
     }
-    Ok(Some((binary, config, socket_dir)))
+    DirBuilder::new().mode(0o700).create(dir)?;
+    Ok(dir.to_path_buf())
 }
 
 /// Wait until kpclientd has made its socket, so `purple-net` can connect at once.
@@ -452,6 +465,19 @@ mod tests {
         assert!(check_kp_config(wrong_path).is_err());
         let with_abstract = format!("{good}    Address = \"@katzenpost\"\n");
         assert!(check_kp_config(&with_abstract).is_err());
+    }
+
+    #[test]
+    fn fresh_private_dir_starts_empty_and_private() {
+        let dir = std::env::temp_dir().join(format!("purple-fresh-{}", std::process::id()));
+        fresh_private_dir(&dir).unwrap();
+        fs::write(dir.join(KP_SOCKET_NAME), b"stale").unwrap();
+        fresh_private_dir(&dir).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let mode =
+            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&dir).unwrap().permissions());
+        assert_eq!(mode & 0o777, 0o700);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -258,4 +258,40 @@ mod tests {
         let digest = Sha256::digest([a.write_cap, a.read_cap, a.first_index].concat());
         println!("keypair digest: {digest:x}");
     }
+
+    /// Against a kpclientd on a live network: write a fresh box, then read it back over a
+    /// second connection. Run with `PURPLE_KPCLIENTD_SOCKET=<path> cargo test -- --ignored`;
+    /// set `PURPLE_KPCLIENTD_READ_SOCKET` to read through a second daemon instead.
+    #[test]
+    #[ignore = "needs a kpclientd on a live network"]
+    fn real_network_round_trips_a_box() {
+        let socket = std::env::var("PURPLE_KPCLIENTD_SOCKET").unwrap();
+        let read_socket =
+            std::env::var("PURPLE_KPCLIENTD_READ_SOCKET").unwrap_or_else(|_| socket.clone());
+        let writer = Client::connect(Path::new(&socket)).unwrap();
+        let reader = Client::connect(Path::new(&read_socket)).unwrap();
+
+        let (at, packet) = crate::random_box().unwrap();
+        let seed = box_seed(&at);
+
+        let started = Instant::now();
+        let keys = reader.new_keypair(&seed).unwrap();
+        let empty = reader
+            .encrypt_read(&keys.read_cap, &keys.first_index)
+            .unwrap();
+        let before = reader
+            .send_read(&empty, &keys.read_cap, &keys.first_index, READ_TIMEOUT)
+            .unwrap();
+        assert!(matches!(before, Fetched::Nothing), "{before:?}");
+        println!("empty read: {:?}", started.elapsed());
+
+        let started_write = Instant::now();
+        write_box(&writer, &seed, &packet).unwrap();
+        println!("write: {:?}", started_write.elapsed());
+
+        let started_read = Instant::now();
+        let got = read_box(&reader, &seed).unwrap();
+        println!("read: {:?}", started_read.elapsed());
+        assert_eq!(got.as_ref().map(Packet::as_bytes), Some(packet.as_bytes()));
+    }
 }
