@@ -29,6 +29,10 @@ pub struct TorSetup {
     pub port: u16,
     /// purple-relay's socket and the store's Noise key, if the store has a direct port.
     pub direct: Option<(PathBuf, [u8; 32])>,
+    /// Built-in bridge types to try, found before the sandbox hides the plugin binaries.
+    pub bridges: Vec<Route>,
+    /// How long a route may go without progress before the next one is tried.
+    pub stall: Duration,
 }
 
 impl TorSetup {
@@ -74,10 +78,11 @@ pub fn drive(
     choices: &Receiver<NetChoice>,
     every: Duration,
 ) {
-    let mut fallback = Fallback::new(
-        &bridges::available(),
+    let mut fallback = Fallback::with_stall(
+        &setup.bridges,
         setup.direct.is_some(),
         Instant::now(),
+        setup.stall,
     );
     let mut control: Option<Control> = None;
     loop {
@@ -171,9 +176,9 @@ mod tests {
         assert!(pasted_plugin(&["meek_lite 192.0.2.1:2 F".to_owned()]).is_err());
     }
 
-    #[test]
-    fn reports_connected_when_tor_finishes_bootstrapping() {
-        let dir = std::env::temp_dir().join(format!("purple-drive-{}", std::process::id()));
+    /// A control socket answering every GETINFO with `progress`, and the setup around it.
+    fn fake_tor(name: &str, progress: u8, bridges: Vec<Route>, stall: Duration) -> TorSetup {
+        let dir = std::env::temp_dir().join(format!("purple-drive-{name}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let (ctl, cookie) = (dir.join("control.sock"), dir.join("control.cookie"));
@@ -184,32 +189,35 @@ mod tests {
             let mut w = c.try_clone().unwrap();
             for line in BufReader::new(c).lines() {
                 let answer = if line.unwrap().starts_with("GETINFO") {
-                    "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=100 TAG=done SUMMARY=\"Done\"\r\n250 OK\r\n"
+                    format!(
+                        "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS={progress} TAG=x \
+                         SUMMARY=\"x\"\r\n250 OK\r\n"
+                    )
                 } else {
-                    "250 OK\r\n"
+                    "250 OK\r\n".to_owned()
                 };
                 if w.write_all(answer.as_bytes()).is_err() {
                     return;
                 }
             }
         });
-        let setup = TorSetup {
+        TorSetup {
             socks: dir.join("socks.sock"),
             control: ctl,
             cookie,
             host: "x.onion".into(),
             port: 80,
             direct: None,
-        };
-        let dialer = Dialer::new(Arc::new(OnionDial {
-            socks: setup.socks.clone(),
-            host: setup.host.clone(),
-            port: 80,
-            timeout: CONN_TIMEOUT,
-        }));
+            bridges,
+            stall,
+        }
+    }
+
+    fn run(setup: TorSetup) -> (Receiver<NetStatus>, Sender<NetChoice>) {
+        let dialer = Dialer::new(Arc::new(setup.onion()));
         let (status_tx, status_rx) = mpsc::channel();
         let (choice_tx, choice_rx) = mpsc::channel();
-        let driver = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             drive(
                 &setup,
                 &dialer,
@@ -218,11 +226,30 @@ mod tests {
                 Duration::from_millis(10),
             );
         });
+        (status_rx, choice_tx)
+    }
+
+    #[test]
+    fn reports_connected_when_tor_finishes_bootstrapping() {
+        let (status, _choices) = run(fake_tor("boot", 100, vec![], super::super::fallback::STALL));
         assert_eq!(
-            status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            status.recv_timeout(Duration::from_secs(5)).unwrap(),
             NetStatus::Connected { route: Route::Tor }
         );
-        drop(choice_tx);
-        driver.join().unwrap();
+    }
+
+    #[test]
+    fn stalls_walk_the_bridges_it_was_given_then_block() {
+        let setup = fake_tor("stall", 0, vec![Route::Obfs4], Duration::from_millis(50));
+        let (status, _choices) = run(setup);
+        let next = || status.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            next(),
+            NetStatus::Connecting {
+                route: Route::Obfs4,
+                percent: 0
+            }
+        );
+        assert_eq!(next(), NetStatus::Blocked);
     }
 }

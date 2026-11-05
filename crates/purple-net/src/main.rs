@@ -14,7 +14,7 @@
 
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -27,6 +27,7 @@ use purple_ipc::{NET_CORE_FD, NetChoice, NetMsg, NetStatus, inherited_stream};
 use purple_net::katzenpost::PigeonholeTransport;
 use purple_net::scheduler::Scheduler;
 use purple_net::tor::driver::{TorSetup, drive};
+use purple_net::tor::fallback::STALL;
 use purple_net::tor::transport::{Dialer, TorTransport};
 use purple_net::{DevProviderTransport, Done, FakeTransport, ReadDone, Sink, Transport};
 
@@ -103,6 +104,9 @@ impl TorFlags {
             host,
             port,
             direct,
+            // Before restrict, while the plugin binaries can still be looked for.
+            bridges: purple_net::tor::bridges::available(),
+            stall: STALL,
         })
     }
 }
@@ -195,8 +199,10 @@ fn run() -> io::Result<()> {
         Store::Katzenpost(_) | Store::Tor(_) => Network::Local,
         Store::InMemory | Store::DevProvider(_) => Network::Allowed,
     };
+    let readable = readable_dirs(&options.store);
+    let readable: Vec<&Path> = readable.iter().map(PathBuf::as_path).collect();
     note_sandbox(&restrict(&Policy {
-        writable: &[],
+        writable: &readable,
         network,
     })?);
     // SAFETY: the launcher hands this fd to purple-net and nothing else here uses it.
@@ -353,6 +359,20 @@ fn forward_done(events: Sender<Event>) -> Sink {
     tx
 }
 
+/// Directories purple-net must read after [`restrict`]: tor's socket directory, for the
+/// control cookie. Landlock grants them as writable, but bwrap mounts them read-only.
+fn readable_dirs(store: &Store) -> Vec<PathBuf> {
+    match store {
+        Store::Tor(setup) => setup
+            .cookie
+            .parent()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect(),
+        Store::InMemory | Store::DevProvider(_) | Store::Katzenpost(_) => Vec::new(),
+    }
+}
+
 /// Feed the Tor driver's status reports into the main loop's events.
 fn forward_status(reports: Receiver<NetStatus>, events: Sender<Event>) {
     thread::spawn(move || {
@@ -398,6 +418,23 @@ mod tests {
 
     fn parse(args: &[&str]) -> io::Result<Options> {
         parse_args(args.iter().map(|&a| a.to_owned()))
+    }
+
+    #[test]
+    fn tor_mode_may_read_tors_socket_dir_for_the_cookie() {
+        let tor = parse(&[
+            "--tor",
+            "/run/tor/socks.sock",
+            "--tor-control",
+            "/run/tor/control.sock",
+            "--tor-cookie",
+            "/run/tor/control.cookie",
+            "--onion",
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz2345.onion:80",
+        ])
+        .unwrap();
+        assert_eq!(readable_dirs(&tor.store), [PathBuf::from("/run/tor")]);
+        assert!(readable_dirs(&Store::InMemory).is_empty());
     }
 
     #[test]

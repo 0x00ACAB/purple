@@ -47,6 +47,8 @@ pub struct Fallback {
     next: Vec<Route>,
     direct_available: bool,
     state: State,
+    /// How long a route may go without progress.
+    stall: Duration,
 }
 
 impl Fallback {
@@ -54,6 +56,17 @@ impl Fallback {
     /// `direct_available` says whether the config has a direct address.
     #[must_use]
     pub fn new(builtin: &[Route], direct_available: bool, now: Instant) -> Self {
+        Self::with_stall(builtin, direct_available, now, STALL)
+    }
+
+    /// The same, giving up on a route after `stall` without progress instead of [`STALL`].
+    #[must_use]
+    pub fn with_stall(
+        builtin: &[Route],
+        direct_available: bool,
+        now: Instant,
+        stall: Duration,
+    ) -> Self {
         let order = [Route::Obfs4, Route::Snowflake, Route::WebTunnel];
         Self {
             next: order
@@ -62,6 +75,7 @@ impl Fallback {
                 .rev()
                 .collect(),
             direct_available,
+            stall,
             state: State::Trying {
                 route: Route::Tor,
                 best: 0,
@@ -97,7 +111,7 @@ impl Fallback {
             };
             return vec![Action::Report(NetStatus::Connecting { route, percent })];
         }
-        if now.saturating_duration_since(since) < STALL {
+        if now.saturating_duration_since(since) < self.stall {
             return Vec::new();
         }
         let Some(next) = self.next.pop() else {
