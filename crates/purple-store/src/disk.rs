@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _};
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -78,7 +78,7 @@ impl DiskStore {
     }
 
     fn load(&mut self, id: u64, path: &Path) -> io::Result<()> {
-        let file = OpenOptions::new().read(true).append(true).open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
         let whole = file
             .metadata()?
             .len()
@@ -116,8 +116,9 @@ impl DiskStore {
             std::collections::btree_map::Entry::Vacant(e) => {
                 let file = OpenOptions::new()
                     .read(true)
-                    .append(true)
+                    .write(true)
                     .create(true)
+                    .truncate(false)
                     .mode(0o600)
                     .open(self.dir.join(format!("{PREFIX}{id:016x}")))?;
                 e.insert(Segment {
@@ -131,8 +132,13 @@ impl DiskStore {
         record.extend_from_slice(&now.to_be_bytes());
         record.extend_from_slice(&addr.0);
         record.extend_from_slice(packet.as_bytes());
-        segment.file.write_all(&record)?;
+        // At the offset the index will record, not wherever the file ends: a write cut short
+        // (a full disk) must not shift every record after it.
         let offset = segment.len;
+        if let Err(err) = segment.file.write_all_at(&record, offset) {
+            segment.file.set_len(offset).ok();
+            return Err(err);
+        }
         segment.len = segment.len.saturating_add(record_len());
         segment.addrs.push(addr);
         self.index.insert(addr, (id, offset, now));
@@ -348,6 +354,33 @@ mod tests {
         assert_eq!(s.get(&BoxAddr([1; 32]), T0 + 2 * HOUR).unwrap(), None);
         assert!(s.get(&BoxAddr([3; 32]), T0 + 2 * HOUR).unwrap().is_some());
         assert!(s.bytes() <= 2 * record);
+    }
+
+    #[test]
+    fn a_partial_write_while_open_does_not_shift_later_records() {
+        let d = dir("partial");
+        let mut s = DiskStore::open(&d, limits(), T0).unwrap();
+        s.put(BoxAddr([1; 32]), &packet(1), T0).unwrap();
+        // What a write cut short by a full disk leaves behind.
+        let segment = fs::read_dir(&d).unwrap().next().unwrap().unwrap().path();
+        OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(&[9; 100])
+            .unwrap();
+        s.put(BoxAddr([2; 32]), &packet(2), T0).unwrap();
+        assert_eq!(s.get(&BoxAddr([2; 32]), T0).unwrap(), Some(packet(2)));
+        drop(s);
+        let reopened = DiskStore::open(&d, limits(), T0).unwrap();
+        assert_eq!(
+            reopened.get(&BoxAddr([1; 32]), T0).unwrap(),
+            Some(packet(1))
+        );
+        assert_eq!(
+            reopened.get(&BoxAddr([2; 32]), T0).unwrap(),
+            Some(packet(2))
+        );
     }
 
     #[test]

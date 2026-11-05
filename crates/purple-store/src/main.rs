@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use purple_harden::sandbox::{Network, Policy, restrict};
 use purple_net::noise::{NoiseStream, noise_keypair};
@@ -26,6 +26,11 @@ const USAGE: &str = "usage: purple-store --data <dir> --onion-socket <path> \
 /// Each connection may write this many boxes a second; purple clients write 2.
 const WRITES_PER_SEC: u32 = 10;
 const KEY_FILE: &str = "noise.key";
+/// A connection that sends nothing for this long is closed; the client reconnects when it
+/// next needs the stream. Also bounds a stalled Noise handshake.
+const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+/// How long to wait after a failed accept (usually out of file descriptors).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(500);
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -110,28 +115,50 @@ fn run() -> io::Result<()> {
         eprintln!("purple-store: direct key {}", hex(&public));
         let store = Arc::clone(&store);
         thread::spawn(move || {
-            for conn in listener.incoming().flatten() {
+            accept_all(listener.incoming(), ACCEPT_BACKOFF, |conn| {
                 let store = Arc::clone(&store);
                 thread::spawn(move || {
-                    let served = NoiseStream::server(conn, &private)
+                    let served = conn
+                        .set_read_timeout(Some(IDLE_TIMEOUT))
+                        .and_then(|()| NoiseStream::server(conn, &private))
                         .and_then(|mut s| serve_provider(&mut s, &*store, Some(WRITES_PER_SEC)));
                     if let Err(err) = served {
                         eprintln!("purple-store: direct client: {err}");
                     }
                 });
-            }
+            });
         });
     }
-    for conn in onion.incoming() {
-        let mut conn = conn?;
+    accept_all(onion.incoming(), ACCEPT_BACKOFF, |mut conn| {
         let store = Arc::clone(&store);
         thread::spawn(move || {
-            if let Err(err) = serve_provider(&mut conn, &*store, Some(WRITES_PER_SEC)) {
+            let served = conn
+                .set_read_timeout(Some(IDLE_TIMEOUT))
+                .and_then(|()| serve_provider(&mut conn, &*store, Some(WRITES_PER_SEC)));
+            if let Err(err) = served {
                 eprintln!("purple-store: client: {err}");
             }
         });
-    }
+    });
     Ok(())
+}
+
+/// Hand each accepted connection to `serve`. A failed accept (out of file descriptors,
+/// say) is logged and waited out, never fatal and never a busy loop.
+fn accept_all<S>(
+    incoming: impl IntoIterator<Item = io::Result<S>>,
+    backoff: Duration,
+    mut serve: impl FnMut(S),
+) {
+    for conn in incoming {
+        match conn {
+            Ok(conn) => serve(conn),
+            Err(err) => {
+                eprintln!("purple-store: accept failed: {err}");
+                thread::sleep(backoff);
+            }
+        }
+    }
 }
 
 /// The direct port's static key, made on first run and kept readable only by the store.
@@ -212,6 +239,19 @@ mod tests {
             .is_err(),
             "no hostnames"
         );
+    }
+
+    #[test]
+    fn accept_errors_are_survived() {
+        let incoming = vec![
+            Err(io::Error::other("too many open files")),
+            Ok(1),
+            Err(io::Error::other("too many open files")),
+            Ok(2),
+        ];
+        let mut served = Vec::new();
+        accept_all(incoming, Duration::ZERO, |conn| served.push(conn));
+        assert_eq!(served, [1, 2]);
     }
 
     #[test]

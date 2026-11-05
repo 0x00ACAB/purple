@@ -303,16 +303,22 @@ fn unlock(
     loop {
         let new = !Vault::exists(data_dir);
         UiEvent::NeedPassphrase { new }.write_to(ui)?;
-        let cmd = match inputs.recv() {
-            Ok(Input::Ui(Ok(Some(cmd)))) => cmd,
-            Ok(Input::Ui(Ok(None))) | Err(_) => return Ok(None),
-            Ok(Input::Ui(Err(err)) | Input::Net(Err(err))) => return Err(err),
-            Ok(Input::Net(Ok(None))) => return Err(net_closed()),
-            Ok(Input::Net(Ok(Some(_)))) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "purple-net replied before core read anything",
-                ));
+        let cmd = loop {
+            match inputs.recv() {
+                Ok(Input::Ui(Ok(Some(cmd)))) => break cmd,
+                Ok(Input::Ui(Ok(None))) | Err(_) => return Ok(None),
+                Ok(Input::Ui(Err(err)) | Input::Net(Err(err))) => return Err(err),
+                Ok(Input::Net(Ok(None))) => return Err(net_closed()),
+                // purple-net reports how Tor is doing from its first second on.
+                Ok(Input::Net(Ok(Some(NetMsg::Status(status))))) => {
+                    to_ui_network(status).write_to(ui)?;
+                }
+                Ok(Input::Net(Ok(Some(_)))) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "purple-net replied before core read anything",
+                    ));
+                }
             }
         };
         let UiCmd::Unlock { passphrase } = cmd else {
@@ -1166,6 +1172,7 @@ fn note_sandbox(report: &Report) {
 #[cfg(test)]
 mod tests {
     use purple_core::messenger::GroupMember;
+    use purple_ipc::Route;
 
     use super::*;
 
@@ -1309,6 +1316,37 @@ mod tests {
             }
         }
         assert!(reads.in_flight.is_empty());
+    }
+
+    #[test]
+    fn status_from_net_during_unlock_goes_to_the_ui() {
+        let dir = std::env::temp_dir().join(format!("purple-unlock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let status = NetStatus::Connecting {
+            route: Route::Tor,
+            percent: 5,
+        };
+        tx.send(Input::Net(Ok(Some(NetMsg::Status(status)))))
+            .unwrap();
+        tx.send(Input::Ui(Ok(None))).unwrap();
+        let (mut ui, mut ui_peer) = UnixStream::pair().unwrap();
+        assert!(unlock(&rx, &mut ui, &dir).unwrap().is_none());
+        drop(ui);
+        assert_eq!(
+            UiEvent::read_from(&mut ui_peer).unwrap(),
+            Some(UiEvent::NeedPassphrase { new: true })
+        );
+        assert_eq!(
+            UiEvent::read_from(&mut ui_peer).unwrap(),
+            Some(UiEvent::Network { status })
+        );
+        assert_eq!(
+            UiEvent::read_from(&mut ui_peer).unwrap(),
+            None,
+            "asked once"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
