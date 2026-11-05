@@ -32,6 +32,9 @@ const LANDLOCK_ABI: ABI = ABI::V6;
 pub enum Network {
     /// May create sockets and use TCP (`purple-net`, `purple-devprovider`).
     Allowed,
+    /// May create Unix sockets only, to reach a local daemon such as kpclientd. No TCP,
+    /// no UDP, no raw or netlink sockets.
+    Local,
     /// May not create sockets at all; existing inherited sockets keep working.
     Denied,
 }
@@ -70,7 +73,7 @@ fn restrict_landlock(policy: &Policy<'_>) -> io::Result<RulesetStatus> {
         .map_err(io::Error::other)?
         .scope(Scope::from_all(LANDLOCK_ABI))
         .map_err(io::Error::other)?;
-    if policy.network == Network::Denied {
+    if policy.network != Network::Allowed {
         ruleset = ruleset
             .handle_access(AccessNet::from_all(LANDLOCK_ABI))
             .map_err(io::Error::other)?;
@@ -240,6 +243,12 @@ fn denied_syscalls(network: Network, exec: Exec) -> io::Result<BTreeMap<i64, Vec
     {
         // An empty rule list matches every call to the syscall.
         rules.insert(nr, Vec::new());
+    }
+
+    if network == Network::Local {
+        // The domain is an int; compare only its 32 bits.
+        let other_domains = rule(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, libc::AF_UNIX)?;
+        rules.insert(libc::SYS_socket, vec![other_domains]);
     }
 
     // The kernel reads an ioctl request as a 32-bit value, so compare only those bits.
@@ -441,9 +450,56 @@ mod tests {
         assert!(run_child(SOCKETPAIR_TEST).success());
     }
 
+    fn local_only() {
+        restrict(&Policy {
+            writable: &[],
+            network: Network::Local,
+        })
+        .unwrap();
+    }
+
+    const LOCAL_UNIX_TEST: &str = "sandbox::tests::local_network_keeps_unix_sockets";
+    #[test]
+    fn local_network_keeps_unix_sockets() {
+        if is_child(LOCAL_UNIX_TEST) {
+            // Bind before restricting: Landlock forbids making the socket file afterwards.
+            let dir = socket_test_dir(std::os::unix::process::parent_id());
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("s");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            local_only();
+            let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            io::Write::write_all(&mut client, b"x").unwrap();
+            let mut byte = [0u8; 1];
+            io::Read::read_exact(&mut server, &mut byte).unwrap();
+            assert_eq!(&byte, b"x");
+            return;
+        }
+        let ok = run_child(LOCAL_UNIX_TEST).success();
+        std::fs::remove_dir_all(socket_test_dir(std::process::id())).ok();
+        assert!(ok);
+    }
+
+    /// Where the Unix socket test's socket goes, named after the parent test process.
+    fn socket_test_dir(pid: u32) -> PathBuf {
+        std::env::temp_dir().join(format!("purple-sock-{pid}"))
+    }
+
+    const LOCAL_TCP_TEST: &str = "sandbox::tests::local_network_kills_tcp";
+    #[test]
+    fn local_network_kills_tcp() {
+        if is_child(LOCAL_TCP_TEST) {
+            local_only();
+            drop(std::net::TcpStream::connect("127.0.0.1:9"));
+            return;
+        }
+        assert_killed_by_seccomp(run_child(LOCAL_TCP_TEST));
+    }
+
     #[test]
     fn exported_programs_are_whole_bpf_instructions() {
-        for network in [Network::Allowed, Network::Denied] {
+        for network in [Network::Allowed, Network::Local, Network::Denied] {
             let programs = seccomp_programs(network).unwrap();
             assert_eq!(programs.len(), 2);
             for program in programs {

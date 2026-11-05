@@ -5,32 +5,86 @@
 //! natively; anything else (the dev provider here, or a Nym-based provider) stores one
 //! packet per derived box address. A transport turns (seed, index) into an address with a
 //! one-way function, so whoever stores the boxes can't tell which ones form a stream.
+//!
+//! Reads can take seconds on a mixnet, so they report back through a [`ReadSink`] rather
+//! than returning, and many can be in flight at once.
 
+pub mod katzenpost;
 pub mod scheduler;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hkdf::Hkdf;
-use purple_ipc::{BoxRef, PACKET_LEN, Packet, read_frame, write_frame};
+use purple_ipc::{BoxRef, PACKET_LEN, Packet, SEED_LEN, StreamSeed, read_frame, write_frame};
+use rand::{Rng, RngCore};
 use sha2::Sha256;
+
+/// What reading a box found: `None` if it hasn't been written or has expired.
+#[derive(Debug)]
+pub struct ReadDone {
+    /// The box read.
+    pub at: BoxRef,
+    /// What it held, or why the read failed.
+    pub packet: io::Result<Option<Packet>>,
+}
+
+/// Where a transport reports finished reads.
+pub type ReadSink = Sender<ReadDone>;
 
 /// Stores and fetches write-once boxes.
 pub trait Transport {
     /// Write `packet` into box `at`. Writing a box that already exists leaves it as it is.
+    /// May return before the write reaches the network.
     ///
     /// # Errors
     /// Fails if the packet can't be handed to the network.
     fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()>;
 
-    /// Read box `at`. `None` if it hasn't been written or has expired.
+    /// Start reading box `at`. The result goes to `done`, possibly before this returns.
     ///
     /// # Errors
     /// Fails if the network can't be reached.
-    fn read(&mut self, at: &BoxRef) -> io::Result<Option<Packet>>;
+    fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()>;
+
+    /// Fill one slot of the cover stream with no real packet to send. The default writes
+    /// random bytes to a random box, which looks like a sealed real packet.
+    ///
+    /// # Errors
+    /// Fails if the packet can't be handed to the network.
+    fn cover(&mut self) -> io::Result<()> {
+        let (at, packet) = random_box()?;
+        self.write(&at, packet)
+    }
+
+    /// Finish writes still in flight before the process exits.
+    ///
+    /// # Errors
+    /// Fails if they can't be finished.
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Random bytes for a random box: indistinguishable from a sealed real packet.
+///
+/// # Errors
+/// Can't fail in practice; the packet length is always right.
+pub fn random_box() -> io::Result<(BoxRef, Packet)> {
+    let mut rng = rand::rng();
+    let mut seed = [0u8; SEED_LEN];
+    rng.fill_bytes(&mut seed);
+    let at = BoxRef {
+        stream: StreamSeed(seed),
+        index: rng.random(),
+    };
+    let mut bytes = vec![0u8; PACKET_LEN];
+    rng.fill_bytes(&mut bytes);
+    Packet::from_slice(&bytes).map(|packet| (at, packet))
 }
 
 /// Where a box lives at a provider. Unlinkable to its stream without the seed.
@@ -152,8 +206,10 @@ impl Transport for FakeTransport {
         self.store.put(box_address(at), packet)
     }
 
-    fn read(&mut self, at: &BoxRef) -> io::Result<Option<Packet>> {
-        self.store.get(&box_address(at))
+    fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()> {
+        let packet = self.store.get(&box_address(at));
+        report(done, at, packet);
+        Ok(())
     }
 }
 
@@ -295,7 +351,15 @@ impl Transport for DevProviderTransport {
         .write_to(&mut self.stream)
     }
 
-    fn read(&mut self, at: &BoxRef) -> io::Result<Option<Packet>> {
+    fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()> {
+        let packet = self.fetch(at)?;
+        report(done, at, Ok(packet));
+        Ok(())
+    }
+}
+
+impl DevProviderTransport {
+    fn fetch(&mut self, at: &BoxRef) -> io::Result<Option<Packet>> {
         let addr = box_address(at);
         ProviderMsg::Get { addr }.write_to(&mut self.stream)?;
         match ProviderMsg::read_from(&mut self.stream)? {
@@ -310,6 +374,11 @@ impl Transport for DevProviderTransport {
     }
 }
 
+/// Hand a finished read to `done`. If nobody listens any more, the read is moot.
+fn report(done: &ReadSink, at: &BoxRef, packet: io::Result<Option<Packet>>) {
+    done.send(ReadDone { at: *at, packet }).ok();
+}
+
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
@@ -320,9 +389,18 @@ fn poisoned<T>(_: PoisonError<T>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use purple_ipc::{SEED_LEN, StreamSeed};
+    use std::sync::mpsc;
 
     use super::*;
+
+    /// Read a box through a transport that reports before `read` returns.
+    fn read_now(net: &mut impl Transport, at: &BoxRef) -> Option<Packet> {
+        let (tx, rx) = mpsc::channel();
+        net.read(at, &tx).unwrap();
+        let done = rx.try_recv().unwrap();
+        assert_eq!(done.at, *at);
+        done.packet.unwrap()
+    }
 
     fn packet(byte: u8) -> Packet {
         Packet::from_slice(&[byte; PACKET_LEN]).unwrap()
@@ -340,10 +418,10 @@ mod tests {
         let mut net = FakeTransport::default();
         net.write(&at(1, 0), packet(1)).unwrap();
         net.write(&at(1, 0), packet(2)).unwrap();
-        assert_eq!(net.read(&at(1, 0)).unwrap(), Some(packet(1)));
-        assert_eq!(net.read(&at(1, 0)).unwrap(), Some(packet(1)));
-        assert_eq!(net.read(&at(1, 1)).unwrap(), None);
-        assert_eq!(net.read(&at(2, 0)).unwrap(), None);
+        assert_eq!(read_now(&mut net, &at(1, 0)), Some(packet(1)));
+        assert_eq!(read_now(&mut net, &at(1, 0)), Some(packet(1)));
+        assert_eq!(read_now(&mut net, &at(1, 1)), None);
+        assert_eq!(read_now(&mut net, &at(2, 0)), None);
     }
 
     #[test]
@@ -363,7 +441,7 @@ mod tests {
         let mut alice = FakeTransport::default();
         let mut bob = alice.clone();
         alice.write(&at(3, 0), packet(7)).unwrap();
-        assert_eq!(bob.read(&at(3, 0)).unwrap(), Some(packet(7)));
+        assert_eq!(read_now(&mut bob, &at(3, 0)), Some(packet(7)));
     }
 
     #[test]
@@ -404,9 +482,9 @@ mod tests {
         let mut client = DevProviderTransport::connect(&addr).unwrap();
         client.write(&at(4, 0), packet(1)).unwrap();
         client.write(&at(4, 1), packet(2)).unwrap();
-        assert_eq!(client.read(&at(4, 0)).unwrap(), Some(packet(1)));
-        assert_eq!(client.read(&at(4, 1)).unwrap(), Some(packet(2)));
-        assert_eq!(client.read(&at(4, 2)).unwrap(), None);
+        assert_eq!(read_now(&mut client, &at(4, 0)), Some(packet(1)));
+        assert_eq!(read_now(&mut client, &at(4, 1)), Some(packet(2)));
+        assert_eq!(read_now(&mut client, &at(4, 2)), None);
         drop(client);
         server.join().unwrap();
         // The provider only ever saw derived addresses.

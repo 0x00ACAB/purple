@@ -2,18 +2,19 @@
 //! (a Poisson process, as in Loopix).
 //!
 //! A tick writes the oldest queued real packet if there is one, otherwise a cover packet:
-//! random bytes into a random box. Real packets are sealed and look random too, so an
-//! observer sees the same stream whether or not the user is talking; sending a message
-//! only adds queueing delay.
+//! random bytes into a random box, unless the transport covers its own traffic (see
+//! [`Transport::cover`]). Real packets are sealed and look random too, so an observer sees
+//! the same stream whether or not the user is talking; sending a message only adds
+//! queueing delay.
 
 use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
-use purple_ipc::{BoxRef, PACKET_LEN, Packet, SEED_LEN, StreamSeed};
-use rand::{Rng, RngCore};
+use purple_ipc::{BoxRef, Packet};
+use rand::Rng;
 
-use crate::Transport;
+use crate::{ReadSink, Transport};
 
 /// Longest gap between ticks, as a multiple of the mean. Caps the exponential's long tail
 /// so a message is never stuck behind one huge gap.
@@ -77,8 +78,7 @@ impl<T: Transport> Scheduler<T> {
             self.transport.write(&at, packet)?;
             Sent::Real
         } else {
-            let (at, packet) = cover_packet()?;
-            self.transport.write(&at, packet)?;
+            self.transport.cover()?;
             Sent::Cover
         };
         let now = Instant::now();
@@ -86,13 +86,21 @@ impl<T: Transport> Scheduler<T> {
         Ok(sent)
     }
 
-    /// Read a box right away. Reads aren't scheduled here: `purple-core` already polls on
-    /// a fixed clock with padded rounds.
+    /// Start reading a box right away; the result goes to `done`. Reads aren't scheduled
+    /// here: `purple-core` already polls on a fixed clock with padded rounds.
     ///
     /// # Errors
     /// Fails if the transport fails.
-    pub fn read(&mut self, at: &BoxRef) -> io::Result<Option<Packet>> {
-        self.transport.read(at)
+    pub fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()> {
+        self.transport.read(at, done)
+    }
+
+    /// Let the transport finish writes still in flight.
+    ///
+    /// # Errors
+    /// Fails if the transport fails.
+    pub fn finish(&mut self) -> io::Result<()> {
+        self.transport.finish()
     }
 }
 
@@ -106,22 +114,10 @@ pub fn sample_delay(mean: Duration) -> Duration {
     mean.mul_f64(factor).max(MIN_DELAY)
 }
 
-/// Random bytes into a random box. Indistinguishable from a sealed real packet.
-fn cover_packet() -> io::Result<(BoxRef, Packet)> {
-    let mut rng = rand::rng();
-    let mut seed = [0u8; SEED_LEN];
-    rng.fill_bytes(&mut seed);
-    let at = BoxRef {
-        stream: StreamSeed(seed),
-        index: rng.random(),
-    };
-    let mut bytes = vec![0u8; PACKET_LEN];
-    rng.fill_bytes(&mut bytes);
-    Ok((at, Packet::from_slice(&bytes)?))
-}
-
 #[cfg(test)]
 mod tests {
+    use purple_ipc::{PACKET_LEN, SEED_LEN, StreamSeed};
+
     use super::*;
 
     /// Records every packet written.
@@ -134,8 +130,8 @@ mod tests {
             Ok(())
         }
 
-        fn read(&mut self, _: &BoxRef) -> io::Result<Option<Packet>> {
-            Ok(None)
+        fn read(&mut self, _: &BoxRef, _: &ReadSink) -> io::Result<()> {
+            Ok(())
         }
     }
 

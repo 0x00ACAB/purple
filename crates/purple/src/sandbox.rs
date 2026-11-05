@@ -126,26 +126,29 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
             kp_socket_dir,
         } => {
             if let Some(dir) = kp_socket_dir {
+                // kpclientd does the networking; purple-net gets only its socket and no
+                // network namespace of its own.
                 out.extend(["--ro-bind".into(), dir.into(), KP_SOCKET_DIR.into()]);
+            } else {
+                out.extend(
+                    [
+                        "--share-net",
+                        "--ro-bind-try",
+                        "/etc/resolv.conf",
+                        "/etc/resolv.conf",
+                    ]
+                    .map(OsString::from),
+                );
+                out.extend(["--ro-bind-try", "/etc/ssl", "/etc/ssl"].map(OsString::from));
+                out.extend(
+                    [
+                        "--ro-bind-try",
+                        "/etc/ca-certificates",
+                        "/etc/ca-certificates",
+                    ]
+                    .map(OsString::from),
+                );
             }
-            out.extend(
-                [
-                    "--share-net",
-                    "--ro-bind-try",
-                    "/etc/resolv.conf",
-                    "/etc/resolv.conf",
-                ]
-                .map(OsString::from),
-            );
-            out.extend(["--ro-bind-try", "/etc/ssl", "/etc/ssl"].map(OsString::from));
-            out.extend(
-                [
-                    "--ro-bind-try",
-                    "/etc/ca-certificates",
-                    "/etc/ca-certificates",
-                ]
-                .map(OsString::from),
-            );
             out.extend(["--bind".into(), state_dir.into(), NET_STATE_DIR.into()]);
         }
         Profile::Core { data_dir } => {
@@ -286,6 +289,17 @@ mod tests {
             .unwrap();
         assert_eq!(with[at - 1], "--ro-bind");
         assert_eq!(with[at + 1], KP_SOCKET_DIR);
+        // With kpclientd doing the networking, purple-net gets none.
+        assert!(!has(&with, "--share-net"));
+        let without = bwrap_args(
+            &Profile::Net {
+                state_dir: "/s".into(),
+                kp_socket_dir: None,
+            },
+            Path::new("/b"),
+            &[],
+        );
+        assert!(has(&without, "--share-net"));
         let core = bwrap_args(
             &Profile::Core {
                 data_dir: "/d".into(),

@@ -7,7 +7,7 @@
 //! `--send-interval-ms` sets the mean gap between packets in the cover stream (default
 //! 1000; the self-test uses 50 unless told otherwise). `--kpclientd` and `--kp-config` also
 //! run Katzenpost's client daemon in a fifth sandbox, with its socket shared read-only with
-//! `purple-net`.
+//! `purple-net`, which then stores boxes on Pigeonhole and has no network of its own.
 
 mod sandbox;
 
@@ -19,6 +19,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use purple_harden::sandbox::{Network, seccomp_programs};
 use purple_ipc::{CORE_NET_FD, CORE_UI_FD, NET_CORE_FD, UI_CORE_FD};
@@ -26,6 +28,11 @@ use sandbox::Profile;
 
 const USAGE: &str = "usage: purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>] \
                      [--kpclientd <binary> --kp-config <file>]";
+/// kpclientd's socket, in the directory the launcher makes for it.
+const KP_SOCKET_NAME: &str = "kpclientd.sock";
+/// How long kpclientd may take to open its socket, and how often to look.
+const KP_SOCKET_WAIT: Duration = Duration::from_secs(30);
+const KP_SOCKET_POLL: Duration = Duration::from_millis(50);
 /// Mean send gap for the self-test, so it finishes in seconds.
 const SELF_TEST_SEND_INTERVAL_MS: &str = "50";
 
@@ -102,6 +109,11 @@ fn run() -> io::Result<bool> {
         );
     }
 
+    if options.dev_provider.is_some() && options.kpclientd.is_some() {
+        return Err(io::Error::other(
+            "--dev-provider and --kpclientd don't go together",
+        ));
+    }
     let kp = prepare_kpclientd(options.kpclientd, options.kp_config, sandboxed)?;
 
     let state_root = private_dir(&xdg_dir("XDG_STATE_HOME", ".local/state")?.join("purple"))?;
@@ -115,18 +127,23 @@ fn run() -> io::Result<bool> {
 
     let net_args = net_args(
         options.dev_provider.as_deref(),
+        kp.is_some(),
         options.send_interval_ms.as_deref(),
         options.no_ui,
     );
 
     let kp_child = match &kp {
-        Some((binary, config, socket_dir)) => Some(spawn_kpclientd(
-            binary,
-            config,
-            socket_dir,
-            bin_dir,
-            Background(log.as_ref()),
-        )?),
+        Some((binary, config, socket_dir)) => {
+            let mut child = spawn_kpclientd(
+                binary,
+                config,
+                socket_dir,
+                bin_dir,
+                Background(log.as_ref()),
+            )?;
+            wait_for_socket(&socket_dir.join(KP_SOCKET_NAME), &mut child.1)?;
+            Some(child)
+        }
         None => None,
     };
 
@@ -245,22 +262,42 @@ fn prepare_kpclientd(
     check_kp_config(&fs::read_to_string(&config)?)?;
     let socket_dir = private_dir(&runtime_dir()?.join("purple/kp"))?;
     // A socket left by an earlier run would make kpclientd's bind fail.
-    match fs::remove_file(socket_dir.join("kpclientd.sock")) {
+    match fs::remove_file(socket_dir.join(KP_SOCKET_NAME)) {
         Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
         Ok(()) | Err(_) => {}
     }
     Ok(Some((binary, config, socket_dir)))
 }
 
-/// Arguments for `purple-net`.
+/// Wait until kpclientd has made its socket, so `purple-net` can connect at once.
+fn wait_for_socket(path: &Path, kpclientd: &mut Child) -> io::Result<()> {
+    let start = Instant::now();
+    while !path.exists() {
+        if let Some(status) = kpclientd.try_wait()? {
+            return Err(io::Error::other(format!("kpclientd exited with {status}")));
+        }
+        if start.elapsed() >= KP_SOCKET_WAIT {
+            return Err(io::Error::other("kpclientd didn't open its socket in time"));
+        }
+        thread::sleep(KP_SOCKET_POLL);
+    }
+    Ok(())
+}
+
+/// Arguments for `purple-net`. With `katzenpost`, it reaches kpclientd's socket where
+/// its sandbox mounts it.
 fn net_args<'a>(
     dev_provider: Option<&'a str>,
+    katzenpost: bool,
     send_interval_ms: Option<&'a str>,
     no_ui: bool,
 ) -> Vec<&'a str> {
     let mut args = Vec::new();
     if let Some(addr) = dev_provider {
         args.extend(["--dev-provider", addr]);
+    }
+    if katzenpost {
+        args.extend(["--katzenpost", sandbox::KP_SOCKET]);
     }
     let send_interval = match (send_interval_ms, no_ui) {
         (Some(ms), _) => Some(ms),

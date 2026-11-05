@@ -1,26 +1,32 @@
 //! purple-net: relays packets between `purple-core` and the network, sending real packets
 //! only in the slots of a constant-rate cover stream (see [`purple_net::scheduler`]).
 //!
-//! Usage: `purple-net [--dev-provider <addr>] [--send-interval-ms <ms>]`. With
+//! Usage: `purple-net [--katzenpost <socket> | --dev-provider <addr>]
+//! [--send-interval-ms <ms>]`. With `--katzenpost` it stores boxes on Pigeonhole through
+//! the kpclientd listening on `socket`, and may not open any other connection. With
 //! `--dev-provider` it forwards to a local `purple-devprovider`, so several purple
-//! instances on one machine can talk; without it, it uses an in-memory network only this
-//! instance can see. `--send-interval-ms` is the mean gap between packets.
+//! instances on one machine can talk. With neither, it uses an in-memory network only
+//! this instance can see. `--send-interval-ms` is the mean gap between packets.
 
-use std::io;
+use std::collections::VecDeque;
+use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use landlock::RulesetStatus;
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
-use purple_ipc::{NET_CORE_FD, NetMsg, inherited_stream};
+use purple_ipc::{BoxRef, NET_CORE_FD, NetMsg, Packet, inherited_stream};
+use purple_net::katzenpost::PigeonholeTransport;
 use purple_net::scheduler::Scheduler;
-use purple_net::{DevProviderTransport, FakeTransport, Transport};
+use purple_net::{DevProviderTransport, FakeTransport, ReadDone, Transport};
 
 const NAME: &str = "purple-net";
-const USAGE: &str = "usage: purple-net [--dev-provider <addr>] [--send-interval-ms <ms>]";
+const USAGE: &str = "usage: purple-net [--katzenpost <socket> | --dev-provider <addr>] \
+                     [--send-interval-ms <ms>]";
 /// One packet a second on average: about 7 MB an hour of 2 KB packets.
 const DEFAULT_SEND_INTERVAL: Duration = Duration::from_secs(1);
 /// How long the in-memory network keeps packets nobody fetched (cover traffic).
@@ -36,20 +42,36 @@ fn main() -> ExitCode {
     }
 }
 
+/// Where boxes are stored.
+#[derive(Debug, PartialEq, Eq)]
+enum Store {
+    InMemory,
+    DevProvider(String),
+    Katzenpost(PathBuf),
+}
+
 struct Options {
-    dev_provider: Option<String>,
+    store: Store,
     send_interval: Duration,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
     let mut options = Options {
-        dev_provider: None,
+        store: Store::InMemory,
         send_interval: DEFAULT_SEND_INTERVAL,
     };
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| io::Error::other(USAGE));
+        let mut set_store = |store| {
+            if options.store != Store::InMemory {
+                return Err(io::Error::other(USAGE));
+            }
+            options.store = store;
+            Ok(())
+        };
         match arg.as_str() {
-            "--dev-provider" => options.dev_provider = Some(value()?),
+            "--dev-provider" => set_store(Store::DevProvider(value()?))?,
+            "--katzenpost" => set_store(Store::Katzenpost(value()?.into()))?,
             "--send-interval-ms" => {
                 let ms: u64 = value()?.parse().map_err(|_| io::Error::other(USAGE))?;
                 if ms == 0 {
@@ -66,52 +88,78 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
 #[expect(unsafe_code, reason = "adopting the socket the launcher passed in")]
 fn run() -> io::Result<()> {
     purple_harden::harden()?;
+    let options = parse_args(std::env::args().skip(1))?;
+    // With Katzenpost, kpclientd does all the networking: purple-net only needs its socket.
+    let network = match options.store {
+        Store::Katzenpost(_) => Network::Local,
+        Store::InMemory | Store::DevProvider(_) => Network::Allowed,
+    };
     note_sandbox(&restrict(&Policy {
         writable: &[],
-        network: Network::Allowed,
+        network,
     })?);
-    let options = parse_args(std::env::args().skip(1))?;
     // SAFETY: the launcher hands this fd to purple-net and nothing else here uses it.
     let core = unsafe { inherited_stream(NET_CORE_FD)? };
-    // The mixnet transport replaces these once the Nym/Katzenpost choice is made.
-    match options.dev_provider {
-        Some(addr) => serve(
+    let interval = options.send_interval;
+    match options.store {
+        Store::Katzenpost(socket) => serve(
             core,
-            Scheduler::new(DevProviderTransport::connect(&addr)?, options.send_interval),
+            Scheduler::new(PigeonholeTransport::connect(&socket)?, interval),
         ),
-        None => serve(
+        Store::DevProvider(addr) => serve(
             core,
-            Scheduler::new(
-                FakeTransport::with_retention(FAKE_RETENTION),
-                options.send_interval,
-            ),
+            Scheduler::new(DevProviderTransport::connect(&addr)?, interval),
+        ),
+        Store::InMemory => serve(
+            core,
+            Scheduler::new(FakeTransport::with_retention(FAKE_RETENTION), interval),
         ),
     }
+}
+
+/// What the main loop waits for.
+enum Event {
+    /// A request from core, or the error that ended core's socket.
+    Core(io::Result<NetMsg>),
+    /// Core closed its socket.
+    CoreClosed,
+    /// A read finished.
+    Read(ReadDone),
 }
 
 /// Queue core's writes into the cover stream and answer its reads, until core closes
 /// the socket. Then send what's still queued, at the same rate, and exit.
 fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::Result<()> {
-    let requests = spawn_request_reader(core.try_clone()?);
+    let (events_tx, events) = mpsc::channel();
+    spawn_request_reader(core.try_clone()?, events_tx.clone());
+    let reads = forward_reads(events_tx);
+    let mut replies = Replies::default();
     loop {
         let wait = scheduler
             .next_tick()
             .saturating_duration_since(Instant::now());
-        match requests.recv_timeout(wait) {
-            Ok(Ok(NetMsg::Write { at, packet })) => scheduler.enqueue(at, packet),
-            Ok(Ok(NetMsg::Read { at })) => match scheduler.read(&at)? {
-                Some(packet) => NetMsg::Found { at, packet }.write_to(&mut core)?,
-                None => NetMsg::Empty { at }.write_to(&mut core)?,
-            },
-            Ok(Ok(NetMsg::Found { .. } | NetMsg::Empty { .. })) => {
+        match events.recv_timeout(wait) {
+            Ok(Event::Core(Ok(NetMsg::Write { at, packet }))) => scheduler.enqueue(at, packet),
+            Ok(Event::Core(Ok(NetMsg::Read { at }))) => {
+                replies.expect(at);
+                scheduler.read(&at, &reads)?;
+            }
+            Ok(Event::Core(Ok(NetMsg::Found { .. } | NetMsg::Empty { .. }))) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "purple-core sent a message only purple-net may send",
                 ));
             }
-            Ok(Err(err)) => return Err(err),
+            Ok(Event::Core(Err(err))) => return Err(err),
+            Ok(Event::Read(done)) => {
+                replies.fill(&done.at, done.packet?);
+                replies.flush(&mut core)?;
+            }
+            Ok(Event::CoreClosed) => return drain(&mut scheduler),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return drain(&mut scheduler),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("purple-net's event channel closed"));
+            }
         }
         if Instant::now() >= scheduler.next_tick() {
             scheduler.tick()?;
@@ -119,7 +167,49 @@ fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::
     }
 }
 
-/// Send the packets still queued when core exits, without breaking the rate.
+/// Replies to core's reads, held until they can go out in the order core asked. Reads
+/// can finish out of order on a mixnet.
+#[derive(Default)]
+struct Replies(VecDeque<(BoxRef, Reply)>);
+
+enum Reply {
+    Waiting,
+    Ready(Option<Packet>),
+}
+
+impl Replies {
+    fn expect(&mut self, at: BoxRef) {
+        self.0.push_back((at, Reply::Waiting));
+    }
+
+    /// Record what the earliest unanswered read of `at` found.
+    fn fill(&mut self, at: &BoxRef, packet: Option<Packet>) {
+        if let Some(slot) = self
+            .0
+            .iter_mut()
+            .find(|(expected, reply)| expected == at && matches!(reply, Reply::Waiting))
+        {
+            slot.1 = Reply::Ready(packet);
+        }
+    }
+
+    /// Send every reply that's ready and has nothing unanswered before it.
+    fn flush(&mut self, core: &mut impl Write) -> io::Result<()> {
+        while matches!(self.0.front(), Some((_, Reply::Ready(_)))) {
+            let Some((at, Reply::Ready(packet))) = self.0.pop_front() else {
+                break;
+            };
+            match packet {
+                Some(packet) => NetMsg::Found { at, packet }.write_to(core)?,
+                None => NetMsg::Empty { at }.write_to(core)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Send the packets still queued when core exits, without breaking the rate, and let
+/// the transport finish writes in flight.
 fn drain(scheduler: &mut Scheduler<impl Transport>) -> io::Result<()> {
     while scheduler.queued() > 0 {
         thread::sleep(
@@ -129,31 +219,38 @@ fn drain(scheduler: &mut Scheduler<impl Transport>) -> io::Result<()> {
         );
         scheduler.tick()?;
     }
-    Ok(())
+    scheduler.finish()
 }
 
-/// Read requests from core on their own thread so the main loop can tick on time. The
-/// channel closes when core closes its socket.
-fn spawn_request_reader(mut core: UnixStream) -> Receiver<io::Result<NetMsg>> {
+/// A sink for finished reads that feeds them into the main loop's events.
+fn forward_reads(events: Sender<Event>) -> Sender<ReadDone> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        loop {
-            match NetMsg::read_from(&mut core) {
-                Ok(Some(msg)) => {
-                    if tx.send(Ok(msg)).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => return,
-                Err(err) => {
-                    // The main loop stops on this error, so a failed send changes nothing.
-                    tx.send(Err(err)).ok();
-                    return;
-                }
+        for done in rx {
+            if events.send(Event::Read(done)).is_err() {
+                return;
             }
         }
     });
-    rx
+    tx
+}
+
+/// Read requests from core on their own thread so the main loop can tick on time.
+fn spawn_request_reader(mut core: UnixStream, events: Sender<Event>) {
+    thread::spawn(move || {
+        loop {
+            let event = match NetMsg::read_from(&mut core) {
+                Ok(Some(msg)) => Event::Core(Ok(msg)),
+                Ok(None) => Event::CoreClosed,
+                Err(err) => Event::Core(Err(err)),
+            };
+            let last = !matches!(event, Event::Core(Ok(_)));
+            // If the main loop is gone, so is the reason to read.
+            if events.send(event).is_err() || last {
+                return;
+            }
+        }
+    });
 }
 
 /// Log how much of the sandbox the kernel enforced, if not all of it.
@@ -174,14 +271,75 @@ mod tests {
         parse_args(args.iter().map(|&a| a.to_owned()))
     }
 
+    fn at(index: u64) -> BoxRef {
+        BoxRef {
+            stream: purple_ipc::StreamSeed([1; purple_ipc::SEED_LEN]),
+            index,
+        }
+    }
+
+    fn packet(byte: u8) -> Packet {
+        Packet::from_slice(&[byte; purple_ipc::PACKET_LEN]).unwrap()
+    }
+
+    fn sent(out: &[u8]) -> Vec<NetMsg> {
+        let mut out = out;
+        std::iter::from_fn(|| NetMsg::read_from(&mut out).unwrap()).collect()
+    }
+
+    #[test]
+    fn replies_go_out_in_request_order() {
+        let mut replies = Replies::default();
+        for index in [0, 1, 2, 1] {
+            replies.expect(at(index));
+        }
+        let mut out = Vec::new();
+        replies.fill(&at(1), Some(packet(1)));
+        replies.fill(&at(2), None);
+        replies.flush(&mut out).unwrap();
+        assert!(
+            out.is_empty(),
+            "nothing goes out before the first read is answered"
+        );
+
+        replies.fill(&at(0), None);
+        replies.flush(&mut out).unwrap();
+        assert_eq!(
+            sent(&out),
+            [
+                NetMsg::Empty { at: at(0) },
+                NetMsg::Found {
+                    at: at(1),
+                    packet: packet(1)
+                },
+                NetMsg::Empty { at: at(2) },
+            ]
+        );
+        // The second read of box 1 is still waiting, and gets its own answer.
+        out.clear();
+        replies.fill(&at(1), Some(packet(2)));
+        replies.flush(&mut out).unwrap();
+        assert_eq!(
+            sent(&out),
+            [NetMsg::Found {
+                at: at(1),
+                packet: packet(2)
+            }]
+        );
+        assert!(replies.0.is_empty());
+    }
+
     #[test]
     fn parses_options() {
         let defaults = parse(&[]).unwrap();
         assert_eq!(defaults.send_interval, DEFAULT_SEND_INTERVAL);
-        assert!(defaults.dev_provider.is_none());
+        assert_eq!(defaults.store, Store::InMemory);
         let set = parse(&["--send-interval-ms", "50", "--dev-provider", "127.0.0.1:1"]).unwrap();
         assert_eq!(set.send_interval, Duration::from_millis(50));
-        assert_eq!(set.dev_provider.as_deref(), Some("127.0.0.1:1"));
+        assert_eq!(set.store, Store::DevProvider("127.0.0.1:1".into()));
+        let kp = parse(&["--katzenpost", "/run/kp/kpclientd.sock"]).unwrap();
+        assert_eq!(kp.store, Store::Katzenpost("/run/kp/kpclientd.sock".into()));
+        assert!(parse(&["--katzenpost", "/s", "--dev-provider", "127.0.0.1:1"]).is_err());
         assert!(parse(&["--send-interval-ms", "0"]).is_err());
         assert!(parse(&["--send-interval-ms", "x"]).is_err());
         assert!(parse(&["--bogus"]).is_err());

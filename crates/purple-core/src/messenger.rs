@@ -548,7 +548,8 @@ mod tests {
         let (mut alice, mut bob) = connected(&mut provider);
         let first = alice.send("bob", b"one").unwrap();
         let second = alice.send("bob", b"two").unwrap();
-        let (a, b) = (first.writes[0].0, second.writes[0].0);
+        // The first message carries libsignal's PreKey fields and may take two boxes.
+        let (a, b) = (first.writes.last().unwrap().0, second.writes[0].0);
         assert_eq!(a.stream, b.stream);
         assert_eq!(b.index, a.index + 1);
 
@@ -588,10 +589,11 @@ mod tests {
         };
         assert!(bob.receive(skipped, &packet).is_err());
         assert!(alice.receive(at, &packet).is_err());
-        assert_eq!(
-            bob.receive(at, &packet).unwrap().events,
-            [text("alice", b"x")]
-        );
+        let mut events = Vec::new();
+        for (box_at, box_packet) in &out.writes {
+            events.extend(bob.receive(*box_at, box_packet).unwrap().events);
+        }
+        assert_eq!(events, [text("alice", b"x")]);
     }
 
     #[test]

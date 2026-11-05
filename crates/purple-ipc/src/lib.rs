@@ -12,9 +12,9 @@ use std::os::unix::net::UnixStream;
 
 pub mod ui;
 
-/// Size of every packet (one box). Must fit the transport's box payload; checked against
-/// the Pigeonhole geometry when that transport lands.
-pub const PACKET_LEN: usize = 2048;
+/// Size of every packet (one box). Must fit the transport's box payload: Namenlos boxes
+/// hold 1549 bytes, and `purple-net` checks the daemon's geometry when it connects.
+pub const PACKET_LEN: usize = 1536;
 /// Size of a stream seed.
 pub const SEED_LEN: usize = 32;
 
