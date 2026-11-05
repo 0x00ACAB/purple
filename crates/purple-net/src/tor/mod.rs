@@ -1,9 +1,5 @@
 //! The Tor transport: purple-net reaches the store's onion service through tor's SOCKS
-//! socket, with a circuit per stream, and drives tor's bridges through its control socket.
+//! socket, with a circuit per stream. tor's control port belongs to purple-torctl.
 
-pub mod bridges;
-pub mod control;
-pub mod driver;
-pub mod fallback;
 pub mod socks;
 pub mod transport;

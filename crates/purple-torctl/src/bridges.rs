@@ -73,7 +73,7 @@ fn plugin_binary(plugin: &str) -> Option<&Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tor::control::check_bridge_line;
+    use crate::control::check_bridge_line;
 
     #[test]
     fn every_builtin_line_is_safe_and_matches_its_transport() {

@@ -2,11 +2,10 @@
 //! only in the slots of a constant-rate cover stream (see [`purple_net::scheduler`]).
 //!
 //! Usage: `purple-net [--katzenpost <socket> | --dev-provider <addr> | --tor <socks>
-//! --tor-control <socket> --tor-cookie <file> --onion <host>:<port> [--direct-relay
-//! <socket> --direct-key <hex>]] [--send-interval-ms <ms>]`. With `--tor` it reaches the
-//! store's onion service through tor's sockets, and falls back to bridges and then, if the
-//! user says so, to the store's direct port through purple-relay; it opens no network
-//! connection of its own. With `--katzenpost` it stores boxes on Pigeonhole through
+//! --onion <host>:<port> [--direct-relay <socket> --direct-key <hex>]]
+//! [--send-interval-ms <ms>]`. With `--tor` it reaches the store's onion service through
+//! tor's SOCKS socket, and when core says so, through purple-relay to the store's direct
+//! port; it opens no network connection of its own and never sees tor's control port. With `--katzenpost` it stores boxes on Pigeonhole through
 //! the kpclientd listening on `socket`, and may not open any other connection. With
 //! `--dev-provider` it forwards to a local `purple-devprovider`, so several purple
 //! instances on one machine can talk. With neither, it uses an in-memory network only
@@ -14,34 +13,29 @@
 
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use landlock::RulesetStatus;
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
-use purple_ipc::{NET_CORE_FD, NetChoice, NetMsg, NetStatus, inherited_stream};
+use purple_ipc::{NET_CORE_FD, NetMsg, inherited_stream};
 use purple_net::katzenpost::PigeonholeTransport;
 use purple_net::scheduler::Scheduler;
-use purple_net::tor::driver::{TorSetup, drive};
-use purple_net::tor::fallback::STALL;
-use purple_net::tor::transport::{Dialer, TorTransport};
+use purple_net::tor::transport::{CONN_TIMEOUT, Dial, Dialer, DirectDial, OnionDial, TorTransport};
 use purple_net::{DevProviderTransport, Done, FakeTransport, ReadDone, Sink, Transport};
 
 const NAME: &str = "purple-net";
 const USAGE: &str = "usage: purple-net [--katzenpost <socket> | --dev-provider <addr> | \
-                     --tor <socks> --tor-control <socket> --tor-cookie <file> \
-                     --onion <host>:<port> [--direct-relay <socket> --direct-key <hex>]] \
+                     --tor <socks> --onion <host>:<port> [--direct-relay <socket> --direct-key <hex>]] \
                      [--send-interval-ms <ms>]";
 /// One packet a second on average: about 7 MB an hour of 2 KB packets.
 const DEFAULT_SEND_INTERVAL: Duration = Duration::from_secs(1);
 /// How long the in-memory network keeps packets nobody fetched (cover traffic).
 const FAKE_RETENTION: Duration = Duration::from_hours(1);
-/// How often the Tor driver checks tor's bootstrap progress.
-const DRIVE_EVERY: Duration = Duration::from_secs(1);
 
 fn main() -> ExitCode {
     match run() {
@@ -59,15 +53,33 @@ enum Store {
     InMemory,
     DevProvider(String),
     Katzenpost(PathBuf),
-    Tor(TorSetup),
+    Tor(TorNet),
+}
+
+/// How purple-net reaches the store in Tor mode.
+#[derive(Debug, PartialEq, Eq)]
+struct TorNet {
+    socks: PathBuf,
+    host: String,
+    port: u16,
+    /// purple-relay's socket and the store's Noise key, if the store has a direct port.
+    direct: Option<(PathBuf, [u8; 32])>,
+}
+
+/// The relay route `/direct` switches to, if the store has one.
+fn direct_dial(tor: &TorNet) -> Option<Arc<dyn Dial>> {
+    tor.direct.as_ref().map(|(relay, key)| -> Arc<dyn Dial> {
+        Arc::new(DirectDial {
+            relay: relay.clone(),
+            key: *key,
+        })
+    })
 }
 
 /// The Tor flags as given, before they're checked as a set.
 #[derive(Default)]
 struct TorFlags {
     socks: Option<PathBuf>,
-    control: Option<PathBuf>,
-    cookie: Option<PathBuf>,
     onion: Option<String>,
     relay: Option<PathBuf>,
     key: Option<String>,
@@ -75,20 +87,13 @@ struct TorFlags {
 
 impl TorFlags {
     const fn is_empty(&self) -> bool {
-        self.socks.is_none()
-            && self.control.is_none()
-            && self.cookie.is_none()
-            && self.onion.is_none()
-            && self.relay.is_none()
-            && self.key.is_none()
+        self.socks.is_none() && self.onion.is_none() && self.relay.is_none() && self.key.is_none()
     }
 
-    /// All four Tor flags, an onion address, and either both direct flags or neither.
-    fn into_setup(self) -> io::Result<TorSetup> {
+    /// The SOCKS socket, an onion address, and either both direct flags or neither.
+    fn into_setup(self) -> io::Result<TorNet> {
         let usage = || io::Error::other(USAGE);
-        let (Some(socks), Some(control), Some(cookie), Some(onion)) =
-            (self.socks, self.control, self.cookie, self.onion)
-        else {
+        let (Some(socks), Some(onion)) = (self.socks, self.onion) else {
             return Err(usage());
         };
         let (host, port) = parse_onion(&onion)?;
@@ -97,16 +102,11 @@ impl TorFlags {
             (None, None) => None,
             _ => return Err(usage()),
         };
-        Ok(TorSetup {
+        Ok(TorNet {
             socks,
-            control,
-            cookie,
             host,
             port,
             direct,
-            // Before restrict, while the plugin binaries can still be looked for.
-            bridges: purple_net::tor::bridges::available(),
-            stall: STALL,
         })
     }
 }
@@ -165,8 +165,6 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
             "--dev-provider" => set_store(Store::DevProvider(value()?))?,
             "--katzenpost" => set_store(Store::Katzenpost(value()?.into()))?,
             "--tor" => tor.socks = Some(value()?.into()),
-            "--tor-control" => tor.control = Some(value()?.into()),
-            "--tor-cookie" => tor.cookie = Some(value()?.into()),
             "--onion" => tor.onion = Some(value()?),
             "--direct-relay" => tor.relay = Some(value()?.into()),
             "--direct-key" => tor.key = Some(value()?),
@@ -199,28 +197,26 @@ fn run() -> io::Result<()> {
         Store::Katzenpost(_) | Store::Tor(_) => Network::Local,
         Store::InMemory | Store::DevProvider(_) => Network::Allowed,
     };
-    let readable = readable_dirs(&options.store);
-    let readable: Vec<&Path> = readable.iter().map(PathBuf::as_path).collect();
     note_sandbox(&restrict(&Policy {
-        writable: &readable,
+        writable: &[],
         network,
     })?);
     // SAFETY: the launcher hands this fd to purple-net and nothing else here uses it.
     let core = unsafe { inherited_stream(NET_CORE_FD)? };
     let interval = options.send_interval;
     match options.store {
-        Store::Tor(setup) => {
-            let dialer = Dialer::new(Arc::new(setup.onion()));
-            let (status_tx, status_rx) = mpsc::channel();
-            let (choice_tx, choice_rx) = mpsc::channel();
-            let driver_dialer = dialer.clone();
-            thread::spawn(move || {
-                drive(&setup, &driver_dialer, &status_tx, &choice_rx, DRIVE_EVERY);
-            });
+        Store::Tor(tor) => {
+            let dialer = Dialer::new(Arc::new(OnionDial {
+                socks: tor.socks.clone(),
+                host: tor.host.clone(),
+                port: tor.port,
+                timeout: CONN_TIMEOUT,
+            }));
+            let direct = direct_dial(&tor).map(|dial| (dialer.clone(), dial));
             serve(
                 core,
                 Scheduler::new(TorTransport::new(dialer), interval),
-                Some((status_rx, choice_tx)),
+                direct.as_ref(),
             )
         }
         Store::Katzenpost(socket) => serve(
@@ -249,24 +245,18 @@ enum Event {
     CoreClosed,
     /// A read or write finished.
     Done(Done),
-    /// The Tor driver's latest status.
-    Status(NetStatus),
 }
 
 /// Queue core's writes into the cover stream and answer its reads, until core closes
-/// the socket. Then send what's still queued, at the same rate, and exit. With `tor`, the
-/// driver's status goes to core and core's choices go to the driver.
+/// the socket. Then send what's still queued, at the same rate, and exit. With `direct`,
+/// [`NetMsg::UseDirect`] switches the dialer to the relay route.
 fn serve(
     mut core: UnixStream,
     mut scheduler: Scheduler<impl Transport>,
-    tor: Option<(Receiver<NetStatus>, Sender<NetChoice>)>,
+    direct: Option<&(Dialer, Arc<dyn Dial>)>,
 ) -> io::Result<()> {
     let (events_tx, events) = mpsc::channel();
     spawn_request_reader(core.try_clone()?, events_tx.clone());
-    let choices = tor.map(|(status, choices)| {
-        forward_status(status, events_tx.clone());
-        choices
-    });
     let done_sink = forward_done(events_tx);
     loop {
         let wait = scheduler
@@ -278,19 +268,17 @@ fn serve(
             Ok(Event::Core(Ok(NetMsg::ReadCover { at }))) => {
                 scheduler.read_cover(&at, &done_sink)?;
             }
-            Ok(Event::Core(Ok(NetMsg::Choose(choice)))) => match &choices {
-                Some(choices) => {
-                    choices.send(choice).ok();
-                }
-                None => eprintln!("{NAME}: no fallback to choose for"),
+            Ok(Event::Core(Ok(NetMsg::UseDirect))) => match direct {
+                Some((dialer, relay)) => dialer.set(Arc::clone(relay)),
+                None => eprintln!("{NAME}: no direct route configured"),
             },
-            Ok(Event::Core(Ok(NetMsg::UseDirect))) => eprintln!("{NAME}: no direct route yet"),
             Ok(Event::Core(Ok(
                 NetMsg::Found { .. }
                 | NetMsg::Empty { .. }
                 | NetMsg::Written { .. }
                 | NetMsg::Taken { .. }
-                | NetMsg::Status(_),
+                | NetMsg::Status(_)
+                | NetMsg::Choose(_),
             ))) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -298,12 +286,6 @@ fn serve(
                 ));
             }
             Ok(Event::Core(Err(err))) => return Err(err),
-            Ok(Event::Status(status)) => match NetMsg::Status(status).write_to(&mut core) {
-                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
-                    return drain(&mut scheduler, &done_sink);
-                }
-                other => other?,
-            },
             Ok(Event::Done(done)) => {
                 let reply = match done {
                     Done::Read(ReadDone { at, packet }) => {
@@ -360,31 +342,6 @@ fn forward_done(events: Sender<Event>) -> Sink {
     tx
 }
 
-/// Directories purple-net must read after [`restrict`]: tor's socket directory, for the
-/// control cookie. Landlock grants them as writable, but bwrap mounts them read-only.
-fn readable_dirs(store: &Store) -> Vec<PathBuf> {
-    match store {
-        Store::Tor(setup) => setup
-            .cookie
-            .parent()
-            .map(Path::to_path_buf)
-            .into_iter()
-            .collect(),
-        Store::InMemory | Store::DevProvider(_) | Store::Katzenpost(_) => Vec::new(),
-    }
-}
-
-/// Feed the Tor driver's status reports into the main loop's events.
-fn forward_status(reports: Receiver<NetStatus>, events: Sender<Event>) {
-    thread::spawn(move || {
-        for status in reports {
-            if events.send(Event::Status(status)).is_err() {
-                return;
-            }
-        }
-    });
-}
-
 /// Read requests from core on their own thread so the main loop can tick on time.
 fn spawn_request_reader(mut core: UnixStream, events: Sender<Event>) {
     thread::spawn(move || {
@@ -422,20 +379,26 @@ mod tests {
     }
 
     #[test]
-    fn tor_mode_may_read_tors_socket_dir_for_the_cookie() {
-        let tor = parse(&[
+    fn direct_route_exists_only_with_a_relay() {
+        let onion = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz2345.onion:80";
+        let key = "ab".repeat(32);
+        let with = parse(&[
             "--tor",
-            "/run/tor/socks.sock",
-            "--tor-control",
-            "/run/tor/control.sock",
-            "--tor-cookie",
-            "/run/tor/control.cookie",
+            "/s",
             "--onion",
-            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz2345.onion:80",
+            onion,
+            "--direct-relay",
+            "/r",
+            "--direct-key",
+            &key,
         ])
         .unwrap();
-        assert_eq!(readable_dirs(&tor.store), [PathBuf::from("/run/tor")]);
-        assert!(readable_dirs(&Store::InMemory).is_empty());
+        let without = parse(&["--tor", "/s", "--onion", onion]).unwrap();
+        let (Store::Tor(with), Store::Tor(without)) = (with.store, without.store) else {
+            panic!("expected Tor")
+        };
+        assert!(direct_dial(&with).is_some());
+        assert!(direct_dial(&without).is_none());
     }
 
     #[test]
@@ -456,10 +419,6 @@ mod tests {
         let tor = parse(&[
             "--tor",
             "/run/tor/socks.sock",
-            "--tor-control",
-            "/run/tor/control.sock",
-            "--tor-cookie",
-            "/run/tor/control.cookie",
             "--onion",
             "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz2345.onion:80",
             "--direct-relay",
@@ -485,10 +444,6 @@ mod tests {
             parse(&[
                 "--tor",
                 "/s",
-                "--tor-control",
-                "/c",
-                "--tor-cookie",
-                "/k",
                 "--onion",
                 "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz2345.onion:80",
                 "--direct-key",
@@ -496,6 +451,18 @@ mod tests {
             ])
             .is_err(),
             "a key without a relay"
+        );
+        assert!(
+            parse(&[
+                "--tor",
+                "/s",
+                "--tor-control",
+                "/c",
+                "--onion",
+                "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz2345.onion:80"
+            ])
+            .is_err(),
+            "purple-net no longer takes tor's control socket"
         );
     }
 }
