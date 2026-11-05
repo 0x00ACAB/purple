@@ -27,10 +27,13 @@ const TPM_DEVICE: &str = "/dev/tpmrm0";
 pub(crate) const TOR_SOCKET_DIR: &str = "/run/tor";
 /// tor's SOCKS socket.
 pub(crate) const TOR_SOCKS: &str = "/run/tor/socks.sock";
+/// Where tor's control socket directory is mounted, in tor's sandbox and purple-torctl's.
+/// Never in purple-net's.
+pub(crate) const TORCTL_SOCKET_DIR: &str = "/run/torctl";
 /// tor's control socket.
-pub(crate) const TOR_CONTROL: &str = "/run/tor/control.sock";
+pub(crate) const TOR_CONTROL: &str = "/run/torctl/control.sock";
 /// The cookie file for tor's control socket.
-pub(crate) const TOR_COOKIE: &str = "/run/tor/control.cookie";
+pub(crate) const TOR_COOKIE: &str = "/run/torctl/control.cookie";
 /// Where tor keeps its state inside its sandbox.
 pub(crate) const TOR_DATA_DIR: &str = "/var/lib/tor";
 /// Where tor's torrc is mounted.
@@ -71,16 +74,20 @@ pub(crate) enum Profile {
         socket_dir: PathBuf,
     },
     /// C tor: network access, its data directory (kept across runs so its guards stay the
-    /// same), the directory it makes its sockets in, its torrc read-only, and purple's
-    /// seccomp filters from [`DAEMON_SECCOMP_FDS`]. Pluggable transports run as its children
-    /// from /usr/bin and need DNS and CA certificates.
+    /// same), the directory it makes its SOCKS socket in, a separate one for its control
+    /// socket and cookie, its torrc read-only, and purple's seccomp filters from
+    /// [`DAEMON_SECCOMP_FDS`]. Pluggable transports run as its children from /usr/bin and
+    /// need DNS and CA certificates.
     Tor {
         data_dir: PathBuf,
         socket_dir: PathBuf,
+        control_dir: PathBuf,
         torrc: PathBuf,
     },
     /// purple-relay: network access and the directory it makes its socket in.
     Relay { socket_dir: PathBuf },
+    /// purple-torctl: tor's control directory read-only. No network, nothing writable.
+    TorCtl { control_dir: PathBuf },
 }
 
 impl Profile {
@@ -92,6 +99,7 @@ impl Profile {
             Self::KpClientd { .. } => "kpclientd",
             Self::Tor { .. } => "tor",
             Self::Relay { .. } => "purple-relay",
+            Self::TorCtl { .. } => "purple-torctl",
         }
     }
 
@@ -100,9 +108,11 @@ impl Profile {
         match self {
             Self::KpClientd { .. } => PathBuf::from(KP_BINARY),
             Self::Tor { .. } => PathBuf::from(TOR_BINARY),
-            Self::Net { .. } | Self::Core { .. } | Self::Ui { .. } | Self::Relay { .. } => {
-                Path::new(APP_DIR).join(self.binary())
-            }
+            Self::Net { .. }
+            | Self::Core { .. }
+            | Self::Ui { .. }
+            | Self::Relay { .. }
+            | Self::TorCtl { .. } => Path::new(APP_DIR).join(self.binary()),
         }
     }
 }
@@ -201,11 +211,17 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
         Profile::Tor {
             data_dir,
             socket_dir,
+            control_dir,
             torrc,
         } => {
             share_net(&mut out);
             out.extend(["--bind".into(), data_dir.into(), TOR_DATA_DIR.into()]);
             out.extend(["--bind".into(), socket_dir.into(), TOR_SOCKET_DIR.into()]);
+            out.extend([
+                "--bind".into(),
+                control_dir.into(),
+                TORCTL_SOCKET_DIR.into(),
+            ]);
             out.extend(["--ro-bind".into(), torrc.into(), TOR_RC.into()]);
             for fd in DAEMON_SECCOMP_FDS {
                 out.extend(["--add-seccomp-fd".into(), fd.to_string().into()]);
@@ -214,6 +230,13 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
         Profile::Relay { socket_dir } => {
             out.push("--share-net".into());
             out.extend(["--bind".into(), socket_dir.into(), RELAY_SOCKET_DIR.into()]);
+        }
+        Profile::TorCtl { control_dir } => {
+            out.extend([
+                "--ro-bind".into(),
+                control_dir.into(),
+                TORCTL_SOCKET_DIR.into(),
+            ]);
         }
     }
 
@@ -377,6 +400,9 @@ mod tests {
             Profile::Relay {
                 socket_dir: "/r".into(),
             },
+            Profile::TorCtl {
+                control_dir: "/c".into(),
+            },
         ];
         for profile in &profiles {
             let args = bwrap_args(profile, Path::new("/b"), &[]);
@@ -411,6 +437,9 @@ mod tests {
             Profile::Relay {
                 socket_dir: "/r".into(),
             },
+            Profile::TorCtl {
+                control_dir: "/c".into(),
+            },
         ];
         for profile in &profiles {
             let args = bwrap_args(profile, Path::new("/bin-dir"), &[]);
@@ -429,6 +458,7 @@ mod tests {
         Profile::Tor {
             data_dir: "/st/tor".into(),
             socket_dir: "/run/user/1000/purple/tor-1".into(),
+            control_dir: "/run/user/1000/purple/torctl-1".into(),
             torrc: "/run/user/1000/purple/tor-1.rc".into(),
         }
     }
@@ -572,5 +602,75 @@ mod tests {
         cmd.args(["-e", "/dev/fd/7"]);
         pass_fds(&mut cmd, &[]).unwrap();
         assert!(!cmd.status().unwrap().success());
+    }
+
+    #[test]
+    fn torctl_sees_tors_control_dir_and_nothing_else() {
+        let args = bwrap_args(
+            &Profile::TorCtl {
+                control_dir: "/c".into(),
+            },
+            Path::new("/b"),
+            &[],
+        );
+        assert!(!has(&args, "--share-net"));
+        let at = args.iter().position(|a| a == "/c").unwrap();
+        assert_eq!(args[at - 1], "--ro-bind");
+        assert_eq!(args[at + 1], TORCTL_SOCKET_DIR);
+        assert!(!has(&args, TOR_SOCKET_DIR) && !has(&args, RELAY_SOCKET_DIR));
+        assert_eq!(args[args.len() - 1], "/app/purple-torctl");
+    }
+
+    #[test]
+    fn tor_gets_both_socket_dirs_and_net_only_the_socks_one() {
+        let tor = bwrap_args(&tor(), Path::new("/b"), &[]);
+        assert!(has(&tor, TOR_SOCKET_DIR) && has(&tor, TORCTL_SOCKET_DIR));
+        let net = bwrap_args(
+            &Profile::Net {
+                state_dir: "/s".into(),
+                sockets: vec![
+                    ("/t".into(), TOR_SOCKET_DIR),
+                    ("/r".into(), RELAY_SOCKET_DIR),
+                ],
+            },
+            Path::new("/b"),
+            &[],
+        );
+        assert!(!has(&net, TORCTL_SOCKET_DIR));
+    }
+
+    #[test]
+    fn net_cannot_see_the_control_socket_or_an_unstarted_relay() {
+        if !bwrap_works() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("purple-net-sees-{}", std::process::id()));
+        let (socks, relay, ctl) = (base.join("tor"), base.join("relay"), base.join("torctl"));
+        for d in [&socks, &relay, &ctl] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(ctl.join("control.sock"), b"").unwrap();
+        let mut args = bwrap_args(
+            &Profile::Net {
+                state_dir: base.clone(),
+                sockets: vec![(socks, TOR_SOCKET_DIR), (relay, RELAY_SOCKET_DIR)],
+            },
+            Path::new("/usr/bin"),
+            &[],
+        );
+        args.pop(); // the purple-net path
+        let sees = |path: &str| {
+            let mut probe = args.clone();
+            probe.extend(["/usr/bin/test", "-e", path].map(OsString::from));
+            Command::new("bwrap")
+                .args(&probe)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(!sees(TOR_CONTROL));
+        assert!(!sees(RELAY_SOCKET));
+        assert!(sees(TOR_SOCKET_DIR));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
