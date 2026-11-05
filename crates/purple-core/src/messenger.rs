@@ -22,7 +22,7 @@ use crate::codec::{Reader, Writer};
 use crate::content::Content;
 use crate::fragment::{Reassembler, split};
 use crate::group::{self, Group, GroupContent, MAX_MEMBERS, Received};
-use crate::invite::Invite;
+use crate::invite::{Invite, StoreRef};
 use crate::mls::{Provider as Mls, SigningKey};
 use crate::queue::{Queue, QueueSecret};
 use crate::session::{Account, Error, Result};
@@ -160,6 +160,8 @@ pub struct Messenger {
     /// Groups this user agreed to join, waiting for the creator's Welcome, with the signing
     /// key in the key package sent.
     joining: BTreeMap<(String, String), SigningKey>,
+    /// The store this purple uses. Not saved: the launcher says on every start.
+    store: StoreRef,
 }
 
 impl std::fmt::Debug for Messenger {
@@ -186,7 +188,13 @@ impl Messenger {
             groups: BTreeMap::new(),
             requests: BTreeSet::new(),
             joining: BTreeMap::new(),
+            store: StoreRef::Memory,
         })
+    }
+
+    /// Use `store` for new invites, and accept only invites made on it.
+    pub fn set_store(&mut self, store: StoreRef) {
+        self.store = store;
     }
 
     /// Create an invite for a contact who will be known as `contact`. Returns the invite to
@@ -196,7 +204,7 @@ impl Messenger {
     /// Fails if `contact` is already in use, or generating the prekeys fails.
     pub fn create_invite(&mut self, contact: &str) -> Result<(Invite, Outgoing)> {
         self.check_name_free(contact)?;
-        let (invite, bundle) = self.account.create_invite()?;
+        let (invite, bundle) = self.account.create_invite(self.store.clone())?;
         let (outgoing, _) = outgoing(&invite.bundle_queue()?, 0, &bundle)?;
         self.invites.insert(
             contact.to_owned(),
@@ -212,8 +220,15 @@ impl Messenger {
     /// starts once the inviter's bundle arrives through [`Self::receive`].
     ///
     /// # Errors
-    /// Fails if `contact` is already in use.
+    /// Fails if `contact` is already in use, or the invite is for another store.
     pub fn accept_invite(&mut self, contact: &str, invite: Invite) -> Result<()> {
+        if invite.store() != Some(&self.store) {
+            return Err(Error::WrongStore(
+                invite
+                    .store()
+                    .map_or_else(|| "unknown".into(), StoreRef::describe),
+            ));
+        }
         self.check_name_free(contact)?;
         self.accepting.insert(
             contact.to_owned(),
@@ -736,6 +751,7 @@ impl Messenger {
             groups,
             requests,
             joining,
+            store: StoreRef::Memory,
         })
     }
 
@@ -1192,7 +1208,7 @@ fn read_pending(r: &mut Reader<'_>) -> Result<BTreeMap<String, Pending>> {
     for _ in 0..r.len()? {
         let name = r.string()?;
         let pending = Pending {
-            invite: Invite::decode(r.bytes()?)?,
+            invite: Invite::decode_stored(r.bytes()?)?,
             next_read: r.u64()?,
         };
         out.insert(name, pending);
@@ -1322,6 +1338,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn accepting_an_invite_for_another_store_is_refused() {
+        let (mut alice, mut bob) = (Messenger::new().unwrap(), Messenger::new().unwrap());
+        alice.set_store(StoreRef::Onion("a".repeat(56) + ".onion"));
+        bob.set_store(StoreRef::Onion("b".repeat(56) + ".onion"));
+        let (invite, _) = alice.create_invite("bob").unwrap();
+        let err = bob
+            .accept_invite("alice", Invite::decode(&invite.encode()).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("another store"), "{err}");
+    }
+
     fn connected(provider: &mut Provider) -> (Messenger, Messenger) {
         let mut alice = Messenger::new().unwrap();
         let mut bob = Messenger::new().unwrap();
@@ -1430,7 +1458,10 @@ mod tests {
         let mut alice = Messenger::new().unwrap();
         let mut bob = Messenger::new().unwrap();
         let (invite, bundle) = bob.create_invite("alice").unwrap();
-        let (_, mallory_bundle) = Account::generate().unwrap().create_invite().unwrap();
+        let (_, mallory_bundle) = Account::generate()
+            .unwrap()
+            .create_invite(StoreRef::Memory)
+            .unwrap();
         let (planted, _) = outgoing(&invite.bundle_queue().unwrap(), 0, &mallory_bundle).unwrap();
         provider.deliver(planted);
         provider.deliver(bundle);

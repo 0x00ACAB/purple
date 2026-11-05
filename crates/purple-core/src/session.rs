@@ -20,7 +20,7 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 
 use crate::codec::{Reader, Writer};
-use crate::invite::{Invite, encode_bundle};
+use crate::invite::{Invite, StoreRef, encode_bundle};
 use crate::signal_store::Stores;
 
 /// libsignal puts the registration ID in the clear inside `PreKey` messages, and Signal uses
@@ -49,6 +49,8 @@ pub enum Error {
     State(&'static str),
     /// OpenMLS rejected a group operation; its own description of why.
     Mls(String),
+    /// An invite made on another store than this purple uses; its description.
+    WrongStore(String),
 }
 
 impl fmt::Display for Error {
@@ -59,6 +61,10 @@ impl fmt::Display for Error {
             Self::Io(err) => write!(f, "{err}"),
             Self::State(msg) => f.write_str(msg),
             Self::Mls(msg) => write!(f, "group: {msg}"),
+            Self::WrongStore(store) => write!(
+                f,
+                "this invite is for another store ({store}); purple uses one store at a time"
+            ),
         }
     }
 }
@@ -162,15 +168,15 @@ impl Account {
         )?)
     }
 
-    /// Create a one-time invite. Returns the invite for the QR code or link, and the
-    /// encoded prekey bundle to store in the invite's bundle queue.
+    /// Create a one-time invite on `store`. Returns the invite for the QR code or link, and
+    /// the encoded prekey bundle to store in the invite's bundle queue.
     ///
     /// # Errors
     /// Fails if generating the prekeys fails.
-    pub fn create_invite(&mut self) -> Result<(Invite, Vec<u8>)> {
+    pub fn create_invite(&mut self, store: StoreRef) -> Result<(Invite, Vec<u8>)> {
         let bundle = self.new_prekey_bundle()?;
         let identity = *self.stores.identity().identity_key();
-        Ok((Invite::create(identity)?, encode_bundle(&bundle)?))
+        Ok((Invite::create(identity, store)?, encode_bundle(&bundle)?))
     }
 
     /// This account's public identity key.

@@ -12,7 +12,7 @@ pub const MAX_NAME_LEN: usize = 64;
 /// Longest message body, in bytes.
 pub const MAX_BODY_LEN: usize = 16 * 1024;
 /// Longest invite string, in bytes.
-pub const MAX_INVITE_LEN: usize = 256;
+pub const MAX_INVITE_LEN: usize = 512;
 /// Longest error text, in bytes.
 pub const MAX_ERROR_LEN: usize = 512;
 /// Longest passphrase, in bytes.

@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use landlock::RulesetStatus;
-use purple_core::invite::Invite;
+use purple_core::invite::{Invite, StoreRef};
 use purple_core::messenger::{Event, Messenger, Outgoing, Taken};
 use purple_core::session;
 use purple_core::tpm::{Sealer, TPM_DEVICE, Tpm};
@@ -28,7 +28,8 @@ use purple_core::vault::{GroupSender, HistoryEntry, KdfParams, UnlockedBy, Vault
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_ipc::ui::{MAX_BODY_LEN, MAX_ERROR_LEN, UiCmd, UiEvent};
 use purple_ipc::{
-    BoxRef, CORE_NET_FD, CORE_UI_FD, NetMsg, Packet, SEED_LEN, StreamSeed, inherited_stream,
+    BoxRef, CORE_NET_FD, CORE_UI_FD, NetChoice, NetMsg, NetStatus, Packet, SEED_LEN, StreamSeed,
+    inherited_stream,
 };
 use rand::seq::SliceRandom;
 use rand::{Rng, RngCore};
@@ -42,7 +43,8 @@ const POLL_ROUND: usize = 16;
 const MAX_READS_IN_FLIGHT: usize = 256;
 const SELF_TEST_POLLS: u32 = 200;
 const SELF_TEST_WAIT: Duration = Duration::from_millis(100);
-const USAGE: &str = "usage: purple-core (--no-ui | --data-dir <dir> [--no-read-padding])";
+const USAGE: &str =
+    "usage: purple-core (--no-ui | --data-dir <dir> --store <store> [--no-read-padding])";
 
 fn main() -> ExitCode {
     match run() {
@@ -62,26 +64,28 @@ enum Mode {
     Serve {
         data_dir: PathBuf,
         padded: bool,
+        /// The store invites name, from the launcher.
+        store: StoreRef,
     },
 }
 
 fn parse_args() -> io::Result<Mode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    parse_args_from(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn parse_args_from(args: &[&str]) -> io::Result<Mode> {
+    let serve = |dir: &str, store: &str, padded| {
+        Ok(Mode::Serve {
+            data_dir: PathBuf::from(dir),
+            padded,
+            store: StoreRef::parse(store).map_err(io::Error::other)?,
+        })
+    };
+    match args {
         ["--no-ui"] => Ok(Mode::SelfTest),
-        ["--data-dir", dir] => Ok(Mode::Serve {
-            data_dir: PathBuf::from(dir),
-            padded: true,
-        }),
-        ["--data-dir", dir, "--no-read-padding"] => Ok(Mode::Serve {
-            data_dir: PathBuf::from(dir),
-            padded: false,
-        }),
+        ["--data-dir", dir, "--store", store] => serve(dir, store, true),
+        ["--data-dir", dir, "--store", store, "--no-read-padding"] => serve(dir, store, false),
         _ => Err(io::Error::other(USAGE)),
     }
 }
@@ -110,10 +114,14 @@ fn run() -> io::Result<()> {
     let mut net = unsafe { inherited_stream(CORE_NET_FD)? };
     match mode {
         Mode::SelfTest => self_test(&mut net),
-        Mode::Serve { data_dir, padded } => {
+        Mode::Serve {
+            data_dir,
+            padded,
+            store,
+        } => {
             // SAFETY: the launcher hands this fd to purple-core and nothing else here uses it.
             let ui = unsafe { inherited_stream(CORE_UI_FD)? };
-            serve_ui(&mut net, ui, &data_dir, Reads::new(padded))
+            serve_ui(&mut net, ui, &data_dir, Reads::new(padded), store)
         }
     }
 }
@@ -142,6 +150,7 @@ fn serve_ui(
     mut ui: UnixStream,
     data_dir: &Path,
     mut reads: Reads,
+    store: StoreRef,
 ) -> io::Result<()> {
     let (inputs_tx, inputs) = mpsc::channel();
     let mut ui_in = ui.try_clone()?;
@@ -163,6 +172,7 @@ fn serve_ui(
         "purple-core: unlocked; master key protection: {:?}",
         vault.protection()
     );
+    messenger.set_store(store);
     replay(&messenger, &vault, &mut ui)?;
     resend_unwritten(&messenger, net)?;
 
@@ -210,10 +220,9 @@ fn serve_ui(
                     Err(err) => report(&mut ui, &err.to_string())?,
                 }
             }
-            Ok(Input::Ui(Ok(Some(cmd)))) => match handle(cmd, &mut messenger) {
-                Ok(effects) => commit(effects, &mut messenger, &mut vault, net, &mut ui)?,
-                Err(err) => report(&mut ui, &err.to_string())?,
-            },
+            Ok(Input::Ui(Ok(Some(cmd)))) => {
+                on_command(cmd, &mut messenger, &mut vault, net, &mut ui)?;
+            }
             Ok(Input::Ui(Ok(None))) => return Ok(()),
             Ok(Input::Net(Ok(Some(NetMsg::Written { at })))) => {
                 if messenger.written(&at) {
@@ -225,6 +234,9 @@ fn serve_ui(
                 }
             }
             Ok(Input::Net(Ok(Some(NetMsg::Taken { at })))) => reads.check(net, at)?,
+            Ok(Input::Net(Ok(Some(NetMsg::Status(status))))) => {
+                to_ui_network(status).write_to(&mut ui)?;
+            }
             Ok(Input::Net(Ok(Some(reply)))) => {
                 if let Some(answer) = reads.answer(reply)? {
                     answered(answer, &mut messenger, &mut vault, net, &mut ui)?;
@@ -395,6 +407,24 @@ fn resend_unwritten(messenger: &Messenger, net: &mut UnixStream) -> io::Result<(
 /// fatal: carrying on could reuse keys after a restart. Packets are saved in the
 /// messenger's outbox before they go out, so one lost on the way is sent again after a
 /// restart.
+/// A UI command: an answer to purple-net's blocked prompt goes to purple-net, anything
+/// else to the messenger.
+fn on_command(
+    cmd: UiCmd,
+    messenger: &mut Messenger,
+    vault: &mut Vault,
+    net: &mut UnixStream,
+    ui: &mut UnixStream,
+) -> io::Result<()> {
+    if let Some(choice) = choice_for(&cmd) {
+        return choice.write_to(net);
+    }
+    match handle(cmd, messenger) {
+        Ok(effects) => commit(effects, messenger, vault, net, ui),
+        Err(err) => report(ui, &err.to_string()),
+    }
+}
+
 fn commit(
     effects: Effects,
     messenger: &mut Messenger,
@@ -486,8 +516,9 @@ fn handle(cmd: UiCmd, messenger: &mut Messenger) -> session::Result<Effects> {
         | UiCmd::GroupLeave { .. }
         | UiCmd::GroupMembers { .. }
         | UiCmd::GroupSend { .. }) => handle_group(group, messenger, &mut effects)?,
+        // serve_ui sends these to purple-net before they get here.
         UiCmd::UseDirect | UiCmd::AddBridges { .. } => {
-            return Err(session::Error::State("purple-net isn't asking for a route"));
+            return Err(session::Error::State("that goes to purple-net"));
         }
     }
     Ok(effects)
@@ -1036,7 +1067,10 @@ fn self_test_poll(
         let mut events = Vec::new();
         while !reads.in_flight.is_empty() {
             let reply = NetMsg::read_from(net)?.ok_or_else(net_closed)?;
-            if matches!(reply, NetMsg::Written { .. } | NetMsg::Taken { .. }) {
+            if matches!(
+                reply,
+                NetMsg::Written { .. } | NetMsg::Taken { .. } | NetMsg::Status(_)
+            ) {
                 continue;
             }
             let Some(answer) = reads.answer(reply)? else {
@@ -1065,6 +1099,24 @@ fn self_test_poll(
         thread::sleep(SELF_TEST_WAIT);
     }
     Err(io::Error::other("self-test timed out waiting for a packet"))
+}
+
+/// purple-net's connection status, for the UI.
+const fn to_ui_network(status: NetStatus) -> UiEvent {
+    UiEvent::Network { status }
+}
+
+/// The message to purple-net for a UI command that answers its blocked prompt.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "every other command is for the messenger"
+)]
+fn choice_for(cmd: &UiCmd) -> Option<NetMsg> {
+    match cmd {
+        UiCmd::UseDirect => Some(NetMsg::Choose(NetChoice::Direct)),
+        UiCmd::AddBridges { lines } => Some(NetMsg::Choose(NetChoice::Bridges(lines.clone()))),
+        _ => None,
+    }
 }
 
 fn now() -> io::Result<u64> {
@@ -1257,6 +1309,54 @@ mod tests {
             }
         }
         assert!(reads.in_flight.is_empty());
+    }
+
+    #[test]
+    fn network_status_and_choices_pass_through() {
+        let status = NetStatus::Blocked;
+        assert_eq!(to_ui_network(status), UiEvent::Network { status });
+        assert_eq!(
+            choice_for(&UiCmd::UseDirect),
+            Some(NetMsg::Choose(NetChoice::Direct))
+        );
+        assert_eq!(
+            choice_for(&UiCmd::AddBridges {
+                lines: "obfs4 x".into()
+            }),
+            Some(NetMsg::Choose(NetChoice::Bridges("obfs4 x".into())))
+        );
+        assert_eq!(choice_for(&UiCmd::GroupNew { group: "g".into() }), None);
+    }
+
+    #[test]
+    fn parses_store_arg() {
+        assert!(matches!(
+            parse_args_from(&["--data-dir", "/d", "--store", "dev"]).unwrap(),
+            Mode::Serve {
+                store: StoreRef::Dev,
+                padded: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_args_from(&[
+                "--data-dir",
+                "/d",
+                "--store",
+                "namenlos",
+                "--no-read-padding"
+            ])
+            .unwrap(),
+            Mode::Serve {
+                store: StoreRef::Namenlos,
+                padded: false,
+                ..
+            }
+        ));
+        assert!(
+            parse_args_from(&["--data-dir", "/d"]).is_err(),
+            "--store is required"
+        );
     }
 
     #[test]
