@@ -6,8 +6,8 @@
 //! packet per derived box address. A transport turns (seed, index) into an address with a
 //! one-way function, so whoever stores the boxes can't tell which ones form a stream.
 //!
-//! Reads can take seconds on a mixnet, so they report back through a [`ReadSink`] rather
-//! than returning, and many can be in flight at once.
+//! Reads and writes can take seconds on a mixnet, so they report back through a [`Sink`]
+//! rather than returning, and many can be in flight at once.
 
 pub mod katzenpost;
 pub mod scheduler;
@@ -33,23 +33,33 @@ pub struct ReadDone {
     pub packet: io::Result<Option<Packet>>,
 }
 
-/// Where a transport reports finished reads.
-pub type ReadSink = Sender<ReadDone>;
+/// What a transport reports back.
+#[derive(Debug)]
+pub enum Done {
+    /// A read finished.
+    Read(ReadDone),
+    /// A write reached the store, so the box now holds the packet.
+    Written(BoxRef),
+}
+
+/// Where a transport reports finished reads and writes.
+pub type Sink = Sender<Done>;
 
 /// Stores and fetches write-once boxes.
 pub trait Transport {
     /// Write `packet` into box `at`. Writing a box that already exists leaves it as it is.
-    /// May return before the write reaches the network.
+    /// May return before the write reaches the network; once it has, [`Done::Written`] goes
+    /// to `done`, if given. A write that never lands is never reported.
     ///
     /// # Errors
     /// Fails if the packet can't be handed to the network.
-    fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()>;
+    fn write(&mut self, at: &BoxRef, packet: Packet, done: Option<&Sink>) -> io::Result<()>;
 
     /// Start reading box `at`. The result goes to `done`, possibly before this returns.
     ///
     /// # Errors
     /// Fails if the network can't be reached.
-    fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()>;
+    fn read(&mut self, at: &BoxRef, done: &Sink) -> io::Result<()>;
 
     /// Fill one slot of the cover stream with no real packet to send. The default writes
     /// random bytes to a random box, which looks like a sealed real packet.
@@ -58,7 +68,7 @@ pub trait Transport {
     /// Fails if the packet can't be handed to the network.
     fn cover(&mut self) -> io::Result<()> {
         let (at, packet) = random_box()?;
-        self.write(&at, packet)
+        self.write(&at, packet, None)
     }
 
     /// Finish writes still in flight before the process exits.
@@ -202,11 +212,13 @@ impl FakeTransport {
 }
 
 impl Transport for FakeTransport {
-    fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()> {
-        self.store.put(box_address(at), packet)
+    fn write(&mut self, at: &BoxRef, packet: Packet, done: Option<&Sink>) -> io::Result<()> {
+        self.store.put(box_address(at), packet)?;
+        report_written(done, at);
+        Ok(())
     }
 
-    fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()> {
+    fn read(&mut self, at: &BoxRef, done: &Sink) -> io::Result<()> {
         let packet = self.store.get(&box_address(at));
         report(done, at, packet);
         Ok(())
@@ -343,15 +355,18 @@ impl DevProviderTransport {
 }
 
 impl Transport for DevProviderTransport {
-    fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()> {
+    fn write(&mut self, at: &BoxRef, packet: Packet, done: Option<&Sink>) -> io::Result<()> {
         ProviderMsg::Put {
             addr: box_address(at),
             packet,
         }
-        .write_to(&mut self.stream)
+        .write_to(&mut self.stream)?;
+        // The provider doesn't answer puts; one the connection took counts as stored.
+        report_written(done, at);
+        Ok(())
     }
 
-    fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()> {
+    fn read(&mut self, at: &BoxRef, done: &Sink) -> io::Result<()> {
         let packet = self.fetch(at)?;
         report(done, at, Ok(packet));
         Ok(())
@@ -375,8 +390,15 @@ impl DevProviderTransport {
 }
 
 /// Hand a finished read to `done`. If nobody listens any more, the read is moot.
-fn report(done: &ReadSink, at: &BoxRef, packet: io::Result<Option<Packet>>) {
-    done.send(ReadDone { at: *at, packet }).ok();
+fn report(done: &Sink, at: &BoxRef, packet: io::Result<Option<Packet>>) {
+    done.send(Done::Read(ReadDone { at: *at, packet })).ok();
+}
+
+/// Tell `done`, if given, that box `at` was written.
+fn report_written(done: Option<&Sink>, at: &BoxRef) {
+    if let Some(done) = done {
+        done.send(Done::Written(*at)).ok();
+    }
 }
 
 fn invalid(msg: &'static str) -> io::Error {
@@ -397,9 +419,13 @@ mod tests {
     fn read_now(net: &mut impl Transport, at: &BoxRef) -> Option<Packet> {
         let (tx, rx) = mpsc::channel();
         net.read(at, &tx).unwrap();
-        let done = rx.try_recv().unwrap();
-        assert_eq!(done.at, *at);
-        done.packet.unwrap()
+        match rx.try_recv().unwrap() {
+            Done::Read(done) => {
+                assert_eq!(done.at, *at);
+                done.packet.unwrap()
+            }
+            Done::Written(_) => panic!("a read reported a write"),
+        }
     }
 
     fn packet(byte: u8) -> Packet {
@@ -416,12 +442,22 @@ mod tests {
     #[test]
     fn boxes_are_write_once_and_reads_do_not_consume() {
         let mut net = FakeTransport::default();
-        net.write(&at(1, 0), packet(1)).unwrap();
-        net.write(&at(1, 0), packet(2)).unwrap();
+        net.write(&at(1, 0), packet(1), None).unwrap();
+        net.write(&at(1, 0), packet(2), None).unwrap();
         assert_eq!(read_now(&mut net, &at(1, 0)), Some(packet(1)));
         assert_eq!(read_now(&mut net, &at(1, 0)), Some(packet(1)));
         assert_eq!(read_now(&mut net, &at(1, 1)), None);
         assert_eq!(read_now(&mut net, &at(2, 0)), None);
+    }
+
+    #[test]
+    fn writes_report_when_asked() {
+        let mut net = FakeTransport::default();
+        let (tx, rx) = mpsc::channel();
+        net.write(&at(4, 0), packet(1), Some(&tx)).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Done::Written(got)) if got == at(4, 0)));
+        net.cover().unwrap();
+        assert!(rx.try_recv().is_err(), "cover writes aren't reported");
     }
 
     #[test]
@@ -440,7 +476,7 @@ mod tests {
     fn clones_share_one_network() {
         let mut alice = FakeTransport::default();
         let mut bob = alice.clone();
-        alice.write(&at(3, 0), packet(7)).unwrap();
+        alice.write(&at(3, 0), packet(7), None).unwrap();
         assert_eq!(read_now(&mut bob, &at(3, 0)), Some(packet(7)));
     }
 
@@ -480,8 +516,8 @@ mod tests {
             serve_provider(&mut stream, &server_store).unwrap();
         });
         let mut client = DevProviderTransport::connect(&addr).unwrap();
-        client.write(&at(4, 0), packet(1)).unwrap();
-        client.write(&at(4, 1), packet(2)).unwrap();
+        client.write(&at(4, 0), packet(1), None).unwrap();
+        client.write(&at(4, 1), packet(2), None).unwrap();
         assert_eq!(read_now(&mut client, &at(4, 0)), Some(packet(1)));
         assert_eq!(read_now(&mut client, &at(4, 1)), Some(packet(2)));
         assert_eq!(read_now(&mut client, &at(4, 2)), None);

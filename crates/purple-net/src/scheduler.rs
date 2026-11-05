@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use purple_ipc::{BoxRef, Packet};
 use rand::Rng;
 
-use crate::{ReadSink, Transport};
+use crate::{Sink, Transport};
 
 /// Longest gap between ticks, as a multiple of the mean. Caps the exponential's long tail
 /// so a message is never stuck behind one huge gap.
@@ -69,13 +69,14 @@ impl<T: Transport> Scheduler<T> {
         self.next_tick
     }
 
-    /// Send one packet (real if any is queued, else cover) and schedule the next tick.
+    /// Send one packet (real if any is queued, else cover) and schedule the next tick. A
+    /// real packet's write is reported to `done` once it lands.
     ///
     /// # Errors
     /// Fails if the transport fails. A real packet that fails to send is dropped.
-    pub fn tick(&mut self) -> io::Result<Sent> {
+    pub fn tick(&mut self, done: &Sink) -> io::Result<Sent> {
         let sent = if let Some((at, packet)) = self.queue.pop_front() {
-            self.transport.write(&at, packet)?;
+            self.transport.write(&at, packet, Some(done))?;
             Sent::Real
         } else {
             self.transport.cover()?;
@@ -91,7 +92,7 @@ impl<T: Transport> Scheduler<T> {
     ///
     /// # Errors
     /// Fails if the transport fails.
-    pub fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()> {
+    pub fn read(&mut self, at: &BoxRef, done: &Sink) -> io::Result<()> {
         self.transport.read(at, done)
     }
 
@@ -125,14 +126,18 @@ mod tests {
     struct Recorder(Vec<(BoxRef, Packet)>);
 
     impl Transport for Recorder {
-        fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()> {
+        fn write(&mut self, at: &BoxRef, packet: Packet, _: Option<&Sink>) -> io::Result<()> {
             self.0.push((*at, packet));
             Ok(())
         }
 
-        fn read(&mut self, _: &BoxRef, _: &ReadSink) -> io::Result<()> {
+        fn read(&mut self, _: &BoxRef, _: &Sink) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn sink() -> Sink {
+        std::sync::mpsc::channel().0
     }
 
     fn at(seed: u8) -> BoxRef {
@@ -151,7 +156,7 @@ mod tests {
         let mut s = Scheduler::new(Recorder::default(), Duration::from_secs(1));
         s.enqueue(at(1), packet(1));
         s.enqueue(at(2), packet(2));
-        let sent: Vec<Sent> = (0..4).map(|_| s.tick().unwrap()).collect();
+        let sent: Vec<Sent> = (0..4).map(|_| s.tick(&sink()).unwrap()).collect();
         assert_eq!(sent, [Sent::Real, Sent::Real, Sent::Cover, Sent::Cover]);
 
         let log = &s.transport.0;
@@ -164,8 +169,8 @@ mod tests {
     #[test]
     fn cover_packets_are_random_each_time() {
         let mut s = Scheduler::new(Recorder::default(), Duration::from_secs(1));
-        s.tick().unwrap();
-        s.tick().unwrap();
+        s.tick(&sink()).unwrap();
+        s.tick(&sink()).unwrap();
         let [(m1, p1), (m2, p2)] = [&s.transport.0[0], &s.transport.0[1]];
         assert_ne!(m1, m2);
         assert_ne!(p1, p2);
@@ -196,7 +201,7 @@ mod tests {
     fn next_tick_moves_forward() {
         let mut s = Scheduler::new(Recorder::default(), Duration::from_millis(50));
         let before = Instant::now();
-        s.tick().unwrap();
+        s.tick(&sink()).unwrap();
         assert!(s.next_tick() >= before);
     }
 }

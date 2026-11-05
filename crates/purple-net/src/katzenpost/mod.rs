@@ -27,7 +27,7 @@ use sha2::Sha256;
 
 pub use client::{Client, Envelope, Fetched, Keypair};
 
-use crate::{ReadDone, ReadSink, Transport};
+use crate::{Done, ReadDone, Sink, Transport};
 
 /// Reads in flight at once. `purple-core` sends at most 256 per poll.
 const READ_WORKERS: usize = 32;
@@ -91,16 +91,23 @@ impl PigeonholeTransport {
 }
 
 impl Transport for PigeonholeTransport {
-    fn write(&mut self, at: &BoxRef, packet: Packet) -> io::Result<()> {
+    fn write(&mut self, at: &BoxRef, packet: Packet, done: Option<&Sink>) -> io::Result<()> {
         let client = Arc::clone(&self.client);
         let seed = box_seed(at);
+        let at = *at;
+        let done = done.cloned();
         let job: Job = Box::new(move || {
-            if let Err(err) = with_retries(
+            match with_retries(
                 || write_box(&client, &seed, &packet),
                 WRITE_RETRY_FIRST,
                 WRITE_RETRY_MAX,
             ) {
-                eprintln!("purple-net: lost a box write: {err}");
+                Ok(()) => {
+                    if let Some(done) = done {
+                        done.send(Done::Written(at)).ok();
+                    }
+                }
+                Err(err) => eprintln!("purple-net: lost a box write: {err}"),
             }
         });
         self.writes
@@ -110,13 +117,13 @@ impl Transport for PigeonholeTransport {
             .map_err(|_| stopped())
     }
 
-    fn read(&mut self, at: &BoxRef, done: &ReadSink) -> io::Result<()> {
+    fn read(&mut self, at: &BoxRef, done: &Sink) -> io::Result<()> {
         let client = Arc::clone(&self.client);
         let at = *at;
         let done = done.clone();
         let job: Job = Box::new(move || {
             let packet = read_box(&client, &box_seed(&at));
-            done.send(ReadDone { at, packet }).ok();
+            done.send(Done::Read(ReadDone { at, packet })).ok();
         });
         self.reads.send(job).map_err(|_| stopped())
     }

@@ -164,6 +164,7 @@ fn serve_ui(
         vault.protection()
     );
     replay(&messenger, &vault, &mut ui)?;
+    resend_unwritten(&messenger, net)?;
 
     // Polls run on a fixed clock, never in response to what the user does, so their
     // timing says nothing about activity.
@@ -210,14 +211,23 @@ fn serve_ui(
                 }
             }
             Ok(Input::Ui(Ok(Some(cmd)))) => match handle(cmd, &mut messenger) {
-                Ok(effects) => commit(effects, &messenger, &mut vault, net, &mut ui)?,
+                Ok(effects) => commit(effects, &mut messenger, &mut vault, net, &mut ui)?,
                 Err(err) => report(&mut ui, &err.to_string())?,
             },
             Ok(Input::Ui(Ok(None))) => return Ok(()),
+            Ok(Input::Net(Ok(Some(NetMsg::Written { at })))) => {
+                if messenger.written(&at) {
+                    let saved = Effects {
+                        changed: true,
+                        ..Effects::default()
+                    };
+                    commit(saved, &mut messenger, &mut vault, net, &mut ui)?;
+                }
+            }
             Ok(Input::Net(Ok(Some(reply)))) => {
                 if let Some((at, Some(packet))) = reads.answer(reply)? {
                     let (effects, error) = receive(&mut messenger, at, &packet, now()?)?;
-                    commit(effects, &messenger, &mut vault, net, &mut ui)?;
+                    commit(effects, &mut messenger, &mut vault, net, &mut ui)?;
                     if let Some(err) = error {
                         report(&mut ui, &format!("dropped a packet: {err}"))?;
                     }
@@ -351,16 +361,34 @@ fn replay(messenger: &Messenger, vault: &Vault, ui: &mut UnixStream) -> io::Resu
     Ok(())
 }
 
+/// Send again whatever the network never confirmed storing. Boxes are write-once, so a
+/// packet that did land the first time is still stored just once.
+fn resend_unwritten(messenger: &Messenger, net: &mut UnixStream) -> io::Result<()> {
+    for (at, packet) in messenger.unwritten() {
+        NetMsg::Write {
+            at: *at,
+            packet: packet.clone(),
+        }
+        .write_to(net)?;
+    }
+    Ok(())
+}
+
 /// Save first, then send packets, then record history and tell the UI. A failed save is
-/// fatal: carrying on could reuse keys after a restart.
+/// fatal: carrying on could reuse keys after a restart. Packets are saved in the
+/// messenger's outbox before they go out, so one lost on the way is sent again after a
+/// restart.
 fn commit(
     effects: Effects,
-    messenger: &Messenger,
+    messenger: &mut Messenger,
     vault: &mut Vault,
     net: &mut UnixStream,
     ui: &mut UnixStream,
 ) -> io::Result<()> {
-    if effects.changed {
+    for out in &effects.outgoing {
+        messenger.keep_until_written(out);
+    }
+    if effects.changed || !effects.outgoing.is_empty() {
         vault
             .save(&messenger.to_snapshot().map_err(io::Error::other)?)
             .map_err(io::Error::other)?;
@@ -526,6 +554,12 @@ impl Reads {
                     "purple-net sent a message only purple-core may send",
                 ));
             }
+            NetMsg::Written { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a write confirmation isn't a read reply",
+                ));
+            }
         };
         match self.in_flight.remove(&at) {
             Some(true) => Ok(Some((at, packet))),
@@ -643,6 +677,9 @@ fn self_test_poll(
         let mut events = Vec::new();
         while !reads.in_flight.is_empty() {
             let reply = NetMsg::read_from(net)?.ok_or_else(net_closed)?;
+            if matches!(reply, NetMsg::Written { .. }) {
+                continue;
+            }
             let Some((at, Some(packet))) = reads.answer(reply)? else {
                 continue;
             };
@@ -741,7 +778,10 @@ mod tests {
         let reads = std::iter::from_fn(|| NetMsg::read_from(&mut bytes).unwrap())
             .map(|msg| match msg {
                 NetMsg::Read { at } => at,
-                other @ (NetMsg::Write { .. } | NetMsg::Found { .. } | NetMsg::Empty { .. }) => {
+                other @ (NetMsg::Write { .. }
+                | NetMsg::Found { .. }
+                | NetMsg::Empty { .. }
+                | NetMsg::Written { .. }) => {
                     panic!("not a read: {other:?}")
                 }
             })

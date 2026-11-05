@@ -80,6 +80,9 @@ pub struct Messenger {
     /// Invites this user accepted, waiting for the inviter's bundle on the bundle stream.
     accepting: BTreeMap<String, Pending>,
     reassemblers: HashMap<StreamSeed, Reassembler>,
+    /// Packets handed to the network that it hasn't confirmed storing yet. Kept in the
+    /// snapshot, so they're sent again after a restart.
+    outbox: Vec<(BoxRef, Packet)>,
 }
 
 impl std::fmt::Debug for Messenger {
@@ -100,6 +103,7 @@ impl Messenger {
             invites: BTreeMap::new(),
             accepting: BTreeMap::new(),
             reassemblers: HashMap::new(),
+            outbox: Vec::new(),
         })
     }
 
@@ -215,9 +219,27 @@ impl Messenger {
         Ok(out)
     }
 
+    /// Keep `out`'s packets until the network confirms each one with [`Self::written`].
+    pub fn keep_until_written(&mut self, out: &Outgoing) {
+        self.outbox.extend(out.writes.iter().cloned());
+    }
+
+    /// The network stored box `at`: stop keeping its packet. Returns whether one was kept.
+    pub fn written(&mut self, at: &BoxRef) -> bool {
+        let before = self.outbox.len();
+        self.outbox.retain(|(kept, _)| kept != at);
+        self.outbox.len() != before
+    }
+
+    /// Packets the network hasn't confirmed storing, oldest first.
+    #[must_use]
+    pub fn unwritten(&self) -> &[(BoxRef, Packet)] {
+        &self.outbox
+    }
+
     /// Serialize everything needed to resume: the account (identity, prekeys, sessions),
-    /// contacts with their queue secrets and stream positions, and pending invites. Partly
-    /// reassembled messages aren't kept.
+    /// contacts with their queue secrets and stream positions, pending invites, and packets
+    /// not yet confirmed stored. Partly reassembled messages aren't kept.
     ///
     /// # Errors
     /// Fails only if libsignal can't serialize a record.
@@ -241,16 +263,24 @@ impl Messenger {
                 w.u64(pending.next_read);
             }
         }
+        w.len(self.outbox.len())?;
+        for (at, packet) in &self.outbox {
+            w.bytes(&at.stream.0)?;
+            w.u64(at.index);
+            w.bytes(packet.as_bytes())?;
+        }
         Ok(w.finish())
     }
 
-    /// Restore a messenger from [`Self::to_snapshot`].
+    /// Restore a messenger from [`Self::to_snapshot`], or from a version 2 snapshot,
+    /// which had no outbox.
     ///
     /// # Errors
     /// Fails on an unknown version or any malformed field.
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        if r.u8()? != SNAPSHOT_VERSION {
+        let version = r.u8()?;
+        if version != SNAPSHOT_VERSION && version != 2 {
             return Err(Error::Malformed("unknown snapshot version"));
         }
         let account = Account::decode(&mut r)?;
@@ -267,6 +297,21 @@ impl Messenger {
         }
         let invites = read_pending(&mut r)?;
         let accepting = read_pending(&mut r)?;
+        let mut outbox = Vec::new();
+        if version == SNAPSHOT_VERSION {
+            for _ in 0..r.len()? {
+                let stream = StreamSeed(
+                    r.bytes()?
+                        .try_into()
+                        .map_err(|_| Error::Malformed("stream seed has the wrong length"))?,
+                );
+                let at = BoxRef {
+                    stream,
+                    index: r.u64()?,
+                };
+                outbox.push((at, Packet::from_slice(r.bytes()?)?));
+            }
+        }
         r.finish()?;
         Ok(Self {
             account,
@@ -274,6 +319,7 @@ impl Messenger {
             invites,
             accepting,
             reassemblers: HashMap::new(),
+            outbox,
         })
     }
 
@@ -414,7 +460,7 @@ impl Messenger {
     }
 }
 
-const SNAPSHOT_VERSION: u8 = 2;
+const SNAPSHOT_VERSION: u8 = 3;
 
 fn secret(bytes: &[u8]) -> Result<QueueSecret> {
     let array: [u8; 32] = bytes
@@ -672,5 +718,40 @@ mod tests {
             assert!(bob.create_invite(bad).is_err(), "{bad:?}");
         }
         assert!(alice.send("carol", b"x").is_err());
+    }
+
+    #[test]
+    fn the_outbox_survives_a_restart_until_each_box_is_written() {
+        let mut alice = Messenger::new().unwrap();
+        let (_, bundle) = alice.create_invite("bob").unwrap();
+        alice.keep_until_written(&bundle);
+        let mut restored = Messenger::from_snapshot(&alice.to_snapshot().unwrap()).unwrap();
+        let bytes = |writes: &[(BoxRef, Packet)]| {
+            writes
+                .iter()
+                .map(|(at, packet)| (*at, packet.as_bytes().to_vec()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bytes(restored.unwritten()), bytes(&bundle.writes));
+
+        let first = bundle.writes.first().unwrap().0;
+        assert!(restored.written(&first));
+        assert!(!restored.written(&first), "already gone");
+        assert_eq!(restored.unwritten().len(), bundle.writes.len() - 1);
+        let again = Messenger::from_snapshot(&restored.to_snapshot().unwrap()).unwrap();
+        assert_eq!(again.unwritten().len(), bundle.writes.len() - 1);
+    }
+
+    #[test]
+    fn version_two_snapshots_still_load() {
+        let alice = Messenger::new().unwrap();
+        let mut old = alice.to_snapshot().unwrap().to_vec();
+        // Version 2 is version 3 without the outbox count at the end.
+        old[0] = 2;
+        old.truncate(old.len() - 4);
+        let restored = Messenger::from_snapshot(&old).unwrap();
+        assert!(restored.unwritten().is_empty());
+        old[0] = 4;
+        assert!(Messenger::from_snapshot(&old).is_err());
     }
 }

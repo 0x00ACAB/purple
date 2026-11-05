@@ -21,7 +21,7 @@ use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_ipc::{NET_CORE_FD, NetMsg, inherited_stream};
 use purple_net::katzenpost::PigeonholeTransport;
 use purple_net::scheduler::Scheduler;
-use purple_net::{DevProviderTransport, FakeTransport, ReadDone, Transport};
+use purple_net::{DevProviderTransport, Done, FakeTransport, ReadDone, Sink, Transport};
 
 const NAME: &str = "purple-net";
 const USAGE: &str = "usage: purple-net [--katzenpost <socket> | --dev-provider <addr>] \
@@ -122,8 +122,8 @@ enum Event {
     Core(io::Result<NetMsg>),
     /// Core closed its socket.
     CoreClosed,
-    /// A read finished.
-    Read(ReadDone),
+    /// A read or write finished.
+    Done(Done),
 }
 
 /// Queue core's writes into the cover stream and answer its reads, until core closes
@@ -131,57 +131,71 @@ enum Event {
 fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::Result<()> {
     let (events_tx, events) = mpsc::channel();
     spawn_request_reader(core.try_clone()?, events_tx.clone());
-    let reads = forward_reads(events_tx);
+    let done_sink = forward_done(events_tx);
     loop {
         let wait = scheduler
             .next_tick()
             .saturating_duration_since(Instant::now());
         match events.recv_timeout(wait) {
             Ok(Event::Core(Ok(NetMsg::Write { at, packet }))) => scheduler.enqueue(at, packet),
-            Ok(Event::Core(Ok(NetMsg::Read { at }))) => scheduler.read(&at, &reads)?,
-            Ok(Event::Core(Ok(NetMsg::Found { .. } | NetMsg::Empty { .. }))) => {
+            Ok(Event::Core(Ok(NetMsg::Read { at }))) => scheduler.read(&at, &done_sink)?,
+            Ok(Event::Core(Ok(
+                NetMsg::Found { .. } | NetMsg::Empty { .. } | NetMsg::Written { .. },
+            ))) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "purple-core sent a message only purple-net may send",
                 ));
             }
             Ok(Event::Core(Err(err))) => return Err(err),
-            Ok(Event::Read(ReadDone { at, packet })) => match packet? {
-                Some(packet) => NetMsg::Found { at, packet }.write_to(&mut core)?,
-                None => NetMsg::Empty { at }.write_to(&mut core)?,
-            },
-            Ok(Event::CoreClosed) => return drain(&mut scheduler),
+            Ok(Event::Done(done)) => {
+                let reply = match done {
+                    Done::Read(ReadDone { at, packet }) => {
+                        packet?.map_or(NetMsg::Empty { at }, |packet| NetMsg::Found { at, packet })
+                    }
+                    Done::Written(at) => NetMsg::Written { at },
+                };
+                match reply.write_to(&mut core) {
+                    // Core closed its socket and the reader hasn't noticed yet.
+                    Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                        return drain(&mut scheduler, &done_sink);
+                    }
+                    other => other?,
+                }
+            }
+            Ok(Event::CoreClosed) => return drain(&mut scheduler, &done_sink),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other("purple-net's event channel closed"));
             }
         }
         if Instant::now() >= scheduler.next_tick() {
-            scheduler.tick()?;
+            scheduler.tick(&done_sink)?;
         }
     }
 }
 
 /// Send the packets still queued when core exits, without breaking the rate, and let
-/// the transport finish writes in flight.
-fn drain(scheduler: &mut Scheduler<impl Transport>) -> io::Result<()> {
+/// the transport finish writes in flight. Core is gone, so nobody hears they landed; it
+/// sends anything it wasn't told about again next time.
+fn drain(scheduler: &mut Scheduler<impl Transport>, done: &Sink) -> io::Result<()> {
     while scheduler.queued() > 0 {
         thread::sleep(
             scheduler
                 .next_tick()
                 .saturating_duration_since(Instant::now()),
         );
-        scheduler.tick()?;
+        scheduler.tick(done)?;
     }
     scheduler.finish()
 }
 
-/// A sink for finished reads that feeds them into the main loop's events.
-fn forward_reads(events: Sender<Event>) -> Sender<ReadDone> {
+/// A sink for finished reads and writes that feeds them into the main loop's events.
+fn forward_done(events: Sender<Event>) -> Sink {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         for done in rx {
-            if events.send(Event::Read(done)).is_err() {
+            if events.send(Event::Done(done)).is_err() {
                 return;
             }
         }
