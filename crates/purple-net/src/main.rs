@@ -354,9 +354,9 @@ fn forward_done(events: Sender<Event>) -> Sink {
 }
 
 /// Feed the Tor driver's status reports into the main loop's events.
-fn forward_status(status: Receiver<NetStatus>, events: Sender<Event>) {
+fn forward_status(reports: Receiver<NetStatus>, events: Sender<Event>) {
     thread::spawn(move || {
-        for status in status {
+        for status in reports {
             if events.send(Event::Status(status)).is_err() {
                 return;
             }
