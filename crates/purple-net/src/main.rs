@@ -8,8 +8,7 @@
 //! instances on one machine can talk. With neither, it uses an in-memory network only
 //! this instance can see. `--send-interval-ms` is the mean gap between packets.
 
-use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use landlock::RulesetStatus;
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
-use purple_ipc::{BoxRef, NET_CORE_FD, NetMsg, Packet, inherited_stream};
+use purple_ipc::{NET_CORE_FD, NetMsg, inherited_stream};
 use purple_net::katzenpost::PigeonholeTransport;
 use purple_net::scheduler::Scheduler;
 use purple_net::{DevProviderTransport, FakeTransport, ReadDone, Transport};
@@ -133,17 +132,13 @@ fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::
     let (events_tx, events) = mpsc::channel();
     spawn_request_reader(core.try_clone()?, events_tx.clone());
     let reads = forward_reads(events_tx);
-    let mut replies = Replies::default();
     loop {
         let wait = scheduler
             .next_tick()
             .saturating_duration_since(Instant::now());
         match events.recv_timeout(wait) {
             Ok(Event::Core(Ok(NetMsg::Write { at, packet }))) => scheduler.enqueue(at, packet),
-            Ok(Event::Core(Ok(NetMsg::Read { at }))) => {
-                replies.expect(at);
-                scheduler.read(&at, &reads)?;
-            }
+            Ok(Event::Core(Ok(NetMsg::Read { at }))) => scheduler.read(&at, &reads)?,
             Ok(Event::Core(Ok(NetMsg::Found { .. } | NetMsg::Empty { .. }))) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -151,10 +146,10 @@ fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::
                 ));
             }
             Ok(Event::Core(Err(err))) => return Err(err),
-            Ok(Event::Read(done)) => {
-                replies.fill(&done.at, done.packet?);
-                replies.flush(&mut core)?;
-            }
+            Ok(Event::Read(ReadDone { at, packet })) => match packet? {
+                Some(packet) => NetMsg::Found { at, packet }.write_to(&mut core)?,
+                None => NetMsg::Empty { at }.write_to(&mut core)?,
+            },
             Ok(Event::CoreClosed) => return drain(&mut scheduler),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -164,47 +159,6 @@ fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::
         if Instant::now() >= scheduler.next_tick() {
             scheduler.tick()?;
         }
-    }
-}
-
-/// Replies to core's reads, held until they can go out in the order core asked. Reads
-/// can finish out of order on a mixnet.
-#[derive(Default)]
-struct Replies(VecDeque<(BoxRef, Reply)>);
-
-enum Reply {
-    Waiting,
-    Ready(Option<Packet>),
-}
-
-impl Replies {
-    fn expect(&mut self, at: BoxRef) {
-        self.0.push_back((at, Reply::Waiting));
-    }
-
-    /// Record what the earliest unanswered read of `at` found.
-    fn fill(&mut self, at: &BoxRef, packet: Option<Packet>) {
-        if let Some(slot) = self
-            .0
-            .iter_mut()
-            .find(|(expected, reply)| expected == at && matches!(reply, Reply::Waiting))
-        {
-            slot.1 = Reply::Ready(packet);
-        }
-    }
-
-    /// Send every reply that's ready and has nothing unanswered before it.
-    fn flush(&mut self, core: &mut impl Write) -> io::Result<()> {
-        while matches!(self.0.front(), Some((_, Reply::Ready(_)))) {
-            let Some((at, Reply::Ready(packet))) = self.0.pop_front() else {
-                break;
-            };
-            match packet {
-                Some(packet) => NetMsg::Found { at, packet }.write_to(core)?,
-                None => NetMsg::Empty { at }.write_to(core)?,
-            }
-        }
-        Ok(())
     }
 }
 
@@ -269,64 +223,6 @@ mod tests {
 
     fn parse(args: &[&str]) -> io::Result<Options> {
         parse_args(args.iter().map(|&a| a.to_owned()))
-    }
-
-    fn at(index: u64) -> BoxRef {
-        BoxRef {
-            stream: purple_ipc::StreamSeed([1; purple_ipc::SEED_LEN]),
-            index,
-        }
-    }
-
-    fn packet(byte: u8) -> Packet {
-        Packet::from_slice(&[byte; purple_ipc::PACKET_LEN]).unwrap()
-    }
-
-    fn sent(out: &[u8]) -> Vec<NetMsg> {
-        let mut out = out;
-        std::iter::from_fn(|| NetMsg::read_from(&mut out).unwrap()).collect()
-    }
-
-    #[test]
-    fn replies_go_out_in_request_order() {
-        let mut replies = Replies::default();
-        for index in [0, 1, 2, 1] {
-            replies.expect(at(index));
-        }
-        let mut out = Vec::new();
-        replies.fill(&at(1), Some(packet(1)));
-        replies.fill(&at(2), None);
-        replies.flush(&mut out).unwrap();
-        assert!(
-            out.is_empty(),
-            "nothing goes out before the first read is answered"
-        );
-
-        replies.fill(&at(0), None);
-        replies.flush(&mut out).unwrap();
-        assert_eq!(
-            sent(&out),
-            [
-                NetMsg::Empty { at: at(0) },
-                NetMsg::Found {
-                    at: at(1),
-                    packet: packet(1)
-                },
-                NetMsg::Empty { at: at(2) },
-            ]
-        );
-        // The second read of box 1 is still waiting, and gets its own answer.
-        out.clear();
-        replies.fill(&at(1), Some(packet(2)));
-        replies.flush(&mut out).unwrap();
-        assert_eq!(
-            sent(&out),
-            [NetMsg::Found {
-                at: at(1),
-                packet: packet(2)
-            }]
-        );
-        assert!(replies.0.is_empty());
     }
 
     #[test]

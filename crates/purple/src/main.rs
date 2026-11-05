@@ -167,6 +167,9 @@ fn run() -> io::Result<bool> {
         data_dir,
         bin_dir,
         sandboxed,
+        // kpclientd sends cover traffic of its own, so padding reads would only waste its
+        // bandwidth.
+        kp_socket_dir.is_none(),
         &core_net,
         log.as_ref(),
     )?);
@@ -194,12 +197,13 @@ fn run() -> io::Result<bool> {
 }
 
 /// Start `purple-core`, and `purple-ui` when there's a display. With no display, core runs
-/// its self-test.
+/// its self-test. `read_padding` says whether core pads its polls.
 fn spawn_core_and_ui(
     wayland_display: Option<OsString>,
     data_dir: PathBuf,
     bin_dir: &Path,
     sandboxed: bool,
+    read_padding: bool,
     core_net: &UnixStream,
     log: Option<&File>,
 ) -> io::Result<Vec<(String, Child)>> {
@@ -230,11 +234,15 @@ fn spawn_core_and_ui(
                     .ok_or_else(|| io::Error::other("data directory path is not UTF-8"))?
                     .to_owned()
             };
+            let mut core_args = vec!["--data-dir", &data_arg];
+            if !read_padding {
+                core_args.push("--no-read-padding");
+            }
             out.push(spawn(
                 &Profile::Core { data_dir },
                 bin_dir,
                 sandboxed,
-                &["--data-dir", &data_arg],
+                &core_args,
                 &core_fds,
                 Background(log),
             )?);

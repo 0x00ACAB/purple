@@ -96,7 +96,8 @@ pub enum NetMsg {
         /// Its contents.
         packet: Packet,
     },
-    /// core to net: read box `at`. Answered by [`NetMsg::Found`] or [`NetMsg::Empty`].
+    /// core to net: read box `at`. Answered by [`NetMsg::Found`] or [`NetMsg::Empty`], in
+    /// the order reads finish, not the order they were asked.
     Read {
         /// The box.
         at: BoxRef,
