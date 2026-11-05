@@ -513,12 +513,9 @@ fn net_args(mode: &Mode, send_interval_ms: Option<&str>, no_ui: bool) -> Vec<Str
     let mut args = Vec::new();
     match mode {
         Mode::Tor(config) => {
-            let fallback = if no_ui {
-                SELF_TEST_SEND_INTERVAL_MS
-            } else {
-                TOR_SEND_INTERVAL_MS
-            };
-            return tor_net_args(config, Some(send_interval_ms.unwrap_or(fallback)));
+            // Tor carries a few requests a second per circuit, so the self-test runs at the
+            // TUI's rate too.
+            return tor_net_args(config, send_interval_ms);
         }
         Mode::Dev(addr) => args.extend(["--dev-provider".to_owned(), addr.clone()]),
         Mode::Katzenpost(_) => {
@@ -728,6 +725,11 @@ mod tests {
         assert_eq!(
             core_store_arg(&Mode::Tor(config.clone())),
             Some(format!("tor:{}", config.onion))
+        );
+        let self_test = net_args(&Mode::Tor(config), None, true).join(" ");
+        assert!(
+            self_test.contains("--send-interval-ms 500"),
+            "the self-test can't go faster than Tor"
         );
     }
 

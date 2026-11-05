@@ -629,7 +629,7 @@ const BLOCKED_HELP: &[&str] = &[
     "network: Tor can't connect from here, with or without the built-in bridges.",
     "  /bridges LINE   try a bridge line from bridges.torproject.org (one per command)",
     "  /direct         connect to the store directly until purple exits:",
-    "    The store will see your IP address and when you're online. Your ISP will see that you use this store. Nobody learns who you talk to.",
+    "    The store will see your IP address and when you're online. Your ISP will see that you use this store. If your contact also connects directly, the store can tell that you two talk.",
 ];
 
 /// The rule purple-net applies to bridge lines (`check_bridge_line`), checked here too so
@@ -818,7 +818,8 @@ mod tests {
         let log = m.system.join("\n");
         assert!(log.contains(
             "The store will see your IP address and when you're online. Your ISP will see that \
-             you use this store. Nobody learns who you talk to."
+             you use this store. If your contact also connects directly, the store can tell \
+             that you two talk."
         ));
         assert!(log.contains("/direct") && log.contains("/bridges"));
         assert_eq!(type_line(&mut m, "/direct"), [UiCmd::UseDirect]);
