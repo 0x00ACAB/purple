@@ -21,10 +21,10 @@ const HEADER_LEN: usize = ID_LEN + 2 + 2 + 2;
 
 /// Data bytes that fit in one fragment.
 pub const FRAGMENT_DATA_LEN: usize = SEALED_LEN - HEADER_LEN;
-/// Most fragments one message may have, about 130 KB. Files will get their own chunking.
+/// Most fragments one message may have, about 95 KB. Files will get their own chunking.
 pub const MAX_FRAGMENTS: u16 = 64;
 /// Most messages a [`Reassembler`] holds incomplete at once. With [`MAX_FRAGMENTS`] this
-/// caps its memory at about 4 MB.
+/// caps its memory at about 3 MB.
 pub const MAX_IN_FLIGHT: usize = 32;
 
 type MessageId = [u8; ID_LEN];
