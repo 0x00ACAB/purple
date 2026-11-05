@@ -20,6 +20,9 @@ pub(crate) const KP_SOCKET: &str = "/run/kp/kpclientd.sock";
 /// Where the `kpclientd` binary and its config are mounted in its sandbox.
 const KP_BINARY: &str = "/opt/kpclientd";
 pub(crate) const KP_CONFIG: &str = "/etc/purple/kpclientd.toml";
+/// The TPM resource manager, the one device `purple-core` gets (same as
+/// `purple_core::tpm::TPM_DEVICE`).
+const TPM_DEVICE: &str = "/dev/tpmrm0";
 /// Fds bwrap reads `kpclientd`'s seccomp filters from.
 pub(crate) const KP_SECCOMP_FDS: [RawFd; 2] = [10, 11];
 
@@ -153,6 +156,12 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
         }
         Profile::Core { data_dir } => {
             out.extend(["--bind".into(), data_dir.into(), CORE_DATA_DIR.into()]);
+            // The TPM, for vaults sealed to it. Skipped where there is none.
+            out.extend([
+                "--dev-bind-try".into(),
+                TPM_DEVICE.into(),
+                TPM_DEVICE.into(),
+            ]);
         }
         Profile::Ui { wayland_display } => {
             out.extend([
@@ -308,6 +317,36 @@ mod tests {
             &[],
         );
         assert!(!has(&core, KP_SOCKET_DIR));
+    }
+
+    #[test]
+    fn only_core_gets_the_tpm() {
+        let profiles = [
+            Profile::Net {
+                state_dir: "/s".into(),
+                kp_socket_dir: None,
+            },
+            Profile::Core {
+                data_dir: "/d".into(),
+            },
+            Profile::Ui {
+                wayland_display: "wayland-1".into(),
+            },
+            kpclientd(),
+        ];
+        for profile in &profiles {
+            let args = bwrap_args(profile, Path::new("/b"), &[]);
+            let core = matches!(profile, Profile::Core { .. });
+            assert_eq!(has(&args, TPM_DEVICE), core, "{profile:?}");
+            if core {
+                let at = args.iter().position(|a| a == "--dev-bind-try").unwrap();
+                assert_eq!(args[at + 1], TPM_DEVICE);
+                assert!(
+                    args.iter().position(|a| a == "--dev").unwrap() < at,
+                    "the TPM goes on top of the minimal /dev"
+                );
+            }
+        }
     }
 
     #[test]

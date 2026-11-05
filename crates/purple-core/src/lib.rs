@@ -9,4 +9,5 @@ pub mod messenger;
 pub mod queue;
 pub mod session;
 mod signal_store;
+pub mod tpm;
 pub mod vault;

@@ -10,6 +10,7 @@
 //! state and could reuse a message key.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,8 @@ use landlock::RulesetStatus;
 use purple_core::invite::Invite;
 use purple_core::messenger::{Event, Messenger, Outgoing};
 use purple_core::session;
-use purple_core::vault::{HistoryEntry, KdfParams, Vault};
+use purple_core::tpm::{Sealer, TPM_DEVICE, Tpm};
+use purple_core::vault::{HistoryEntry, KdfParams, UnlockedBy, Vault};
 use purple_harden::sandbox::{Network, Policy, Report, restrict};
 use purple_ipc::ui::{MAX_BODY_LEN, MAX_ERROR_LEN, UiCmd, UiEvent};
 use purple_ipc::{
@@ -90,7 +92,14 @@ fn run() -> io::Result<()> {
     let mode = parse_args()?;
     let writable: Vec<&Path> = match &mode {
         Mode::SelfTest => Vec::new(),
-        Mode::Serve { data_dir, .. } => vec![data_dir.as_path()],
+        Mode::Serve { data_dir, .. } => {
+            let tpm = Path::new(TPM_DEVICE);
+            let mut writable = vec![data_dir.as_path()];
+            if tpm.exists() {
+                writable.push(tpm);
+            }
+            writable
+        }
     };
     note_sandbox(&restrict(&Policy {
         writable: &writable,
@@ -164,11 +173,39 @@ fn serve_ui(
         match inputs.recv_timeout(wait) {
             Ok(Input::Ui(Ok(Some(UiCmd::ChangePassphrase { old, new })))) => {
                 let (old, new) = (Zeroizing::new(old), Zeroizing::new(new));
+                let mut tpm = vault.sealed_to_tpm().then(open_tpm).flatten();
                 let changed = messenger.to_snapshot().and_then(|snapshot| {
-                    vault.change_passphrase(&old, &new, KdfParams::DEFAULT, &snapshot)
+                    vault.change_passphrase(
+                        &old,
+                        &new,
+                        KdfParams::DEFAULT,
+                        &snapshot,
+                        as_sealer(&mut tpm),
+                    )
                 });
                 match changed {
                     Ok(()) => UiEvent::PassphraseChanged.write_to(&mut ui)?,
+                    Err(err) => report(&mut ui, &err.to_string())?,
+                }
+            }
+            Ok(Input::Ui(Ok(Some(UiCmd::EnrollTpm { passphrase })))) => {
+                let passphrase = Zeroizing::new(passphrase);
+                let enrolled = Tpm::open()
+                    .map_err(|err| {
+                        session::Error::Io(io::Error::other(format!(
+                            "can't open {TPM_DEVICE}: {err} (if permission is denied, add \
+                             your user to the tss group)"
+                        )))
+                    })
+                    .and_then(|mut tpm| {
+                        let snapshot = messenger.to_snapshot()?;
+                        vault.enroll_tpm(&passphrase, KdfParams::DEFAULT, &snapshot, &mut tpm)
+                    });
+                match enrolled {
+                    Ok(code) => UiEvent::TpmEnrolled {
+                        recovery_code: code.to_text().to_string(),
+                    }
+                    .write_to(&mut ui)?,
                     Err(err) => report(&mut ui, &err.to_string())?,
                 }
             }
@@ -271,12 +308,16 @@ fn unlock(
                 Ok((messenger, vault))
             })
         } else {
-            Vault::open(data_dir, &passphrase)
+            let mut tpm = open_tpm();
+            Vault::open(data_dir, &passphrase, as_sealer(&mut tpm))
                 .and_then(|(vault, snapshot)| Ok((Messenger::from_snapshot(&snapshot)?, vault)))
         };
         match opened {
             Ok(pair) => {
                 UiEvent::Unlocked.write_to(ui)?;
+                if pair.1.unlocked_by() == UnlockedBy::RecoveryCode {
+                    UiEvent::RecoveryUnlocked.write_to(ui)?;
+                }
                 return Ok(Some(pair));
             }
             Err(err) => report(ui, &err.to_string())?,
@@ -364,7 +405,7 @@ fn handle(cmd: UiCmd, messenger: &mut Messenger) -> session::Result<Effects> {
         UiCmd::Unlock { .. } => {
             return Err(session::Error::State("already unlocked"));
         }
-        UiCmd::ChangePassphrase { .. } => {
+        UiCmd::ChangePassphrase { .. } | UiCmd::EnrollTpm { .. } => {
             return Err(session::Error::State(
                 "passphrase changes are handled by the vault",
             ));
@@ -645,6 +686,16 @@ fn expect(ok: bool) -> io::Result<()> {
             "self-test did not see the expected events",
         ))
     }
+}
+
+/// The TPM, if this machine has one this user may use. Vaults not sealed to it don't need
+/// it, so a missing TPM isn't an error here.
+fn open_tpm() -> Option<Tpm<File>> {
+    Tpm::open().ok()
+}
+
+fn as_sealer(tpm: &mut Option<Tpm<File>>) -> Option<&mut dyn Sealer> {
+    tpm.as_mut().map(|tpm| -> &mut dyn Sealer { tpm })
 }
 
 /// Log how much of the sandbox the kernel enforced, if not all of it.

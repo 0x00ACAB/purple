@@ -27,6 +27,7 @@ const HELP: &[&str] = &[
     "/invite NAME          create an invite for a new contact called NAME",
     "/accept NAME INVITE   accept an invite (paste it) from a contact called NAME",
     "/passphrase           change the vault passphrase (Esc cancels)",
+    "/tpm                  seal the vault to this machine's TPM; you get a recovery code",
     "/quit                 exit (also Esc or Ctrl-C)",
     "Up/Down or Tab switch contact; anything else you type is sent to the selected contact.",
 ];
@@ -68,11 +69,14 @@ enum Lock {
     Open,
 }
 
-/// Where a `/passphrase` change stands. Each step holds what was typed so far.
+/// Where a `/passphrase` change or `/tpm` enrollment stands. Each step holds what was
+/// typed so far.
 #[derive(Default)]
 enum Change {
     #[default]
     Idle,
+    /// `/tpm`: asking for the passphrase.
+    Tpm,
     Old,
     New {
         old: Zeroizing<String>,
@@ -177,7 +181,7 @@ fn on_key(model: &mut Model, key: KeyEvent) -> Vec<UiCmd> {
         KeyCode::Esc if !matches!(model.change, Change::Idle) => {
             model.change = Change::Idle;
             model.input.zeroize();
-            model.log("passphrase change cancelled");
+            model.log("cancelled");
         }
         KeyCode::Esc => model.quit = true,
         KeyCode::Char('c') if ctrl => model.quit = true,
@@ -246,6 +250,14 @@ fn submit(model: &mut Model) -> Vec<UiCmd> {
         (Some("passphrase"), None, None, None) => {
             model.change = Change::Old;
             model.log("current passphrase:");
+            Vec::new()
+        }
+        (Some("tpm"), None, None, None) => {
+            model.change = Change::Tpm;
+            model.log(
+                "this seals the vault to this machine's TPM. You'll get a recovery code to write \
+                 down. Passphrase:",
+            );
             Vec::new()
         }
         (Some("help"), None, None, None) => {
@@ -318,6 +330,12 @@ fn submit_passphrase(model: &mut Model) -> Vec<UiCmd> {
 fn submit_change(model: &mut Model) -> Vec<UiCmd> {
     let typed = Zeroizing::new(std::mem::take(&mut model.input));
     match std::mem::take(&mut model.change) {
+        Change::Tpm => {
+            model.log("sealing the vault to the TPM...");
+            return vec![UiCmd::EnrollTpm {
+                passphrase: typed.to_string(),
+            }];
+        }
         Change::Old => {
             model.log("new passphrase (at least 8 characters):");
             model.change = Change::New { old: typed };
@@ -381,6 +399,15 @@ fn on_core_event(model: &mut Model, event: UiEvent) {
             model.log("unlocked. type /help for commands.");
         }
         UiEvent::PassphraseChanged => model.log("passphrase changed"),
+        UiEvent::TpmEnrolled { recovery_code } => {
+            model.log("the vault is sealed to the TPM. Write down this recovery code; it is shown only now:");
+            model.log(format!("    {}", sanitize(&recovery_code)));
+            model.log("if the TPM is ever lost or cleared, type it at the passphrase prompt.");
+        }
+        UiEvent::RecoveryUnlocked => model.log(
+            "opened with the recovery code. Set a new passphrase now with /passphrase, giving \
+             the recovery code as the current one.",
+        ),
         UiEvent::Sent { to, body } => {
             let to = sanitize(&to);
             model.add_contact(to.clone());
@@ -488,6 +515,7 @@ pub(crate) fn view(model: &Model, frame: &mut Frame<'_>) {
 
     let masked = || "*".repeat(model.input.chars().count());
     let (input_title, shown) = match (&model.change, &model.lock) {
+        (Change::Tpm, _) => (" passphrase ", masked()),
         (Change::Old, _) => (" current passphrase ", masked()),
         (Change::New { .. }, _) => (" new passphrase ", masked()),
         (Change::Repeat { .. }, _) => (" repeat new passphrase ", masked()),

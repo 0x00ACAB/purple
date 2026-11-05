@@ -17,6 +17,8 @@ pub const MAX_INVITE_LEN: usize = 256;
 pub const MAX_ERROR_LEN: usize = 512;
 /// Longest passphrase, in bytes.
 pub const MAX_PASSPHRASE_LEN: usize = 1024;
+/// Longest recovery code text, in bytes.
+pub const MAX_RECOVERY_LEN: usize = 64;
 
 /// The largest message is a name plus a body.
 const MAX_UI_FRAME: usize = 1 + 2 + MAX_NAME_LEN + 2 + MAX_BODY_LEN;
@@ -26,6 +28,7 @@ const CMD_ACCEPT_INVITE: u8 = 2;
 const CMD_SEND: u8 = 3;
 const CMD_UNLOCK: u8 = 4;
 const CMD_CHANGE_PASSPHRASE: u8 = 5;
+const CMD_ENROLL_TPM: u8 = 6;
 
 const EVENT_INVITE_CREATED: u8 = 1;
 const EVENT_CONNECTED: u8 = 2;
@@ -35,6 +38,8 @@ const EVENT_NEED_PASSPHRASE: u8 = 5;
 const EVENT_UNLOCKED: u8 = 6;
 const EVENT_SENT: u8 = 7;
 const EVENT_PASSPHRASE_CHANGED: u8 = 8;
+const EVENT_TPM_ENROLLED: u8 = 9;
+const EVENT_RECOVERY_UNLOCKED: u8 = 10;
 
 /// What the user asked for, sent from `purple-ui` to `purple-core`.
 #[derive(Clone, PartialEq, Eq)]
@@ -50,6 +55,11 @@ pub enum UiCmd {
         old: String,
         /// The new passphrase.
         new: String,
+    },
+    /// Seal the vault to the TPM.
+    EnrollTpm {
+        /// The current passphrase, which stays the passphrase.
+        passphrase: String,
     },
     /// Create an invite for a contact to be known as `contact`.
     CreateInvite {
@@ -78,6 +88,7 @@ impl std::fmt::Debug for UiCmd {
         match self {
             Self::Unlock { .. } => f.write_str("Unlock { .. }"),
             Self::ChangePassphrase { .. } => f.write_str("ChangePassphrase { .. }"),
+            Self::EnrollTpm { .. } => f.write_str("EnrollTpm { .. }"),
             Self::CreateInvite { contact } => f
                 .debug_struct("CreateInvite")
                 .field("contact", contact)
@@ -95,7 +106,7 @@ impl std::fmt::Debug for UiCmd {
 }
 
 /// What happened, sent from `purple-core` to `purple-ui`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum UiEvent {
     /// The vault is locked. `new` is true when there's no vault yet and the passphrase
     /// will create one.
@@ -107,6 +118,13 @@ pub enum UiEvent {
     Unlocked,
     /// The passphrase was changed.
     PassphraseChanged,
+    /// The vault is now sealed to the TPM. The recovery code is shown this once.
+    TpmEnrolled {
+        /// The code that opens the vault without the TPM.
+        recovery_code: String,
+    },
+    /// The vault was opened with the recovery code, so a new passphrase should be set.
+    RecoveryUnlocked,
     /// A message this user sent earlier, replayed from history.
     Sent {
         /// Recipient.
@@ -140,6 +158,41 @@ pub enum UiEvent {
     },
 }
 
+/// Debug without the recovery code; message text is shown, as the UI shows it anyway.
+impl std::fmt::Debug for UiEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedPassphrase { new } => {
+                f.debug_struct("NeedPassphrase").field("new", new).finish()
+            }
+            Self::Unlocked => f.write_str("Unlocked"),
+            Self::PassphraseChanged => f.write_str("PassphraseChanged"),
+            Self::TpmEnrolled { .. } => f.write_str("TpmEnrolled { .. }"),
+            Self::RecoveryUnlocked => f.write_str("RecoveryUnlocked"),
+            Self::Sent { to, body } => f
+                .debug_struct("Sent")
+                .field("to", to)
+                .field("body", body)
+                .finish(),
+            Self::InviteCreated { contact, invite } => f
+                .debug_struct("InviteCreated")
+                .field("contact", contact)
+                .field("invite", invite)
+                .finish(),
+            Self::Connected { contact } => f
+                .debug_struct("Connected")
+                .field("contact", contact)
+                .finish(),
+            Self::Message { from, body } => f
+                .debug_struct("Message")
+                .field("from", from)
+                .field("body", body)
+                .finish(),
+            Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+        }
+    }
+}
+
 impl UiCmd {
     /// Write as one frame.
     ///
@@ -156,6 +209,10 @@ impl UiCmd {
                 out.tag(CMD_CHANGE_PASSPHRASE);
                 out.str(old, MAX_PASSPHRASE_LEN)?;
                 out.str(new, MAX_PASSPHRASE_LEN)?;
+            }
+            Self::EnrollTpm { passphrase } => {
+                out.tag(CMD_ENROLL_TPM);
+                out.str(passphrase, MAX_PASSPHRASE_LEN)?;
             }
             Self::CreateInvite { contact } => {
                 out.tag(CMD_CREATE_INVITE);
@@ -192,6 +249,9 @@ impl UiCmd {
                 old: d.str(MAX_PASSPHRASE_LEN)?,
                 new: d.str(MAX_PASSPHRASE_LEN)?,
             },
+            CMD_ENROLL_TPM => Self::EnrollTpm {
+                passphrase: d.str(MAX_PASSPHRASE_LEN)?,
+            },
             CMD_CREATE_INVITE => Self::CreateInvite {
                 contact: d.str(MAX_NAME_LEN)?,
             },
@@ -224,6 +284,11 @@ impl UiEvent {
             }
             Self::Unlocked => out.tag(EVENT_UNLOCKED),
             Self::PassphraseChanged => out.tag(EVENT_PASSPHRASE_CHANGED),
+            Self::TpmEnrolled { recovery_code } => {
+                out.tag(EVENT_TPM_ENROLLED);
+                out.str(recovery_code, MAX_RECOVERY_LEN)?;
+            }
+            Self::RecoveryUnlocked => out.tag(EVENT_RECOVERY_UNLOCKED),
             Self::Sent { to, body } => {
                 out.tag(EVENT_SENT);
                 out.str(to, MAX_NAME_LEN)?;
@@ -270,6 +335,10 @@ impl UiEvent {
             },
             EVENT_UNLOCKED => Self::Unlocked,
             EVENT_PASSPHRASE_CHANGED => Self::PassphraseChanged,
+            EVENT_TPM_ENROLLED => Self::TpmEnrolled {
+                recovery_code: d.str(MAX_RECOVERY_LEN)?,
+            },
+            EVENT_RECOVERY_UNLOCKED => Self::RecoveryUnlocked,
             EVENT_SENT => Self::Sent {
                 to: d.str(MAX_NAME_LEN)?,
                 body: d.str(MAX_BODY_LEN)?,
@@ -369,6 +438,9 @@ mod tests {
                 old: s("correct horse"),
                 new: s("battery staple"),
             },
+            UiCmd::EnrollTpm {
+                passphrase: s("correct horse"),
+            },
             UiCmd::CreateInvite {
                 contact: s("alice"),
             },
@@ -390,6 +462,10 @@ mod tests {
             UiEvent::NeedPassphrase { new: false },
             UiEvent::Unlocked,
             UiEvent::PassphraseChanged,
+            UiEvent::TpmEnrolled {
+                recovery_code: s("AAAAA-AAAAA-AAAAA-AAAAA-AAAAAA"),
+            },
+            UiEvent::RecoveryUnlocked,
             UiEvent::Sent {
                 to: s("bob"),
                 body: s("earlier"),

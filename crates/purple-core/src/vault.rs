@@ -2,9 +2,13 @@
 //!
 //! A random 32-byte data key, held in a [`SecretPage`] (`memfd_secret` where available),
 //! encrypts everything; HKDF splits it into a state key and a history key. The data key
-//! never changes. Key slots in the state header each hold a wrapped copy of it: for now one
-//! passphrase slot (Argon2id, then XChaCha20-Poly1305), later a TPM slot beside it.
-//! Changing the passphrase only rewraps the data key, so history is never rewritten.
+//! never changes. Key slots in the state header each hold a wrapped copy of it
+//! (XChaCha20-Poly1305 under a key-encryption key). A new vault has a passphrase slot,
+//! keyed by Argon2id. Enrolling the TPM replaces it with a TPM slot, keyed by Argon2id
+//! together with a secret only the TPM releases, and a recovery slot, keyed by a random
+//! code shown once. With no passphrase slot left, a copy of the disk can't be attacked
+//! offline: every guess has to go through the TPM, which rate-limits them. Changing the
+//! passphrase only rewraps the data key, so history is never rewritten.
 //!
 //! `state.purple`: header (magic, version, key slots), nonce, then the snapshot sealed under
 //! the state key with the whole header as AAD. Each save writes a temporary file, syncs it,
@@ -32,6 +36,7 @@ use zeroize::Zeroizing;
 
 use crate::codec::{Reader, Writer};
 use crate::session::{Error, Result};
+use crate::tpm::{SECRET_LEN, Sealer};
 
 const STATE_FILE: &str = "state.purple";
 const STATE_TMP: &str = "state.purple.tmp";
@@ -52,6 +57,15 @@ const MAX_RECORD_LEN: usize = 1 << 20;
 
 /// Key slot kinds.
 const SLOT_PASSPHRASE: u8 = 1;
+const SLOT_TPM: u8 = 2;
+const SLOT_RECOVERY: u8 = 3;
+/// Length of a recovery code's secret.
+const RECOVERY_LEN: usize = 16;
+/// RFC 4648 base32, which survives being read aloud or written by hand.
+const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+/// Characters in a recovery code, without separators: 128 bits at 5 per character.
+const RECOVERY_CHARS: usize = 26;
+#[cfg(test)]
 /// A passphrase slot: Argon2 parameters, salt, nonce, wrapped data key.
 const PASSPHRASE_SLOT_LEN: usize = 4 + 4 + 4 + SALT_LEN + NONCE_LEN + WRAPPED_LEN;
 
@@ -92,6 +106,7 @@ pub struct HistoryEntry {
 }
 
 /// The data key wrapped under a key derived from a passphrase.
+#[derive(Clone)]
 struct PassphraseSlot {
     params: KdfParams,
     salt: [u8; SALT_LEN],
@@ -104,67 +119,35 @@ impl PassphraseSlot {
     fn wrap(data_key: &SecretPage, passphrase: &str, params: KdfParams) -> Result<Self> {
         let mut salt = [0u8; SALT_LEN];
         fill_random(&mut salt)?;
-        let mut nonce = [0u8; NONCE_LEN];
-        fill_random(&mut nonce)?;
         let kek = derive_kek(passphrase, &salt, params)?;
-        let wrapped = key_cipher(&kek)?
-            .encrypt(
-                &XNonce::from(nonce),
-                Payload {
-                    msg: data_key.as_slice(),
-                    aad: &Self::aad(params, &salt),
-                },
-            )
-            .map_err(|_| Error::Malformed("wrapping the data key failed"))?;
+        let (nonce, wrapped) = wrap_key(kek.as_slice(), data_key, &Self::aad(params, &salt))?;
         Ok(Self {
             params,
             salt,
             nonce,
-            wrapped: wrapped
-                .try_into()
-                .map_err(|_| Error::Malformed("wrapped key has the wrong length"))?,
+            wrapped,
         })
     }
 
     /// Recover the data key. Fails on a wrong passphrase.
     fn unwrap(&self, passphrase: &str) -> Result<SecretPage> {
         let kek = derive_kek(passphrase, &self.salt, self.params)?;
-        let plaintext = Zeroizing::new(
-            key_cipher(&kek)?
-                .decrypt(
-                    &XNonce::from(self.nonce),
-                    Payload {
-                        msg: &self.wrapped,
-                        aad: &Self::aad(self.params, &self.salt),
-                    },
-                )
-                .map_err(|_| Error::State("wrong passphrase, or the state file is damaged"))?,
-        );
-        let mut data_key = SecretPage::new(KEY_LEN)?;
-        data_key.as_mut_slice().copy_from_slice(
-            plaintext
-                .get(..KEY_LEN)
-                .ok_or(Error::Malformed("short data key"))?,
-        );
-        Ok(data_key)
+        unwrap_key(
+            kek.as_slice(),
+            &self.nonce,
+            &self.wrapped,
+            &Self::aad(self.params, &self.salt),
+            "wrong passphrase, or the state file is damaged",
+        )
     }
 
     /// Binds the wrapped key to the file format, slot kind and Argon2 inputs.
     fn aad(params: KdfParams, salt: &[u8; SALT_LEN]) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(8 + 2 + 12 + SALT_LEN);
-        aad.extend_from_slice(STATE_MAGIC);
-        aad.extend_from_slice(&[STATE_VERSION, SLOT_PASSPHRASE]);
-        aad.extend_from_slice(&params.memory_kib.to_be_bytes());
-        aad.extend_from_slice(&params.iterations.to_be_bytes());
-        aad.extend_from_slice(&params.parallelism.to_be_bytes());
-        aad.extend_from_slice(salt);
-        aad
+        slot_aad(SLOT_PASSPHRASE, &[&encode_params(params), salt])
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.params.memory_kib.to_be_bytes());
-        out.extend_from_slice(&self.params.iterations.to_be_bytes());
-        out.extend_from_slice(&self.params.parallelism.to_be_bytes());
+        out.extend_from_slice(&encode_params(self.params));
         out.extend_from_slice(&self.salt);
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.wrapped);
@@ -173,11 +156,7 @@ impl PassphraseSlot {
     fn decode(body: &[u8]) -> Result<Self> {
         let mut r = Reader::new(body);
         let slot = Self {
-            params: KdfParams {
-                memory_kib: r.u32()?,
-                iterations: r.u32()?,
-                parallelism: r.u32()?,
-            },
+            params: decode_params(&mut r)?,
             salt: r.take()?,
             nonce: r.take()?,
             wrapped: r.take()?,
@@ -187,31 +166,278 @@ impl PassphraseSlot {
     }
 }
 
-/// The state file header: key slots.
+/// The data key wrapped under a key that needs both the passphrase and a secret sealed in
+/// the TPM. The TPM releases the secret only for a password derived from the passphrase,
+/// and counts wrong ones toward its lockout.
+#[derive(Clone)]
+struct TpmSlot {
+    params: KdfParams,
+    salt: [u8; SALT_LEN],
+    /// The TPM's sealed object holding the secret.
+    sealed: Vec<u8>,
+    nonce: [u8; NONCE_LEN],
+    wrapped: [u8; WRAPPED_LEN],
+}
+
+impl TpmSlot {
+    /// Wrap `data_key` under `passphrase` and a fresh secret sealed in `sealer`.
+    fn wrap(
+        data_key: &SecretPage,
+        passphrase: &str,
+        params: KdfParams,
+        sealer: &mut dyn Sealer,
+    ) -> Result<Self> {
+        let mut salt = [0u8; SALT_LEN];
+        fill_random(&mut salt)?;
+        let stretched = derive_kek(passphrase, &salt, params)?;
+        let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
+        fill_random(secret.as_mut_slice())?;
+        let object = sealer.seal(&*tpm_auth(&stretched)?, &secret)?;
+        let kek = tpm_kek(&stretched, &secret)?;
+        let (nonce, wrapped) =
+            wrap_key(kek.as_slice(), data_key, &Self::aad(params, &salt, &object))?;
+        Ok(Self {
+            params,
+            salt,
+            sealed: object,
+            nonce,
+            wrapped,
+        })
+    }
+
+    /// Recover the data key. A wrong passphrase is caught by the TPM.
+    fn unwrap(&self, passphrase: &str, sealer: &mut dyn Sealer) -> Result<SecretPage> {
+        let stretched = derive_kek(passphrase, &self.salt, self.params)?;
+        let secret = sealer.unseal(&self.sealed, &*tpm_auth(&stretched)?)?;
+        let kek = tpm_kek(&stretched, &secret)?;
+        unwrap_key(
+            kek.as_slice(),
+            &self.nonce,
+            &self.wrapped,
+            &Self::aad(self.params, &self.salt, &self.sealed),
+            "the state file is damaged",
+        )
+    }
+
+    fn aad(params: KdfParams, salt: &[u8; SALT_LEN], sealed: &[u8]) -> Vec<u8> {
+        slot_aad(SLOT_TPM, &[&encode_params(params), salt, sealed])
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        out.extend_from_slice(&encode_params(self.params));
+        out.extend_from_slice(&self.salt);
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.wrapped);
+        let len = u16::try_from(self.sealed.len())
+            .map_err(|_| Error::Malformed("sealed TPM object too long"))?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&self.sealed);
+        Ok(())
+    }
+
+    fn decode(body: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(body);
+        let params = decode_params(&mut r)?;
+        let salt = r.take()?;
+        let nonce = r.take()?;
+        let wrapped = r.take()?;
+        let len = usize::from(u16::from_be_bytes(r.take()?));
+        let slot = Self {
+            params,
+            salt,
+            sealed: r.raw(len)?.to_vec(),
+            nonce,
+            wrapped,
+        };
+        r.finish()?;
+        Ok(slot)
+    }
+}
+
+/// The data key wrapped under a key derived from a [`RecoveryCode`]. The code has 128 bits
+/// of entropy, so HKDF is enough; it needs no stretching.
+#[derive(Clone)]
+struct RecoverySlot {
+    salt: [u8; SALT_LEN],
+    nonce: [u8; NONCE_LEN],
+    wrapped: [u8; WRAPPED_LEN],
+}
+
+impl RecoverySlot {
+    fn wrap(data_key: &SecretPage, code: &RecoveryCode) -> Result<Self> {
+        let mut salt = [0u8; SALT_LEN];
+        fill_random(&mut salt)?;
+        let kek = recovery_kek(code, &salt)?;
+        let (nonce, wrapped) = wrap_key(kek.as_slice(), data_key, &Self::aad(&salt))?;
+        Ok(Self {
+            salt,
+            nonce,
+            wrapped,
+        })
+    }
+
+    fn unwrap(&self, code: &RecoveryCode) -> Result<SecretPage> {
+        let kek = recovery_kek(code, &self.salt)?;
+        unwrap_key(
+            kek.as_slice(),
+            &self.nonce,
+            &self.wrapped,
+            &Self::aad(&self.salt),
+            "wrong recovery code",
+        )
+    }
+
+    fn aad(salt: &[u8; SALT_LEN]) -> Vec<u8> {
+        slot_aad(SLOT_RECOVERY, &[salt])
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.salt);
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.wrapped);
+    }
+
+    fn decode(body: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(body);
+        let slot = Self {
+            salt: r.take()?,
+            nonce: r.take()?,
+            wrapped: r.take()?,
+        };
+        r.finish()?;
+        Ok(slot)
+    }
+}
+
+/// A random code that opens the vault without the TPM, shown once when the TPM is
+/// enrolled. Written as base32 in dash-separated groups.
+pub struct RecoveryCode(Zeroizing<[u8; RECOVERY_LEN]>);
+
+impl std::fmt::Debug for RecoveryCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecoveryCode(..)")
+    }
+}
+
+impl RecoveryCode {
+    fn generate() -> Result<Self> {
+        let mut code = Zeroizing::new([0u8; RECOVERY_LEN]);
+        fill_random(code.as_mut_slice())?;
+        Ok(Self(code))
+    }
+
+    /// The code as the user writes it down: five groups, the last one six characters.
+    #[must_use]
+    pub fn to_text(&self) -> Zeroizing<String> {
+        let mut chars = Zeroizing::new(String::with_capacity(RECOVERY_CHARS));
+        let mut bits: u32 = 0;
+        let mut held = 0u32;
+        for &byte in self.0.iter() {
+            bits = (bits << 8) | u32::from(byte);
+            held = held.saturating_add(8);
+            while held >= 5 {
+                held = held.saturating_sub(5);
+                chars.push(base32_char(bits >> held));
+            }
+        }
+        if held > 0 {
+            chars.push(base32_char(bits << (5u32.saturating_sub(held))));
+        }
+        let mut text = Zeroizing::new(String::with_capacity(RECOVERY_CHARS + 4));
+        for (i, c) in chars.chars().enumerate() {
+            if i > 0 && i % 5 == 0 && i < RECOVERY_CHARS - 1 {
+                text.push('-');
+            }
+            text.push(c);
+        }
+        text
+    }
+
+    /// Read a code back, ignoring case, spaces and dashes. `None` if `text` isn't one.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut code = Zeroizing::new([0u8; RECOVERY_LEN]);
+        let mut bits: u32 = 0;
+        let mut held = 0u32;
+        let mut out = 0usize;
+        let mut chars = 0usize;
+        for c in text.chars().filter(|c| !matches!(c, '-' | ' ')) {
+            let value = BASE32
+                .iter()
+                .position(|&b| char::from(b) == c.to_ascii_uppercase())?;
+            chars = chars.saturating_add(1);
+            bits = (bits << 5) | u32::try_from(value).ok()?;
+            held = held.saturating_add(5);
+            if held >= 8 {
+                held = held.saturating_sub(8);
+                *code.get_mut(out)? = u8::try_from((bits >> held) & 0xFF).ok()?;
+                out = out.saturating_add(1);
+            }
+        }
+        // 26 characters carry 130 bits; the last two must be zero.
+        if chars != RECOVERY_CHARS || out != RECOVERY_LEN || bits & !(u32::MAX << held) != 0 {
+            return None;
+        }
+        Some(Self(code))
+    }
+}
+
+fn base32_char(index: u32) -> char {
+    let index = usize::try_from(index & 0x1F).unwrap_or(0);
+    char::from(*BASE32.get(index).unwrap_or(&b'A'))
+}
+
+/// How the vault was unlocked this time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnlockedBy {
+    /// With the passphrase alone.
+    Passphrase,
+    /// With the passphrase and the TPM.
+    Tpm,
+    /// With the recovery code.
+    RecoveryCode,
+}
+
+/// The state file header: key slots. There is always a passphrase slot or a TPM slot.
 struct Header {
-    passphrase: PassphraseSlot,
+    passphrase: Option<PassphraseSlot>,
+    tpm: Option<TpmSlot>,
+    recovery: Option<RecoverySlot>,
     /// Slots of kinds this version doesn't understand, kept as (kind, body).
     unknown_slots: Vec<(u8, Vec<u8>)>,
 }
 
 impl Header {
     fn encode(&self) -> Result<Vec<u8>> {
-        let count = u8::try_from(self.unknown_slots.len().saturating_add(1))
-            .map_err(|_| Error::Malformed("too many key slots"))?;
+        let mut slots: Vec<(u8, Vec<u8>)> = Vec::new();
+        if let Some(slot) = &self.passphrase {
+            let mut body = Vec::new();
+            slot.encode(&mut body);
+            slots.push((SLOT_PASSPHRASE, body));
+        }
+        if let Some(slot) = &self.tpm {
+            let mut body = Vec::new();
+            slot.encode(&mut body)?;
+            slots.push((SLOT_TPM, body));
+        }
+        if let Some(slot) = &self.recovery {
+            let mut body = Vec::new();
+            slot.encode(&mut body);
+            slots.push((SLOT_RECOVERY, body));
+        }
+        slots.extend(self.unknown_slots.iter().cloned());
+        let count =
+            u8::try_from(slots.len()).map_err(|_| Error::Malformed("too many key slots"))?;
         let mut out = Vec::new();
         out.extend_from_slice(STATE_MAGIC);
         out.push(STATE_VERSION);
         out.push(count);
-        let mut passphrase_slot = Vec::with_capacity(PASSPHRASE_SLOT_LEN);
-        self.passphrase.encode(&mut passphrase_slot);
-        for (kind, body) in std::iter::once((SLOT_PASSPHRASE, &passphrase_slot))
-            .chain(self.unknown_slots.iter().map(|(kind, body)| (*kind, body)))
-        {
+        for (kind, body) in slots {
             let len =
                 u16::try_from(body.len()).map_err(|_| Error::Malformed("key slot too long"))?;
             out.push(kind);
             out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(body);
+            out.extend_from_slice(&body);
         }
         Ok(out)
     }
@@ -232,25 +458,64 @@ impl Header {
             }
             _ => return Err(Error::Malformed("state file is from a newer purple")),
         }
-        let mut passphrase = None;
-        let mut unknown_slots = Vec::new();
+        let mut header = Self {
+            passphrase: None,
+            tpm: None,
+            recovery: None,
+            unknown_slots: Vec::new(),
+        };
         for _ in 0..r.u8()? {
             let kind = r.u8()?;
             let len = usize::from(u16::from_be_bytes(r.take()?));
             let body = r.raw(len)?;
-            match kind {
-                SLOT_PASSPHRASE if passphrase.is_none() => {
-                    passphrase = Some(PassphraseSlot::decode(body)?);
+            let duplicate = match kind {
+                SLOT_PASSPHRASE => header
+                    .passphrase
+                    .replace(PassphraseSlot::decode(body)?)
+                    .is_some(),
+                SLOT_TPM => header.tpm.replace(TpmSlot::decode(body)?).is_some(),
+                SLOT_RECOVERY => header
+                    .recovery
+                    .replace(RecoverySlot::decode(body)?)
+                    .is_some(),
+                _ => {
+                    header.unknown_slots.push((kind, body.to_vec()));
+                    false
                 }
-                SLOT_PASSPHRASE => return Err(Error::Malformed("duplicate passphrase slot")),
-                _ => unknown_slots.push((kind, body.to_vec())),
+            };
+            if duplicate {
+                return Err(Error::Malformed("duplicate key slot"));
             }
         }
-        let header = Self {
-            passphrase: passphrase.ok_or(Error::Malformed("no passphrase slot"))?,
-            unknown_slots,
-        };
+        if header.passphrase.is_none() && header.tpm.is_none() {
+            return Err(Error::Malformed("no passphrase or TPM slot"));
+        }
         Ok((header, file.len().saturating_sub(r.rest().len())))
+    }
+
+    /// Recover the data key from `secret`: the recovery code if it is one, otherwise the
+    /// passphrase, through the TPM if the vault is sealed to it.
+    fn unlock(
+        &self,
+        secret: &str,
+        sealer: Option<&mut dyn Sealer>,
+    ) -> Result<(SecretPage, UnlockedBy)> {
+        if let (Some(slot), Some(code)) = (&self.recovery, RecoveryCode::parse(secret))
+            && let Ok(data_key) = slot.unwrap(&code)
+        {
+            return Ok((data_key, UnlockedBy::RecoveryCode));
+        }
+        if let Some(slot) = &self.passphrase {
+            return Ok((slot.unwrap(secret)?, UnlockedBy::Passphrase));
+        }
+        let slot = self
+            .tpm
+            .as_ref()
+            .ok_or(Error::Malformed("no passphrase or TPM slot"))?;
+        let sealer = sealer.ok_or(Error::State(
+            "this vault is sealed to a TPM that purple can't reach; use the recovery code",
+        ))?;
+        Ok((slot.unwrap(secret, sealer)?, UnlockedBy::Tpm))
     }
 }
 
@@ -259,6 +524,7 @@ pub struct Vault {
     dir: PathBuf,
     data_key: SecretPage,
     header: Header,
+    unlocked_by: UnlockedBy,
     history_records: u64,
     _lock: File,
 }
@@ -300,7 +566,9 @@ impl Vault {
         let mut data_key = SecretPage::new(KEY_LEN)?;
         fill_random(data_key.as_mut_slice())?;
         let header = Header {
-            passphrase: PassphraseSlot::wrap(&data_key, passphrase, params)?,
+            passphrase: Some(PassphraseSlot::wrap(&data_key, passphrase, params)?),
+            tpm: None,
+            recovery: None,
             unknown_slots: Vec::new(),
         };
         let mut history = create_private(&dir.join(HISTORY_FILE))?;
@@ -311,6 +579,7 @@ impl Vault {
             dir: dir.to_owned(),
             data_key,
             header,
+            unlocked_by: UnlockedBy::Passphrase,
             history_records: 0,
             _lock: lock,
         };
@@ -318,19 +587,24 @@ impl Vault {
         Ok(vault)
     }
 
-    /// Unlock the vault in `dir`. Returns it with the saved snapshot.
+    /// Unlock the vault in `dir` with its passphrase or recovery code. `sealer` is the TPM,
+    /// needed if the vault is sealed to it. Returns the vault with the saved snapshot.
     ///
     /// # Errors
-    /// Fails on a wrong passphrase, a damaged or unsupported file, or if another purple
-    /// holds the directory.
-    pub fn open(dir: &Path, passphrase: &str) -> Result<(Self, Zeroizing<Vec<u8>>)> {
+    /// Fails on a wrong passphrase, if the TPM is needed but missing or refuses, on a
+    /// damaged or unsupported file, or if another purple holds the directory.
+    pub fn open(
+        dir: &Path,
+        passphrase: &str,
+        sealer: Option<&mut dyn Sealer>,
+    ) -> Result<(Self, Zeroizing<Vec<u8>>)> {
         let lock = lock_dir(dir)?;
         let file = Zeroizing::new(fs::read(dir.join(STATE_FILE))?);
         let (header, header_len) = Header::decode(&file)?;
         let (header_bytes, rest) = file
             .split_at_checked(header_len)
             .ok_or(Error::Malformed("state file too short"))?;
-        let data_key = header.passphrase.unwrap(passphrase)?;
+        let (data_key, unlocked_by) = header.unlock(passphrase, sealer)?;
         let (nonce, ciphertext) = rest
             .split_first_chunk::<NONCE_LEN>()
             .ok_or(Error::Malformed("state file too short"))?;
@@ -348,6 +622,7 @@ impl Vault {
             dir: dir.to_owned(),
             data_key,
             header,
+            unlocked_by,
             history_records: 0,
             _lock: lock,
         };
@@ -359,29 +634,114 @@ impl Vault {
         Ok((vault, Zeroizing::new(snapshot)))
     }
 
-    /// Replace the passphrase. `old` must be the current one. Only the passphrase slot
-    /// changes: the data key, and so the history, stay as they are. `snapshot` is saved
-    /// with the new header.
+    /// Replace the passphrase. `old` must be the current one, or the recovery code. With
+    /// the recovery code, a TPM slot is dropped for a plain passphrase slot, since the TPM
+    /// may be what was lost. Only key slots change: the data key, and so the history, stay
+    /// as they are. `snapshot` is saved with the new header.
     ///
     /// # Errors
-    /// Fails if `old` is wrong, `new` is too short, or saving fails. The vault is unchanged
-    /// on failure.
+    /// Fails if `old` is wrong, `new` is too short, the TPM is needed but missing or
+    /// refuses, or saving fails. The vault is unchanged on failure.
     pub fn change_passphrase(
         &mut self,
         old: &str,
         new: &str,
         params: KdfParams,
         snapshot: &[u8],
+        sealer: Option<&mut dyn Sealer>,
     ) -> Result<()> {
         check_passphrase(new)?;
-        self.header.passphrase.unwrap(old)?;
-        let slot = PassphraseSlot::wrap(&self.data_key, new, params)?;
-        let previous = std::mem::replace(&mut self.header.passphrase, slot);
+        let recovered = match (&self.header.recovery, RecoveryCode::parse(old)) {
+            (Some(slot), Some(code)) => slot.unwrap(&code).is_ok(),
+            _ => false,
+        };
+        if recovered {
+            let passphrase = PassphraseSlot::wrap(&self.data_key, new, params)?;
+            let recovery = self.header.recovery.clone();
+            return self.replace_slots(Some(passphrase), None, recovery, snapshot);
+        }
+        if let Some(slot) = &self.header.passphrase {
+            slot.unwrap(old)?;
+            let passphrase = PassphraseSlot::wrap(&self.data_key, new, params)?;
+            let (tpm, recovery) = (self.header.tpm.clone(), self.header.recovery.clone());
+            return self.replace_slots(Some(passphrase), tpm, recovery, snapshot);
+        }
+        let slot = self
+            .header
+            .tpm
+            .as_ref()
+            .ok_or(Error::Malformed("no passphrase or TPM slot"))?;
+        let sealer = sealer.ok_or(Error::State(
+            "changing the passphrase needs the TPM, which purple can't reach",
+        ))?;
+        slot.unwrap(old, &mut *sealer)?;
+        let tpm = TpmSlot::wrap(&self.data_key, new, params, sealer)?;
+        let recovery = self.header.recovery.clone();
+        self.replace_slots(None, Some(tpm), recovery, snapshot)
+    }
+
+    /// Seal the vault to the TPM: the passphrase slot gives way to a TPM slot under the same
+    /// passphrase and a recovery slot. Returns the recovery code, to be shown once.
+    ///
+    /// # Errors
+    /// Fails if the vault is already sealed, `passphrase` is wrong, the TPM refuses, or
+    /// saving fails. The vault is unchanged on failure.
+    pub fn enroll_tpm(
+        &mut self,
+        passphrase: &str,
+        params: KdfParams,
+        snapshot: &[u8],
+        sealer: &mut dyn Sealer,
+    ) -> Result<RecoveryCode> {
+        let slot = self
+            .header
+            .passphrase
+            .as_ref()
+            .ok_or(Error::State("this vault is already sealed to the TPM"))?;
+        slot.unwrap(passphrase)?;
+        let tpm = TpmSlot::wrap(&self.data_key, passphrase, params, sealer)?;
+        // Make sure the TPM gives the secret back before the passphrase slot goes.
+        tpm.unwrap(passphrase, sealer)?;
+        let code = RecoveryCode::generate()?;
+        let recovery = RecoverySlot::wrap(&self.data_key, &code)?;
+        self.replace_slots(None, Some(tpm), Some(recovery), snapshot)?;
+        Ok(code)
+    }
+
+    /// Put these slots in the header and save. On failure the old slots come back.
+    fn replace_slots(
+        &mut self,
+        passphrase: Option<PassphraseSlot>,
+        tpm: Option<TpmSlot>,
+        recovery: Option<RecoverySlot>,
+        snapshot: &[u8],
+    ) -> Result<()> {
+        let previous = (
+            std::mem::replace(&mut self.header.passphrase, passphrase),
+            std::mem::replace(&mut self.header.tpm, tpm),
+            std::mem::replace(&mut self.header.recovery, recovery),
+        );
         if let Err(err) = self.save(snapshot) {
-            self.header.passphrase = previous;
+            (
+                self.header.passphrase,
+                self.header.tpm,
+                self.header.recovery,
+            ) = previous;
             return Err(err);
         }
         Ok(())
+    }
+
+    /// How the vault was unlocked.
+    #[must_use]
+    pub const fn unlocked_by(&self) -> UnlockedBy {
+        self.unlocked_by
+    }
+
+    /// Whether the vault is sealed to the TPM.
+    #[must_use]
+    pub const fn sealed_to_tpm(&self) -> bool {
+        self.header.tpm.is_some()
     }
 
     /// How the data key is protected in memory.
@@ -564,9 +924,115 @@ fn derive_kek(passphrase: &str, salt: &[u8], params: KdfParams) -> Result<Secret
     Ok(kek)
 }
 
-fn key_cipher(kek: &SecretPage) -> Result<XChaCha20Poly1305> {
-    XChaCha20Poly1305::new_from_slice(kek.as_slice())
+fn key_cipher(kek: &[u8]) -> Result<XChaCha20Poly1305> {
+    XChaCha20Poly1305::new_from_slice(kek)
         .map_err(|_| Error::Malformed("invalid key-encryption key"))
+}
+
+/// Wrap `data_key` under `kek` with a fresh nonce, bound to `aad`.
+fn wrap_key(
+    kek: &[u8],
+    data_key: &SecretPage,
+    aad: &[u8],
+) -> Result<([u8; NONCE_LEN], [u8; WRAPPED_LEN])> {
+    let mut nonce = [0u8; NONCE_LEN];
+    fill_random(&mut nonce)?;
+    let wrapped = key_cipher(kek)?
+        .encrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: data_key.as_slice(),
+                aad,
+            },
+        )
+        .map_err(|_| Error::Malformed("wrapping the data key failed"))?;
+    let wrapped = wrapped
+        .try_into()
+        .map_err(|_| Error::Malformed("wrapped key has the wrong length"))?;
+    Ok((nonce, wrapped))
+}
+
+/// Recover a data key wrapped by [`wrap_key`]. `wrong` is the error when it doesn't open.
+fn unwrap_key(
+    kek: &[u8],
+    nonce: &[u8; NONCE_LEN],
+    wrapped: &[u8; WRAPPED_LEN],
+    aad: &[u8],
+    wrong: &'static str,
+) -> Result<SecretPage> {
+    let plaintext = Zeroizing::new(
+        key_cipher(kek)?
+            .decrypt(&XNonce::from(*nonce), Payload { msg: wrapped, aad })
+            .map_err(|_| Error::State(wrong))?,
+    );
+    let mut data_key = SecretPage::new(KEY_LEN)?;
+    data_key.as_mut_slice().copy_from_slice(
+        plaintext
+            .get(..KEY_LEN)
+            .ok_or(Error::Malformed("short data key"))?,
+    );
+    Ok(data_key)
+}
+
+/// A slot's AAD: the file format, the slot kind, then `fields`, the last of which may vary
+/// in length.
+fn slot_aad(kind: u8, fields: &[&[u8]]) -> Vec<u8> {
+    let mut aad = Vec::new();
+    aad.extend_from_slice(STATE_MAGIC);
+    aad.extend_from_slice(&[STATE_VERSION, kind]);
+    for field in fields {
+        aad.extend_from_slice(field);
+    }
+    aad
+}
+
+fn encode_params(params: KdfParams) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    for (chunk, value) in
+        out.chunks_exact_mut(4)
+            .zip([params.memory_kib, params.iterations, params.parallelism])
+    {
+        chunk.copy_from_slice(&value.to_be_bytes());
+    }
+    out
+}
+
+fn decode_params(r: &mut Reader<'_>) -> Result<KdfParams> {
+    Ok(KdfParams {
+        memory_kib: r.u32()?,
+        iterations: r.u32()?,
+        parallelism: r.u32()?,
+    })
+}
+
+/// The TPM object's password, from the stretched passphrase.
+fn tpm_auth(stretched: &SecretPage) -> Result<Zeroizing<[u8; SECRET_LEN]>> {
+    let mut auth = Zeroizing::new([0u8; SECRET_LEN]);
+    Hkdf::<Sha256>::new(None, stretched.as_slice())
+        .expand(b"purple vault tpm auth v1", auth.as_mut_slice())
+        .map_err(|_| Error::Malformed("HKDF output length invalid"))?;
+    Ok(auth)
+}
+
+/// The TPM slot's key-encryption key: needs both the stretched passphrase and the secret
+/// the TPM keeps.
+fn tpm_kek(stretched: &SecretPage, secret: &[u8; SECRET_LEN]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(KEY_LEN + SECRET_LEN));
+    ikm.extend_from_slice(stretched.as_slice());
+    ikm.extend_from_slice(secret);
+    let mut kek = Zeroizing::new([0u8; KEY_LEN]);
+    Hkdf::<Sha256>::new(None, &ikm)
+        .expand(b"purple vault tpm kek v1", kek.as_mut_slice())
+        .map_err(|_| Error::Malformed("HKDF output length invalid"))?;
+    Ok(kek)
+}
+
+fn recovery_kek(code: &RecoveryCode, salt: &[u8; SALT_LEN]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    let mut kek = Zeroizing::new([0u8; KEY_LEN]);
+    Hkdf::<Sha256>::new(Some(salt), code.0.as_slice())
+        .expand(b"purple vault recovery kek v1", kek.as_mut_slice())
+        .map_err(|_| Error::Malformed("HKDF output length invalid"))?;
+    Ok(kek)
 }
 
 /// A cipher keyed by HKDF from the data key, one per `label`.
@@ -644,7 +1110,7 @@ mod tests {
         vault.save(b"second").unwrap();
         drop(vault);
 
-        let (_vault, snapshot) = Vault::open(&dir, "correct horse").unwrap();
+        let (_vault, snapshot) = Vault::open(&dir, "correct horse", None).unwrap();
         assert_eq!(snapshot.as_slice(), b"second");
         let mode = fs::metadata(dir.join(STATE_FILE))
             .unwrap()
@@ -660,7 +1126,7 @@ mod tests {
         let dir = temp_dir("wrong");
         assert!(Vault::create(&dir, "short", FAST, b"x").is_err());
         drop(Vault::create(&dir, "correct horse", FAST, b"secret state").unwrap());
-        assert!(Vault::open(&dir, "wrong horse!").is_err());
+        assert!(Vault::open(&dir, "wrong horse!", None).is_err());
 
         let path = dir.join(STATE_FILE);
         let mut bytes = fs::read(&path).unwrap();
@@ -670,11 +1136,14 @@ mod tests {
         for i in [0, 9, header_len - 1, header_len, bytes.len() - 1] {
             bytes[i] ^= 1;
             fs::write(&path, &bytes).unwrap();
-            assert!(Vault::open(&dir, "correct horse").is_err(), "byte {i}");
+            assert!(
+                Vault::open(&dir, "correct horse", None).is_err(),
+                "byte {i}"
+            );
             bytes[i] ^= 1;
         }
         fs::write(&path, &bytes).unwrap();
-        assert!(Vault::open(&dir, "correct horse").is_ok());
+        assert!(Vault::open(&dir, "correct horse", None).is_ok());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -691,7 +1160,7 @@ mod tests {
     fn only_one_instance_per_directory() {
         let dir = temp_dir("lock");
         let _held = Vault::create(&dir, "correct horse", FAST, b"x").unwrap();
-        assert!(Vault::open(&dir, "correct horse").is_err());
+        assert!(Vault::open(&dir, "correct horse", None).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -709,7 +1178,7 @@ mod tests {
         file.write_all(&[0, 0, 0, 200, 1, 2, 3]).unwrap();
         drop(file);
 
-        let (mut reopened, _) = Vault::open(&dir, "correct horse").unwrap();
+        let (mut reopened, _) = Vault::open(&dir, "correct horse", None).unwrap();
         assert_eq!(
             reopened.history().unwrap(),
             [entry("alice", "one"), entry("bob", "two")]
@@ -727,13 +1196,13 @@ mod tests {
         let history_before = fs::read(dir.join(HISTORY_FILE)).unwrap();
 
         vault
-            .change_passphrase("correct horse", "battery staple", FAST, b"state 2")
+            .change_passphrase("correct horse", "battery staple", FAST, b"state 2", None)
             .unwrap();
         drop(vault);
 
         assert_eq!(fs::read(dir.join(HISTORY_FILE)).unwrap(), history_before);
-        assert!(Vault::open(&dir, "correct horse").is_err());
-        let (reopened, snapshot) = Vault::open(&dir, "battery staple").unwrap();
+        assert!(Vault::open(&dir, "correct horse", None).is_err());
+        let (reopened, snapshot) = Vault::open(&dir, "battery staple", None).unwrap();
         assert_eq!(snapshot.as_slice(), b"state 2");
         assert_eq!(reopened.history().unwrap(), [entry("alice", "kept")]);
         fs::remove_dir_all(&dir).ok();
@@ -745,17 +1214,17 @@ mod tests {
         let mut vault = Vault::create(&dir, "correct horse", FAST, b"state").unwrap();
         assert!(
             vault
-                .change_passphrase("wrong horse!", "battery staple", FAST, b"x")
+                .change_passphrase("wrong horse!", "battery staple", FAST, b"x", None)
                 .is_err()
         );
         assert!(
             vault
-                .change_passphrase("correct horse", "short", FAST, b"x")
+                .change_passphrase("correct horse", "short", FAST, b"x", None)
                 .is_err()
         );
         vault.save(b"still works").unwrap();
         drop(vault);
-        let (_vault, snapshot) = Vault::open(&dir, "correct horse").unwrap();
+        let (_vault, snapshot) = Vault::open(&dir, "correct horse", None).unwrap();
         assert_eq!(snapshot.as_slice(), b"still works");
         fs::remove_dir_all(&dir).ok();
     }
@@ -767,7 +1236,7 @@ mod tests {
         vault.header.unknown_slots.push((9, vec![1, 2, 3]));
         vault.save(b"y").unwrap();
         drop(vault);
-        let (reopened, snapshot) = Vault::open(&dir, "correct horse").unwrap();
+        let (reopened, snapshot) = Vault::open(&dir, "correct horse", None).unwrap();
         assert_eq!(snapshot.as_slice(), b"y");
         assert_eq!(reopened.header.unknown_slots, [(9, vec![1, 2, 3])]);
         fs::remove_dir_all(&dir).ok();
@@ -780,7 +1249,7 @@ mod tests {
         old.push(1);
         old.extend_from_slice(&[0; 64]);
         fs::write(dir.join(STATE_FILE), old).unwrap();
-        let err = Vault::open(&dir, "correct horse").unwrap_err();
+        let err = Vault::open(&dir, "correct horse", None).unwrap_err();
         assert!(err.to_string().contains("format 1"), "{err}");
         fs::remove_dir_all(&dir).ok();
     }
@@ -802,5 +1271,210 @@ mod tests {
         .unwrap();
         assert!(vault.history().is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A TPM stand-in: keeps secrets in memory and locks out after three wrong passwords.
+    #[derive(Default)]
+    struct FakeTpm {
+        objects: Vec<([u8; SECRET_LEN], [u8; SECRET_LEN])>,
+        failures: u32,
+        refuse_seal: bool,
+    }
+
+    impl Sealer for FakeTpm {
+        fn seal(&mut self, auth: &[u8; SECRET_LEN], secret: &[u8; SECRET_LEN]) -> Result<Vec<u8>> {
+            if self.refuse_seal {
+                return Err(Error::State("TPM refused"));
+            }
+            self.objects.push((*auth, *secret));
+            Ok(self.objects.len().saturating_sub(1).to_be_bytes().to_vec())
+        }
+
+        fn unseal(
+            &mut self,
+            sealed: &[u8],
+            auth: &[u8; SECRET_LEN],
+        ) -> Result<Zeroizing<[u8; SECRET_LEN]>> {
+            if self.failures >= 3 {
+                return Err(Error::State("locked out"));
+            }
+            let index = usize::from_be_bytes(
+                sealed
+                    .try_into()
+                    .map_err(|_| Error::Malformed("not a sealed object"))?,
+            );
+            let (expected, secret) = *self
+                .objects
+                .get(index)
+                .ok_or(Error::Malformed("no such object"))?;
+            if expected != *auth {
+                self.failures = self.failures.saturating_add(1);
+                return Err(Error::State("wrong passphrase"));
+            }
+            Ok(Zeroizing::new(secret))
+        }
+    }
+
+    fn slot_kinds(dir: &Path) -> Vec<u8> {
+        let file = fs::read(dir.join(STATE_FILE)).unwrap();
+        let (header, _) = Header::decode(&file).unwrap();
+        let mut kinds = Vec::new();
+        if header.passphrase.is_some() {
+            kinds.push(SLOT_PASSPHRASE);
+        }
+        if header.tpm.is_some() {
+            kinds.push(SLOT_TPM);
+        }
+        if header.recovery.is_some() {
+            kinds.push(SLOT_RECOVERY);
+        }
+        kinds
+    }
+
+    #[test]
+    fn enrolling_the_tpm_leaves_nothing_to_attack_offline() {
+        let dir = temp_dir("tpm");
+        let mut tpm = FakeTpm::default();
+        let mut vault = Vault::create(&dir, "correct horse", FAST, b"state 1").unwrap();
+        vault.append(&entry("alice", "kept")).unwrap();
+        assert!(
+            vault
+                .enroll_tpm("wrong horse!", FAST, b"state 1", &mut tpm)
+                .is_err()
+        );
+        let code = vault
+            .enroll_tpm("correct horse", FAST, b"state 2", &mut tpm)
+            .unwrap();
+        assert!(vault.sealed_to_tpm());
+        assert_eq!(slot_kinds(&dir), [SLOT_TPM, SLOT_RECOVERY]);
+        assert!(
+            vault
+                .enroll_tpm("correct horse", FAST, b"x", &mut tpm)
+                .is_err(),
+            "already sealed"
+        );
+        drop(vault);
+
+        // The right passphrase alone no longer opens it.
+        let err = Vault::open(&dir, "correct horse", None).unwrap_err();
+        assert!(err.to_string().contains("recovery code"), "{err}");
+        let (sealed, snapshot) = Vault::open(&dir, "correct horse", Some(&mut tpm)).unwrap();
+        assert_eq!(snapshot.as_slice(), b"state 2");
+        assert_eq!(sealed.unlocked_by(), UnlockedBy::Tpm);
+        assert_eq!(sealed.history().unwrap(), [entry("alice", "kept")]);
+        drop(sealed);
+
+        // Wrong guesses go through the TPM, which counts them.
+        for _ in 0..3 {
+            assert!(Vault::open(&dir, "wrong horse!", Some(&mut tpm)).is_err());
+        }
+        let locked = Vault::open(&dir, "correct horse", Some(&mut tpm)).unwrap_err();
+        assert_eq!(locked.to_string(), "locked out");
+
+        // The recovery code still opens it, TPM or not.
+        let (recovered, recovered_snapshot) = Vault::open(&dir, &code.to_text(), None).unwrap();
+        assert_eq!(recovered_snapshot.as_slice(), b"state 2");
+        assert_eq!(recovered.unlocked_by(), UnlockedBy::RecoveryCode);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_resets_the_vault_to_a_plain_passphrase() {
+        let dir = temp_dir("recover");
+        let mut tpm = FakeTpm::default();
+        let mut vault = Vault::create(&dir, "correct horse", FAST, b"x").unwrap();
+        let code = vault
+            .enroll_tpm("correct horse", FAST, b"x", &mut tpm)
+            .unwrap();
+        drop(vault);
+
+        // The TPM is gone: unlock with the code, then pick a new passphrase.
+        let (mut recovered, _) = Vault::open(&dir, &code.to_text().to_lowercase(), None).unwrap();
+        recovered
+            .change_passphrase(&code.to_text(), "battery staple", FAST, b"y", None)
+            .unwrap();
+        assert!(!recovered.sealed_to_tpm());
+        assert_eq!(slot_kinds(&dir), [SLOT_PASSPHRASE, SLOT_RECOVERY]);
+        drop(recovered);
+        let (reopened, snapshot) = Vault::open(&dir, "battery staple", None).unwrap();
+        assert_eq!(snapshot.as_slice(), b"y");
+        assert_eq!(reopened.unlocked_by(), UnlockedBy::Passphrase);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn changing_the_passphrase_reseals_it_in_the_tpm() {
+        let dir = temp_dir("reseal");
+        let mut tpm = FakeTpm::default();
+        let mut vault = Vault::create(&dir, "correct horse", FAST, b"x").unwrap();
+        vault
+            .enroll_tpm("correct horse", FAST, b"x", &mut tpm)
+            .unwrap();
+        assert!(
+            vault
+                .change_passphrase("correct horse", "battery staple", FAST, b"x", None)
+                .is_err(),
+            "needs the TPM"
+        );
+        vault
+            .change_passphrase(
+                "correct horse",
+                "battery staple",
+                FAST,
+                b"y",
+                Some(&mut tpm),
+            )
+            .unwrap();
+        assert_eq!(slot_kinds(&dir), [SLOT_TPM, SLOT_RECOVERY]);
+        drop(vault);
+        assert!(Vault::open(&dir, "correct horse", Some(&mut tpm)).is_err());
+        let (reopened, _) = Vault::open(&dir, "battery staple", Some(&mut tpm)).unwrap();
+        assert_eq!(reopened.unlocked_by(), UnlockedBy::Tpm);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_refusing_tpm_leaves_the_vault_as_it_was() {
+        let dir = temp_dir("refuse");
+        let mut tpm = FakeTpm {
+            refuse_seal: true,
+            ..FakeTpm::default()
+        };
+        let mut vault = Vault::create(&dir, "correct horse", FAST, b"x").unwrap();
+        assert!(
+            vault
+                .enroll_tpm("correct horse", FAST, b"x", &mut tpm)
+                .is_err()
+        );
+        assert!(!vault.sealed_to_tpm());
+        assert_eq!(slot_kinds(&dir), [SLOT_PASSPHRASE]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_codes_read_back_however_they_are_typed() {
+        let code = RecoveryCode::generate().unwrap();
+        let text = code.to_text();
+        assert_eq!(text.len(), RECOVERY_CHARS + 4);
+        assert_eq!(
+            text.split('-').map(str::len).collect::<Vec<_>>(),
+            [5, 5, 5, 5, 6]
+        );
+        for typed in [
+            text.to_string(),
+            text.to_lowercase(),
+            text.replace('-', " "),
+            text.replace('-', ""),
+        ] {
+            assert_eq!(*RecoveryCode::parse(&typed).unwrap().0, *code.0, "{typed}");
+        }
+        let zeros = RecoveryCode(Zeroizing::new([0; RECOVERY_LEN]));
+        assert_eq!(*zeros.to_text(), "AAAAA-AAAAA-AAAAA-AAAAA-AAAAAA");
+        assert!(RecoveryCode::parse("correct horse battery staple").is_none());
+        let short: String = text.chars().skip(1).collect();
+        assert!(RecoveryCode::parse(&short).is_none());
+        // The last character carries two bits that must be zero.
+        assert!(RecoveryCode::parse("AAAAA-AAAAA-AAAAA-AAAAA-AAAAAB").is_none());
+        assert!(RecoveryCode::parse("AAAAA-AAAAA-AAAAA-AAAAA-AAAAAE").is_some());
     }
 }
