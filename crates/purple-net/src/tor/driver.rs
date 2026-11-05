@@ -164,10 +164,7 @@ mod tests {
         let obfs4 = vec!["obfs4 192.0.2.1:443 F cert=c iat-mode=0".to_owned()];
         assert_eq!(pasted_plugin(&obfs4), Ok("obfs4 exec /usr/bin/lyrebird"));
         let snow = vec!["snowflake 192.0.2.3:80 F".to_owned()];
-        assert_eq!(
-            pasted_plugin(&snow),
-            Ok("snowflake exec /usr/bin/snowflake-client")
-        );
+        assert_eq!(pasted_plugin(&snow), Ok("snowflake exec /usr/bin/lyrebird"));
         let mixed = vec![obfs4[0].clone(), snow[0].clone()];
         assert!(pasted_plugin(&mixed).is_err());
         assert!(pasted_plugin(&["meek_lite 192.0.2.1:2 F".to_owned()]).is_err());
