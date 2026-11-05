@@ -68,7 +68,9 @@ impl DiskStore {
         };
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();
-            let Some(id) = segment_id(&path) else { continue };
+            let Some(id) = segment_id(&path) else {
+                continue;
+            };
             store.load(id, &path)?;
         }
         store.trim(now)?;
@@ -77,7 +79,11 @@ impl DiskStore {
 
     fn load(&mut self, id: u64, path: &Path) -> io::Result<()> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
-        let whole = file.metadata()?.len().checked_div(record_len()).unwrap_or(0);
+        let whole = file
+            .metadata()?
+            .len()
+            .checked_div(record_len())
+            .unwrap_or(0);
         let len = whole.saturating_mul(record_len());
         file.set_len(len)?;
         let mut reader = io::BufReader::new(&file);
@@ -86,7 +92,8 @@ impl DiskStore {
         for n in 0..whole {
             reader.read_exact(&mut record)?;
             let (at, addr) = header(&record)?;
-            self.index.insert(addr, (id, n.saturating_mul(record_len()), at));
+            self.index
+                .insert(addr, (id, n.saturating_mul(record_len()), at));
             addrs.push(addr);
         }
         self.segments.insert(id, Segment { file, len, addrs });
@@ -156,7 +163,10 @@ impl DiskStore {
     /// Bytes of records on disk.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.segments.values().map(|s| s.len).fold(0, u64::saturating_add)
+        self.segments
+            .values()
+            .map(|s| s.len)
+            .fold(0, u64::saturating_add)
     }
 
     fn live(&self, addr: &BoxAddr, now: u64) -> Option<(u64, u64)> {
@@ -236,7 +246,10 @@ fn poisoned<T>(_: PoisonError<T>) -> io::Error {
 
 impl Boxes for SharedStore {
     fn put(&self, addr: BoxAddr, packet: Packet) -> io::Result<bool> {
-        self.0.lock().map_err(poisoned)?.put(addr, &packet, unix_now()?)
+        self.0
+            .lock()
+            .map_err(poisoned)?
+            .put(addr, &packet, unix_now()?)
     }
 
     fn get(&self, addr: &BoxAddr) -> io::Result<Option<Packet>> {
@@ -293,8 +306,14 @@ mod tests {
         s.put(BoxAddr([2; 32]), &packet(2), T0 + 2 * HOUR).unwrap();
         drop(s);
         let reopened = DiskStore::open(&d, limits(), T0 + 3 * HOUR).unwrap();
-        assert_eq!(reopened.get(&BoxAddr([1; 32]), T0 + 3 * HOUR).unwrap(), Some(packet(1)));
-        assert_eq!(reopened.get(&BoxAddr([2; 32]), T0 + 3 * HOUR).unwrap(), Some(packet(2)));
+        assert_eq!(
+            reopened.get(&BoxAddr([1; 32]), T0 + 3 * HOUR).unwrap(),
+            Some(packet(1))
+        );
+        assert_eq!(
+            reopened.get(&BoxAddr([2; 32]), T0 + 3 * HOUR).unwrap(),
+            Some(packet(2))
+        );
     }
 
     #[test]

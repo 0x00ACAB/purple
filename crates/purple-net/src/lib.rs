@@ -10,6 +10,7 @@
 //! rather than returning, and many can be in flight at once.
 
 pub mod katzenpost;
+pub mod noise;
 pub mod scheduler;
 
 use std::collections::HashMap;
@@ -371,14 +372,23 @@ impl ProviderMsg {
     }
 }
 
-/// Answer one client's `Put`/`Get` requests from `store` until it disconnects.
+/// Answer one client's `Put`/`Get` requests from `store` until it disconnects. With
+/// `writes_per_sec`, a client writing faster than that is slowed down.
 ///
 /// # Errors
 /// Fails on an I/O error or a message only the provider may send.
-pub fn serve_provider(peer: &mut (impl Read + Write), store: &BoxStore) -> io::Result<()> {
+pub fn serve_provider(
+    peer: &mut (impl Read + Write),
+    store: &impl Boxes,
+    writes_per_sec: Option<u32>,
+) -> io::Result<()> {
+    let mut bucket = writes_per_sec.map(TokenBucket::new);
     while let Some(msg) = ProviderMsg::read_from(peer)? {
         match msg {
             ProviderMsg::Put { addr, packet } => {
+                if let Some(bucket) = &mut bucket {
+                    bucket.take();
+                }
                 let reply = if store.put(addr, packet)? {
                     ProviderMsg::Stored { addr }
                 } else {
@@ -397,8 +407,44 @@ pub fn serve_provider(peer: &mut (impl Read + Write), store: &BoxStore) -> io::R
                 return Err(invalid("client sent a message only the provider may send"));
             }
         }
+        peer.flush()?;
     }
     Ok(())
+}
+
+/// Lets `rate` writes through per second, with a burst of `rate`; past that, `take` sleeps.
+#[derive(Debug)]
+struct TokenBucket {
+    rate: u32,
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate: u32) -> Self {
+        Self {
+            rate,
+            tokens: f64::from(rate),
+            last: Instant::now(),
+        }
+    }
+
+    fn take(&mut self) {
+        let now = Instant::now();
+        let rate = f64::from(self.rate);
+        self.tokens = now
+            .duration_since(self.last)
+            .as_secs_f64()
+            .mul_add(rate, self.tokens)
+            .min(rate);
+        self.last = now;
+        if self.tokens < 1.0 {
+            std::thread::sleep(Duration::from_secs_f64((1.0 - self.tokens) / rate));
+            self.tokens = 1.0;
+            self.last = Instant::now();
+        }
+        self.tokens -= 1.0;
+    }
 }
 
 /// Forwards to a `purple-devprovider` over TCP. Development only: there is no mixnet in
@@ -518,6 +564,59 @@ mod tests {
     }
 
     #[test]
+    fn provider_serves_through_noise() {
+        let (private, public) = noise::noise_keypair().unwrap();
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let store = BoxStore::default();
+        let server_store = store.clone();
+        let server = std::thread::spawn(move || {
+            let mut s = noise::NoiseStream::server(b, &private).unwrap();
+            serve_provider(&mut s, &server_store, None).unwrap();
+        });
+        let mut c = noise::NoiseStream::client(a, &public).unwrap();
+        let addr = BoxAddr([3; 32]);
+        ProviderMsg::Put {
+            addr,
+            packet: packet(1),
+        }
+        .write_to(&mut c)
+        .unwrap();
+        c.flush().unwrap();
+        assert_eq!(
+            ProviderMsg::read_from(&mut c).unwrap(),
+            Some(ProviderMsg::Stored { addr })
+        );
+        drop(c);
+        server.join().unwrap();
+        assert_eq!(store.get(&addr).unwrap(), Some(packet(1)));
+    }
+
+    #[test]
+    fn write_rate_is_limited_per_connection() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let store = BoxStore::default();
+        let server = std::thread::spawn(move || serve_provider(&mut b, &store, Some(10)));
+        let start = Instant::now();
+        for i in 0..25u8 {
+            ProviderMsg::Put {
+                addr: BoxAddr([i; 32]),
+                packet: packet(i),
+            }
+            .write_to(&mut a)
+            .unwrap();
+            ProviderMsg::read_from(&mut a).unwrap().unwrap();
+        }
+        // 10 free, then 15 more at 10/s.
+        assert!(
+            start.elapsed() >= Duration::from_millis(1400),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(a);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn cover_reads_answer_like_reads() {
         let mut net = FakeTransport::default();
         net.write(&at(6, 0), packet(4), None).unwrap();
@@ -609,7 +708,7 @@ mod tests {
         let server_store = store.clone();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            serve_provider(&mut stream, &server_store).unwrap();
+            serve_provider(&mut stream, &server_store, None).unwrap();
         });
         let mut client = DevProviderTransport::connect(&addr).unwrap();
         client.write(&at(4, 0), packet(1), None).unwrap();

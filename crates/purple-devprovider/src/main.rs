@@ -52,7 +52,7 @@ fn run() -> io::Result<()> {
         let mut stream = stream?;
         let store = store.clone();
         thread::spawn(move || {
-            if let Err(err) = serve_provider(&mut stream, &store) {
+            if let Err(err) = serve_provider(&mut stream, &store, None) {
                 eprintln!("purple-devprovider: client error: {err}");
             }
         });

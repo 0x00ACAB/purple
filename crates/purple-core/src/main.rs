@@ -1271,7 +1271,10 @@ mod tests {
                 assert_eq!(read, at(1, 0));
                 plain += 1;
             } else {
-                assert!(matches!(msg, NetMsg::ReadCover { .. }), "unexpected {msg:?}");
+                assert!(
+                    matches!(msg, NetMsg::ReadCover { .. }),
+                    "unexpected {msg:?}"
+                );
                 cover += 1;
             }
         }

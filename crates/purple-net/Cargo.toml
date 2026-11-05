@@ -14,6 +14,7 @@ purple-harden.workspace = true
 purple-ipc.workspace = true
 rand.workspace = true
 sha2.workspace = true
+snow.workspace = true
 
 [lints]
 workspace = true

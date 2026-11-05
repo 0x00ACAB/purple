@@ -300,7 +300,9 @@ impl NetMsg {
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         match bytes {
             [TAG_STATUS, kind, route, percent] => {
-                return Ok(Self::Status(NetStatus::from_bytes([*kind, *route, *percent])?));
+                return Ok(Self::Status(NetStatus::from_bytes([
+                    *kind, *route, *percent,
+                ])?));
             }
             [TAG_STATUS, ..] => return Err(invalid("status has the wrong length")),
             [TAG_CHOOSE, 0] => return Ok(Self::Choose(NetChoice::Direct)),
@@ -334,9 +336,7 @@ impl NetMsg {
                 at,
                 packet: Packet::from_slice(body)?,
             }),
-            TAG_READ | TAG_READ_COVER | TAG_EMPTY | TAG_WRITTEN | TAG_TAKEN
-                if !body.is_empty() =>
-            {
+            TAG_READ | TAG_READ_COVER | TAG_EMPTY | TAG_WRITTEN | TAG_TAKEN if !body.is_empty() => {
                 Err(invalid("trailing bytes"))
             }
             TAG_READ => Ok(Self::Read { at }),
@@ -555,10 +555,14 @@ mod tests {
                 route: Route::Snowflake,
                 percent: 45,
             }),
-            NetMsg::Status(NetStatus::Connected { route: Route::Direct }),
+            NetMsg::Status(NetStatus::Connected {
+                route: Route::Direct,
+            }),
             NetMsg::Status(NetStatus::Blocked),
             NetMsg::Choose(NetChoice::Direct),
-            NetMsg::Choose(NetChoice::Bridges("obfs4 192.0.2.1:443 AAAA cert=x iat-mode=0".into())),
+            NetMsg::Choose(NetChoice::Bridges(
+                "obfs4 192.0.2.1:443 AAAA cert=x iat-mode=0".into(),
+            )),
         ] {
             assert_eq!(NetMsg::decode(&msg.encode()).unwrap(), msg);
         }
@@ -566,12 +570,30 @@ mod tests {
 
     #[test]
     fn status_messages_reject_garbage() {
-        assert!(NetMsg::decode(&[TAG_STATUS, 9, 0, 0]).is_err(), "unknown status kind");
-        assert!(NetMsg::decode(&[TAG_STATUS, 0, 99, 0]).is_err(), "unknown route");
-        assert!(NetMsg::decode(&[TAG_STATUS, 0, 0, 101]).is_err(), "percent over 100");
-        assert!(NetMsg::decode(&[TAG_STATUS, 2, 0, 0, 1]).is_err(), "trailing bytes");
-        assert!(NetMsg::decode(&[TAG_CHOOSE, 0, 1]).is_err(), "direct takes no body");
-        assert!(NetMsg::decode(&[TAG_CHOOSE, 1, 0xff]).is_err(), "bridges must be UTF-8");
+        assert!(
+            NetMsg::decode(&[TAG_STATUS, 9, 0, 0]).is_err(),
+            "unknown status kind"
+        );
+        assert!(
+            NetMsg::decode(&[TAG_STATUS, 0, 99, 0]).is_err(),
+            "unknown route"
+        );
+        assert!(
+            NetMsg::decode(&[TAG_STATUS, 0, 0, 101]).is_err(),
+            "percent over 100"
+        );
+        assert!(
+            NetMsg::decode(&[TAG_STATUS, 2, 0, 0, 1]).is_err(),
+            "trailing bytes"
+        );
+        assert!(
+            NetMsg::decode(&[TAG_CHOOSE, 0, 1]).is_err(),
+            "direct takes no body"
+        );
+        assert!(
+            NetMsg::decode(&[TAG_CHOOSE, 1, 0xff]).is_err(),
+            "bridges must be UTF-8"
+        );
         let long = NetMsg::Choose(NetChoice::Bridges("a".repeat(MAX_BRIDGE_TEXT + 1)));
         assert!(long.write_to(&mut Vec::new()).is_err());
     }
