@@ -23,19 +23,39 @@ pub(crate) const KP_CONFIG: &str = "/etc/purple/kpclientd.toml";
 /// The TPM resource manager, the one device `purple-core` gets (same as
 /// `purple_core::tpm::TPM_DEVICE`).
 const TPM_DEVICE: &str = "/dev/tpmrm0";
-/// Fds bwrap reads `kpclientd`'s seccomp filters from.
-pub(crate) const KP_SECCOMP_FDS: [RawFd; 2] = [10, 11];
+/// Where tor's socket directory is mounted, in its sandbox and in `purple-net`'s.
+pub(crate) const TOR_SOCKET_DIR: &str = "/run/tor";
+/// tor's SOCKS socket.
+pub(crate) const TOR_SOCKS: &str = "/run/tor/socks.sock";
+/// tor's control socket.
+pub(crate) const TOR_CONTROL: &str = "/run/tor/control.sock";
+/// The cookie file for tor's control socket.
+pub(crate) const TOR_COOKIE: &str = "/run/tor/control.cookie";
+/// Where tor keeps its state inside its sandbox.
+pub(crate) const TOR_DATA_DIR: &str = "/var/lib/tor";
+/// Where tor's torrc is mounted.
+pub(crate) const TOR_RC: &str = "/etc/purple/torrc";
+/// The tor binary, from the system package.
+const TOR_BINARY: &str = "/usr/bin/tor";
+/// Where purple-relay's socket directory is mounted, in its sandbox and in `purple-net`'s.
+pub(crate) const RELAY_SOCKET_DIR: &str = "/run/relay";
+/// purple-relay's socket.
+pub(crate) const RELAY_SOCKET: &str = "/run/relay/relay.sock";
+/// Fds bwrap reads the seccomp filters for daemons purple can't modify (kpclientd, tor)
+/// from.
+pub(crate) const DAEMON_SECCOMP_FDS: [RawFd; 2] = [10, 11];
 
 const MAX_PASSED_FDS: usize = 4;
 
 /// What one purple process is allowed to reach.
 #[derive(Debug)]
 pub(crate) enum Profile {
-    /// Network access plus its own state directory, and `kpclientd`'s socket directory
-    /// (read-only) when that transport is in use.
+    /// Its own state directory, and the socket directories (read-only, host path and where
+    /// it's mounted) of the daemons that do its networking. With none, it gets network
+    /// access itself.
     Net {
         state_dir: PathBuf,
-        kp_socket_dir: Option<PathBuf>,
+        sockets: Vec<(PathBuf, &'static str)>,
     },
     /// Its own data directory. No network, no display.
     Core { data_dir: PathBuf },
@@ -44,12 +64,23 @@ pub(crate) enum Profile {
     Ui { wayland_display: OsString },
     /// Katzenpost's client daemon: network access, its config read-only, and the directory
     /// it creates its socket in. purple can't modify it, so bwrap installs purple's seccomp
-    /// filters on it (from [`KP_SECCOMP_FDS`]).
+    /// filters on it (from [`DAEMON_SECCOMP_FDS`]).
     KpClientd {
         binary: PathBuf,
         config: PathBuf,
         socket_dir: PathBuf,
     },
+    /// C tor: network access, its data directory (kept across runs so its guards stay the
+    /// same), the directory it makes its sockets in, its torrc read-only, and purple's
+    /// seccomp filters from [`DAEMON_SECCOMP_FDS`]. Pluggable transports run as its children
+    /// from /usr/bin and need DNS and CA certificates.
+    Tor {
+        data_dir: PathBuf,
+        socket_dir: PathBuf,
+        torrc: PathBuf,
+    },
+    /// purple-relay: network access and the directory it makes its socket in.
+    Relay { socket_dir: PathBuf },
 }
 
 impl Profile {
@@ -59,6 +90,8 @@ impl Profile {
             Self::Core { .. } => "purple-core",
             Self::Ui { .. } => "purple-ui",
             Self::KpClientd { .. } => "kpclientd",
+            Self::Tor { .. } => "tor",
+            Self::Relay { .. } => "purple-relay",
         }
     }
 
@@ -66,7 +99,8 @@ impl Profile {
     fn exec_path(&self) -> PathBuf {
         match self {
             Self::KpClientd { .. } => PathBuf::from(KP_BINARY),
-            Self::Net { .. } | Self::Core { .. } | Self::Ui { .. } => {
+            Self::Tor { .. } => PathBuf::from(TOR_BINARY),
+            Self::Net { .. } | Self::Core { .. } | Self::Ui { .. } | Self::Relay { .. } => {
                 Path::new(APP_DIR).join(self.binary())
             }
         }
@@ -124,33 +158,14 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
     out.extend(["--ro-bind".into(), bin_dir.into(), APP_DIR.into()]);
 
     match profile {
-        Profile::Net {
-            state_dir,
-            kp_socket_dir,
-        } => {
-            if let Some(dir) = kp_socket_dir {
-                // kpclientd does the networking; purple-net gets only its socket and no
-                // network namespace of its own.
-                out.extend(["--ro-bind".into(), dir.into(), KP_SOCKET_DIR.into()]);
-            } else {
-                out.extend(
-                    [
-                        "--share-net",
-                        "--ro-bind-try",
-                        "/etc/resolv.conf",
-                        "/etc/resolv.conf",
-                    ]
-                    .map(OsString::from),
-                );
-                out.extend(["--ro-bind-try", "/etc/ssl", "/etc/ssl"].map(OsString::from));
-                out.extend(
-                    [
-                        "--ro-bind-try",
-                        "/etc/ca-certificates",
-                        "/etc/ca-certificates",
-                    ]
-                    .map(OsString::from),
-                );
+        Profile::Net { state_dir, sockets } => {
+            if sockets.is_empty() {
+                share_net(&mut out);
+            }
+            // Otherwise the daemons do the networking; purple-net gets only their sockets
+            // and no network namespace of its own.
+            for (dir, inside) in sockets {
+                out.extend(["--ro-bind".into(), dir.into(), (*inside).into()]);
             }
             out.extend(["--bind".into(), state_dir.into(), NET_STATE_DIR.into()]);
         }
@@ -179,15 +194,40 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
             out.extend(["--ro-bind".into(), binary.into(), KP_BINARY.into()]);
             out.extend(["--ro-bind".into(), config.into(), KP_CONFIG.into()]);
             out.extend(["--bind".into(), socket_dir.into(), KP_SOCKET_DIR.into()]);
-            for fd in KP_SECCOMP_FDS {
+            for fd in DAEMON_SECCOMP_FDS {
                 out.extend(["--add-seccomp-fd".into(), fd.to_string().into()]);
             }
+        }
+        Profile::Tor {
+            data_dir,
+            socket_dir,
+            torrc,
+        } => {
+            share_net(&mut out);
+            out.extend(["--bind".into(), data_dir.into(), TOR_DATA_DIR.into()]);
+            out.extend(["--bind".into(), socket_dir.into(), TOR_SOCKET_DIR.into()]);
+            out.extend(["--ro-bind".into(), torrc.into(), TOR_RC.into()]);
+            for fd in DAEMON_SECCOMP_FDS {
+                out.extend(["--add-seccomp-fd".into(), fd.to_string().into()]);
+            }
+        }
+        Profile::Relay { socket_dir } => {
+            out.push("--share-net".into());
+            out.extend(["--bind".into(), socket_dir.into(), RELAY_SOCKET_DIR.into()]);
         }
     }
 
     out.extend(["--chdir".into(), "/".into(), profile.exec_path().into()]);
     out.extend(args.iter().map(OsString::from));
     out
+}
+
+/// The host's network, with DNS and CA certificates.
+fn share_net(out: &mut Vec<OsString>) {
+    out.push("--share-net".into());
+    for path in ["/etc/resolv.conf", "/etc/ssl", "/etc/ca-certificates"] {
+        out.extend(["--ro-bind-try", path, path].map(OsString::from));
+    }
 }
 
 /// Build the command for `profile`, sandboxed with bwrap or, when `sandboxed` is false,
@@ -287,7 +327,7 @@ mod tests {
         let with = bwrap_args(
             &Profile::Net {
                 state_dir: "/s".into(),
-                kp_socket_dir: Some("/run/user/1000/purple/kp".into()),
+                sockets: vec![("/run/user/1000/purple/kp".into(), KP_SOCKET_DIR)],
             },
             Path::new("/b"),
             &[],
@@ -303,7 +343,7 @@ mod tests {
         let without = bwrap_args(
             &Profile::Net {
                 state_dir: "/s".into(),
-                kp_socket_dir: None,
+                sockets: vec![],
             },
             Path::new("/b"),
             &[],
@@ -324,7 +364,7 @@ mod tests {
         let profiles = [
             Profile::Net {
                 state_dir: "/s".into(),
-                kp_socket_dir: None,
+                sockets: vec![],
             },
             Profile::Core {
                 data_dir: "/d".into(),
@@ -333,6 +373,10 @@ mod tests {
                 wayland_display: "wayland-1".into(),
             },
             kpclientd(),
+            tor(),
+            Profile::Relay {
+                socket_dir: "/r".into(),
+            },
         ];
         for profile in &profiles {
             let args = bwrap_args(profile, Path::new("/b"), &[]);
@@ -354,7 +398,7 @@ mod tests {
         let profiles = [
             Profile::Net {
                 state_dir: "/s".into(),
-                kp_socket_dir: None,
+                sockets: vec![],
             },
             Profile::Core {
                 data_dir: "/d".into(),
@@ -363,6 +407,10 @@ mod tests {
                 wayland_display: "wayland-1".into(),
             },
             kpclientd(),
+            tor(),
+            Profile::Relay {
+                socket_dir: "/r".into(),
+            },
         ];
         for profile in &profiles {
             let args = bwrap_args(profile, Path::new("/bin-dir"), &[]);
@@ -377,12 +425,66 @@ mod tests {
         }
     }
 
+    fn tor() -> Profile {
+        Profile::Tor {
+            data_dir: "/st/tor".into(),
+            socket_dir: "/run/user/1000/purple/tor-1".into(),
+            torrc: "/run/user/1000/purple/tor-1.rc".into(),
+        }
+    }
+
+    #[test]
+    fn tor_gets_network_its_dirs_its_torrc_and_purples_seccomp() {
+        let args = bwrap_args(&tor(), Path::new("/b"), &["-f", TOR_RC]);
+        assert!(has(&args, "--share-net"));
+        assert!(has(&args, "/st/tor") && has(&args, TOR_DATA_DIR));
+        assert!(has(&args, "/run/user/1000/purple/tor-1") && has(&args, TOR_SOCKET_DIR));
+        assert!(has(&args, TOR_RC));
+        assert_eq!(args.iter().filter(|a| *a == "--add-seccomp-fd").count(), 2);
+        assert_eq!(args[args.len() - 3], "/usr/bin/tor");
+    }
+
+    #[test]
+    fn net_in_tor_mode_has_sockets_but_no_network() {
+        let net = bwrap_args(
+            &Profile::Net {
+                state_dir: "/s".into(),
+                sockets: vec![
+                    ("/t".into(), TOR_SOCKET_DIR),
+                    ("/r".into(), RELAY_SOCKET_DIR),
+                ],
+            },
+            Path::new("/b"),
+            &[],
+        );
+        assert!(!has(&net, "--share-net"));
+        for (host, inside) in [("/t", TOR_SOCKET_DIR), ("/r", RELAY_SOCKET_DIR)] {
+            let at = net.iter().position(|a| a == host).unwrap();
+            assert_eq!(net[at - 1], "--ro-bind");
+            assert_eq!(net[at + 1], inside);
+        }
+    }
+
+    #[test]
+    fn relay_gets_network_and_its_socket_dir_only() {
+        let relay = bwrap_args(
+            &Profile::Relay {
+                socket_dir: "/r".into(),
+            },
+            Path::new("/b"),
+            &[],
+        );
+        assert!(has(&relay, "--share-net"));
+        assert!(has(&relay, RELAY_SOCKET_DIR));
+        assert!(!has(&relay, TOR_SOCKET_DIR));
+    }
+
     #[test]
     fn only_net_gets_the_network() {
         let net = bwrap_args(
             &Profile::Net {
                 state_dir: "/s".into(),
-                kp_socket_dir: None,
+                sockets: vec![],
             },
             Path::new("/b"),
             &[],
@@ -404,6 +506,19 @@ mod tests {
         assert!(has(&net, "--share-net"));
         assert!(!has(&core, "--share-net"));
         assert!(!has(&ui, "--share-net"));
+        // The daemons that do the networking for purple-net get it too.
+        for daemon in [
+            tor(),
+            Profile::Relay {
+                socket_dir: "/r".into(),
+            },
+            kpclientd(),
+        ] {
+            assert!(has(
+                &bwrap_args(&daemon, Path::new("/b"), &[]),
+                "--share-net"
+            ));
+        }
     }
 
     #[test]

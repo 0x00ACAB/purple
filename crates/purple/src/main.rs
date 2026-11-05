@@ -1,15 +1,25 @@
 //! purple launcher: starts `purple-net`, `purple-core` and `purple-ui`, each in its own
 //! bubblewrap sandbox, connected only by the sockets passed in here.
 //!
-//! Usage: `purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>]
-//! [--kpclientd <binary> --kp-config <file>]`. `--no-ui` runs the self-test instead of the
-//! TUI. `--dev-provider` points `purple-net` at a local `purple-devprovider`.
-//! `--send-interval-ms` sets the mean gap between packets in the cover stream (default
-//! 1000; the self-test uses 50 unless told otherwise). `--kpclientd` and `--kp-config` also
-//! run Katzenpost's client daemon in a fifth sandbox, with its socket shared read-only with
-//! `purple-net`, which then stores boxes on Pigeonhole and has no network of its own.
+//! Usage: `purple [--no-ui] [--store-config <file>] [--dev-provider <addr>]
+//! [--send-interval-ms <ms>] [--kpclientd <binary> --kp-config <file>]`. `--no-ui` runs the
+//! self-test instead of the TUI.
+//!
+//! The TUI uses the box store named in the store config (`--store-config`, by default
+//! `$XDG_CONFIG_HOME/purple/store.conf`), reached through C tor in its own sandbox, and,
+//! if the config has a direct port and the user asks for it, through purple-relay. The
+//! self-test uses an in-memory network unless given a store config. `--dev-provider` points
+//! `purple-net` at a local `purple-devprovider`. `--send-interval-ms` sets the mean gap
+//! between packets in the cover stream (default 500 over Tor, 1000 otherwise; the self-test
+//! uses 50 unless told otherwise). `--kpclientd` and `--kp-config` run Katzenpost's client
+//! daemon instead of tor, with its socket shared read-only with `purple-net`, which then
+//! stores boxes on Pigeonhole.
 
 mod sandbox;
+mod store_config;
+mod torrc;
+
+use store_config::{StoreConfig, parse_store_config};
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -26,13 +36,18 @@ use purple_harden::sandbox::{Network, seccomp_programs};
 use purple_ipc::{CORE_NET_FD, CORE_UI_FD, NET_CORE_FD, UI_CORE_FD};
 use sandbox::Profile;
 
-const USAGE: &str = "usage: purple [--no-ui] [--dev-provider <addr>] [--send-interval-ms <ms>] \
-                     [--kpclientd <binary> --kp-config <file>]";
+const USAGE: &str = "usage: purple [--no-ui] [--store-config <file>] [--dev-provider <addr>] \
+                     [--send-interval-ms <ms>] [--kpclientd <binary> --kp-config <file>]";
 /// kpclientd's socket, in the directory the launcher makes for it.
 const KP_SOCKET_NAME: &str = "kpclientd.sock";
-/// How long kpclientd may take to open its socket, and how often to look.
-const KP_SOCKET_WAIT: Duration = Duration::from_secs(30);
-const KP_SOCKET_POLL: Duration = Duration::from_millis(50);
+/// tor's SOCKS socket and purple-relay's socket, in the directories made for them.
+const TOR_SOCKS_NAME: &str = "socks.sock";
+const RELAY_SOCKET_NAME: &str = "relay.sock";
+/// How long a daemon may take to open its socket, and how often to look.
+const SOCKET_WAIT: Duration = Duration::from_secs(30);
+const SOCKET_POLL: Duration = Duration::from_millis(50);
+/// Mean send gap over Tor: 2 packets a second.
+const TOR_SEND_INTERVAL_MS: &str = "500";
 /// Mean send gap for the self-test, so it finishes in seconds.
 const SELF_TEST_SEND_INTERVAL_MS: &str = "50";
 
@@ -54,6 +69,20 @@ struct Options {
     send_interval_ms: Option<String>,
     kpclientd: Option<PathBuf>,
     kp_config: Option<PathBuf>,
+    store_config: Option<PathBuf>,
+}
+
+/// Where boxes go.
+#[derive(Debug)]
+enum Mode {
+    /// An in-memory network only this run can see (the self-test).
+    Memory,
+    /// A local `purple-devprovider`.
+    Dev(String),
+    /// Pigeonhole, through kpclientd.
+    Katzenpost(KpSetup),
+    /// purple's own store, through tor.
+    Tor(StoreConfig),
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
@@ -74,6 +103,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
             }
             "--kp-config" => {
                 options.kp_config =
+                    Some(args.next().ok_or_else(|| io::Error::other(USAGE))?.into());
+            }
+            "--store-config" => {
+                options.store_config =
                     Some(args.next().ok_or_else(|| io::Error::other(USAGE))?.into());
             }
             _ => return Err(io::Error::other(USAGE)),
@@ -109,12 +142,14 @@ fn run() -> io::Result<bool> {
         );
     }
 
-    if options.dev_provider.is_some() && options.kpclientd.is_some() {
-        return Err(io::Error::other(
-            "--dev-provider and --kpclientd don't go together",
-        ));
-    }
-    let kp = prepare_kpclientd(options.kpclientd, options.kp_config, sandboxed)?;
+    let mode = choose_mode(
+        options.dev_provider,
+        options.kpclientd,
+        options.kp_config,
+        options.store_config,
+        options.no_ui,
+        sandboxed,
+    )?;
 
     let state_root = private_dir(&xdg_dir("XDG_STATE_HOME", ".local/state")?.join("purple"))?;
     let state_dir = private_dir(&state_root.join("net"))?;
@@ -124,42 +159,33 @@ fn run() -> io::Result<bool> {
         Some(_) => Some(open_log(&state_root.join("purple.log"))?),
         None => None,
     };
+    let background = Background(log.as_ref());
 
-    let net_args = net_args(
-        options.dev_provider.as_deref(),
-        kp.is_some(),
-        options.send_interval_ms.as_deref(),
-        options.no_ui,
-    );
-
-    let kp_socket_dir = kp.as_ref().map(|(_, _, socket_dir)| socket_dir.clone());
-    let kp_child = match &kp {
-        Some((binary, config, socket_dir)) => {
-            let mut child = spawn_kpclientd(
-                binary,
-                config,
-                socket_dir,
-                bin_dir,
-                Background(log.as_ref()),
-            )?;
-            wait_for_socket(&socket_dir.join(KP_SOCKET_NAME), &mut child.1)?;
-            Some(child)
+    let net_owned = net_args(&mode, options.send_interval_ms.as_deref(), options.no_ui);
+    let mut daemons = Daemons::default();
+    let sockets = match &mode {
+        Mode::Katzenpost((binary, config, socket_dir)) => {
+            daemons.dirs.push(socket_dir.clone());
+            let mut child = spawn_kpclientd(binary, config, socket_dir, bin_dir, background)?;
+            let waited = wait_for_socket(&socket_dir.join(KP_SOCKET_NAME), &mut child);
+            daemons.children.push(child);
+            waited?;
+            vec![(socket_dir.clone(), sandbox::KP_SOCKET_DIR)]
         }
-        None => None,
+        Mode::Tor(config) => start_tor(config, &state_root, bin_dir, background, &mut daemons)?,
+        Mode::Memory | Mode::Dev(_) => Vec::new(),
     };
 
     let mut children = Vec::new();
     let (core_net, net_core) = UnixStream::pair()?;
+    let net_strs: Vec<&str> = net_owned.iter().map(String::as_str).collect();
     children.push(spawn(
-        &Profile::Net {
-            state_dir,
-            kp_socket_dir: kp.map(|(_, _, socket_dir)| socket_dir),
-        },
+        &Profile::Net { state_dir, sockets },
         bin_dir,
         sandboxed,
-        &net_args,
+        &net_strs,
         &[(net_core.as_raw_fd(), NET_CORE_FD)],
-        Background(log.as_ref()),
+        background,
     )?);
 
     children.extend(spawn_core_and_ui(
@@ -167,9 +193,7 @@ fn run() -> io::Result<bool> {
         data_dir,
         bin_dir,
         sandboxed,
-        // kpclientd sends cover traffic of its own, so padding reads would only waste its
-        // bandwidth.
-        kp_socket_dir.is_none(),
+        &mode,
         &core_net,
         log.as_ref(),
     )?);
@@ -185,25 +209,148 @@ fn run() -> io::Result<bool> {
             all_ok = false;
         }
     }
-    // kpclientd doesn't exit on its own. Killing its bwrap tears down the whole sandbox.
-    if let Some((_, mut child)) = kp_child {
-        child.kill().ok();
-        child.wait()?;
-    }
-    if let Some(dir) = kp_socket_dir {
-        fs::remove_dir_all(dir)?;
-    }
+    daemons.stop()?;
     Ok(all_ok)
 }
 
+/// Daemons that don't exit on their own (kpclientd, tor, purple-relay), and the
+/// directories and files made for them.
+#[derive(Default)]
+struct Daemons {
+    children: Vec<(String, Child)>,
+    dirs: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+}
+
+impl Daemons {
+    /// Kill each daemon (killing its bwrap tears down the whole sandbox) and remove what
+    /// was made for it.
+    fn stop(self) -> io::Result<()> {
+        for (_, mut child) in self.children {
+            child.kill().ok();
+            child.wait()?;
+        }
+        for dir in self.dirs {
+            fs::remove_dir_all(dir)?;
+        }
+        for file in self.files {
+            fs::remove_file(file)?;
+        }
+        Ok(())
+    }
+}
+
+/// Pick where boxes go from the flags. The TUI defaults to the store config.
+fn choose_mode(
+    dev_provider: Option<String>,
+    kpclientd: Option<PathBuf>,
+    kp_config: Option<PathBuf>,
+    store_config: Option<PathBuf>,
+    no_ui: bool,
+    sandboxed: bool,
+) -> io::Result<Mode> {
+    let chosen = [
+        dev_provider.is_some(),
+        kpclientd.is_some() || kp_config.is_some(),
+        store_config.is_some(),
+    ];
+    if chosen.iter().filter(|&&c| c).count() > 1 {
+        return Err(io::Error::other(
+            "--dev-provider, --kpclientd and --store-config don't go together",
+        ));
+    }
+    if let Some(addr) = dev_provider {
+        return Ok(Mode::Dev(addr));
+    }
+    if let Some(kp) = prepare_kpclientd(kpclientd, kp_config, sandboxed)? {
+        return Ok(Mode::Katzenpost(kp));
+    }
+    let path = match store_config {
+        Some(path) => path,
+        None if no_ui => return Ok(Mode::Memory),
+        None => xdg_dir("XDG_CONFIG_HOME", ".config")?.join("purple/store.conf"),
+    };
+    if !sandboxed {
+        return Err(io::Error::other(
+            "purple won't run tor without bubblewrap around it",
+        ));
+    }
+    let text = match fs::read_to_string(&path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::other(format!(
+                "no store configured: put the store's onion address in {} (see the design doc)",
+                path.display()
+            )));
+        }
+        other => other?,
+    };
+    parse_store_config(&text).map(Mode::Tor)
+}
+
+/// Start tor, and purple-relay if the store has a direct port, and return the socket
+/// directories purple-net needs. tor bootstraps in the background; purple-net's driver
+/// watches it.
+fn start_tor(
+    config: &StoreConfig,
+    state_root: &Path,
+    bin_dir: &Path,
+    background: Background<'_>,
+    daemons: &mut Daemons,
+) -> io::Result<Vec<(PathBuf, &'static str)>> {
+    let parent = private_dir(&runtime_dir()?.join("purple"))?;
+    let pid = std::process::id();
+    let torrc_path = parent.join(format!("tor-{pid}.rc"));
+    let mut torrc_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&torrc_path)?;
+    daemons.files.push(torrc_path.clone());
+    torrc_file.write_all(torrc::torrc().as_bytes())?;
+    let tor_dir = fresh_private_dir(&parent.join(format!("tor-{pid}")))?;
+    daemons.dirs.push(tor_dir.clone());
+    let profile = Profile::Tor {
+        data_dir: private_dir(&state_root.join("tor"))?,
+        socket_dir: tor_dir.clone(),
+        torrc: torrc_path,
+    };
+    let mut tor = spawn_daemon(&profile, bin_dir, &["-f", sandbox::TOR_RC], background)?;
+    let waited = wait_for_socket(&tor_dir.join(TOR_SOCKS_NAME), &mut tor);
+    daemons.children.push(tor);
+    waited?;
+    let mut sockets = vec![(tor_dir, sandbox::TOR_SOCKET_DIR)];
+    if let Some((addr, _)) = config.direct {
+        let relay_dir = fresh_private_dir(&parent.join(format!("relay-{pid}")))?;
+        daemons.dirs.push(relay_dir.clone());
+        let addr = addr.to_string();
+        let mut relay = spawn(
+            &Profile::Relay {
+                socket_dir: relay_dir.clone(),
+            },
+            bin_dir,
+            true,
+            &["--listen", sandbox::RELAY_SOCKET, "--connect", &addr],
+            &[],
+            background,
+        )?;
+        let relay_up = wait_for_socket(&relay_dir.join(RELAY_SOCKET_NAME), &mut relay);
+        daemons.children.push(relay);
+        relay_up?;
+        sockets.push((relay_dir, sandbox::RELAY_SOCKET_DIR));
+    }
+    Ok(sockets)
+}
+
 /// Start `purple-core`, and `purple-ui` when there's a display. With no display, core runs
-/// its self-test. `read_padding` says whether core pads its polls.
+/// its self-test. Core is told which store it uses, and pads its polls except over
+/// Katzenpost, which sends cover traffic of its own.
 fn spawn_core_and_ui(
     wayland_display: Option<OsString>,
     data_dir: PathBuf,
     bin_dir: &Path,
     sandboxed: bool,
-    read_padding: bool,
+    mode: &Mode,
     core_net: &UnixStream,
     log: Option<&File>,
 ) -> io::Result<Vec<(String, Child)>> {
@@ -234,8 +381,12 @@ fn spawn_core_and_ui(
                     .ok_or_else(|| io::Error::other("data directory path is not UTF-8"))?
                     .to_owned()
             };
-            let mut core_args = vec!["--data-dir", &data_arg];
-            if !read_padding {
+            let mut core_args = vec!["--data-dir", data_arg.as_str()];
+            let store = core_store_arg(mode);
+            if let Some(store) = &store {
+                core_args.extend(["--store", store.as_str()]);
+            }
+            if matches!(mode, Mode::Katzenpost(_)) {
                 core_args.push("--no-read-padding");
             }
             out.push(spawn(
@@ -290,35 +441,90 @@ fn fresh_private_dir(dir: &Path) -> io::Result<PathBuf> {
     Ok(dir.to_path_buf())
 }
 
-/// Wait until kpclientd has made its socket, so `purple-net` can connect at once.
-fn wait_for_socket(path: &Path, kpclientd: &mut Child) -> io::Result<()> {
+/// Wait until a daemon has made its socket, so `purple-net` can connect at once.
+fn wait_for_socket(path: &Path, (name, daemon): &mut (String, Child)) -> io::Result<()> {
     let start = Instant::now();
     while !path.exists() {
-        if let Some(status) = kpclientd.try_wait()? {
-            return Err(io::Error::other(format!("kpclientd exited with {status}")));
+        if let Some(status) = daemon.try_wait()? {
+            return Err(io::Error::other(format!("{name} exited with {status}")));
         }
-        if start.elapsed() >= KP_SOCKET_WAIT {
-            return Err(io::Error::other("kpclientd didn't open its socket in time"));
+        if start.elapsed() >= SOCKET_WAIT {
+            return Err(io::Error::other(format!(
+                "{name} didn't open its socket in time"
+            )));
         }
-        thread::sleep(KP_SOCKET_POLL);
+        thread::sleep(SOCKET_POLL);
     }
     Ok(())
 }
 
-/// Arguments for `purple-net`. With `katzenpost`, it reaches kpclientd's socket where
-/// its sandbox mounts it.
-fn net_args<'a>(
-    dev_provider: Option<&'a str>,
-    katzenpost: bool,
-    send_interval_ms: Option<&'a str>,
-    no_ui: bool,
-) -> Vec<&'a str> {
-    let mut args = Vec::new();
-    if let Some(addr) = dev_provider {
-        args.extend(["--dev-provider", addr]);
+/// What core's `--store` says: which store its invites name. The self-test's in-memory
+/// network passes nothing.
+fn core_store_arg(mode: &Mode) -> Option<String> {
+    match mode {
+        Mode::Memory => None,
+        Mode::Dev(_) => Some("dev".to_owned()),
+        Mode::Katzenpost(_) => Some("namenlos".to_owned()),
+        Mode::Tor(config) => Some(format!("tor:{}", config.onion)),
     }
-    if katzenpost {
-        args.extend(["--katzenpost", sandbox::KP_SOCKET]);
+}
+
+/// `purple-net`'s Tor flags, with tor's and purple-relay's sockets where its sandbox
+/// mounts them. Two packets a second unless told otherwise.
+fn tor_net_args(config: &StoreConfig, send_interval_ms: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--tor",
+        sandbox::TOR_SOCKS,
+        "--tor-control",
+        sandbox::TOR_CONTROL,
+        "--tor-cookie",
+        sandbox::TOR_COOKIE,
+        "--onion",
+    ]
+    .map(str::to_owned)
+    .into();
+    args.push(format!("{}:{}", config.onion, config.port));
+    if let Some((_, key)) = config.direct {
+        args.extend([
+            "--direct-relay".to_owned(),
+            sandbox::RELAY_SOCKET.to_owned(),
+            "--direct-key".to_owned(),
+            hex(&key),
+        ]);
+    }
+    args.extend([
+        "--send-interval-ms".to_owned(),
+        send_interval_ms.unwrap_or(TOR_SEND_INTERVAL_MS).to_owned(),
+    ]);
+    args
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        // Writing to a String can't fail.
+        write!(out, "{b:02x}").ok();
+        out
+    })
+}
+
+/// Arguments for `purple-net`.
+fn net_args(mode: &Mode, send_interval_ms: Option<&str>, no_ui: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    match mode {
+        Mode::Tor(config) => {
+            let fallback = if no_ui {
+                SELF_TEST_SEND_INTERVAL_MS
+            } else {
+                TOR_SEND_INTERVAL_MS
+            };
+            return tor_net_args(config, Some(send_interval_ms.unwrap_or(fallback)));
+        }
+        Mode::Dev(addr) => args.extend(["--dev-provider".to_owned(), addr.clone()]),
+        Mode::Katzenpost(_) => {
+            args.extend(["--katzenpost".to_owned(), sandbox::KP_SOCKET.to_owned()]);
+        }
+        Mode::Memory => {}
     }
     let send_interval = match (send_interval_ms, no_ui) {
         (Some(ms), _) => Some(ms),
@@ -326,13 +532,12 @@ fn net_args<'a>(
         (None, false) => None,
     };
     if let Some(ms) = send_interval {
-        args.extend(["--send-interval-ms", ms]);
+        args.extend(["--send-interval-ms".to_owned(), ms.to_owned()]);
     }
     args
 }
 
-/// Run Katzenpost's client daemon sandboxed, with purple's seccomp filters installed by
-/// bwrap from pipes.
+/// Run Katzenpost's client daemon sandboxed.
 fn spawn_kpclientd(
     binary: &Path,
     config: &Path,
@@ -345,7 +550,18 @@ fn spawn_kpclientd(
         config: config.to_owned(),
         socket_dir: socket_dir.to_owned(),
     };
-    let mut cmd = sandbox::command(&profile, bin_dir, true, &["-c", sandbox::KP_CONFIG]);
+    spawn_daemon(&profile, bin_dir, &["-c", sandbox::KP_CONFIG], background)
+}
+
+/// Run a daemon purple can't modify (kpclientd, tor) under bwrap, with purple's seccomp
+/// filters installed by bwrap from pipes.
+fn spawn_daemon(
+    profile: &Profile,
+    bin_dir: &Path,
+    args: &[&str],
+    background: Background<'_>,
+) -> io::Result<(String, Child)> {
+    let mut cmd = sandbox::command(profile, bin_dir, true, args);
     let mut readers = Vec::new();
     for program in seccomp_programs(Network::Allowed)? {
         let (reader, mut writer) = io::pipe()?;
@@ -355,7 +571,7 @@ fn spawn_kpclientd(
     let fds: Vec<(RawFd, RawFd)> = readers
         .iter()
         .map(AsRawFd::as_raw_fd)
-        .zip(sandbox::KP_SECCOMP_FDS)
+        .zip(sandbox::DAEMON_SECCOMP_FDS)
         .collect();
     sandbox::pass_fds(&mut cmd, &fds)?;
     cmd.stdin(Stdio::null());
@@ -486,6 +702,33 @@ mod tests {
             std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&dir).unwrap().permissions());
         assert_eq!(mode & 0o777, 0o700);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tor_mode_args() {
+        let config = StoreConfig {
+            onion: "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz2345.onion".into(),
+            port: 80,
+            direct: Some(("192.0.2.10:4443".parse().unwrap(), [0x0f; 32])),
+        };
+        let args = tor_net_args(&config, None);
+        let joined = args.join(" ");
+        assert!(joined.contains("--tor /run/tor/socks.sock"));
+        assert!(
+            joined.contains(
+                "--onion abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz2345.onion:80"
+            )
+        );
+        assert!(joined.contains("--direct-relay /run/relay/relay.sock"));
+        assert!(joined.contains(&format!("--direct-key {}", "0f".repeat(32))));
+        assert!(
+            joined.contains("--send-interval-ms 500"),
+            "2 packets a second"
+        );
+        assert_eq!(
+            core_store_arg(&Mode::Tor(config.clone())),
+            Some(format!("tor:{}", config.onion))
+        );
     }
 
     #[test]
