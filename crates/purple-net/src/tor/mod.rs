@@ -4,3 +4,4 @@
 pub mod control;
 pub mod fallback;
 pub mod socks;
+pub mod transport;

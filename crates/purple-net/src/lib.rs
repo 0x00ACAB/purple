@@ -510,12 +510,12 @@ impl DevProviderTransport {
 }
 
 /// Hand a finished read to `done`. If nobody listens any more, the read is moot.
-fn report(done: &Sink, at: &BoxRef, packet: io::Result<Option<Packet>>) {
+pub(crate) fn report(done: &Sink, at: &BoxRef, packet: io::Result<Option<Packet>>) {
     done.send(Done::Read(ReadDone { at: *at, packet })).ok();
 }
 
 /// Tell `done`, if given, how the write to box `at` went.
-fn report_write(done: Option<&Sink>, at: &BoxRef, stored: bool) {
+pub(crate) fn report_write(done: Option<&Sink>, at: &BoxRef, stored: bool) {
     if let Some(done) = done {
         let report = if stored {
             Done::Written(*at)
