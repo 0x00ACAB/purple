@@ -192,8 +192,8 @@ mod tests {
             !a.iter().any(|act| matches!(act, Action::UseBridges(_))),
             "progress keeps the route"
         );
-        let a = f.progress(100, t0 + Duration::from_secs(101));
-        assert_eq!(reports(&a), [NetStatus::Connected { route: Route::Tor }]);
+        let done = f.progress(100, t0 + Duration::from_secs(101));
+        assert_eq!(reports(&done), [NetStatus::Connected { route: Route::Tor }]);
     }
 
     #[test]
@@ -226,8 +226,8 @@ mod tests {
             a.iter()
                 .any(|act| matches!(act, Action::UseBridges(Route::Snowflake)))
         );
-        let a = f.progress(0, t0 + STALL * 2);
-        assert_eq!(reports(&a), [NetStatus::Blocked]);
+        let blocked = f.progress(0, t0 + STALL * 2);
+        assert_eq!(reports(&blocked), [NetStatus::Blocked]);
     }
 
     #[test]
@@ -289,8 +289,8 @@ mod tests {
                 percent: 0
             }]
         );
-        let a = f.progress(0, t0 + STALL * 3);
-        assert_eq!(reports(&a), [NetStatus::Blocked]);
+        let blocked = f.progress(0, t0 + STALL * 3);
+        assert_eq!(reports(&blocked), [NetStatus::Blocked]);
     }
 
     #[test]
