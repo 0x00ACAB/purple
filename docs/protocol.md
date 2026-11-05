@@ -303,8 +303,8 @@ as one message (Section 6) to the bundle queue starting at box 0:
 ```
 
 Field lengths in the bundle are 16-bit, unlike Section 4.1. The identity key is not in
-the bundle; the accepter takes it from the invite. Registration ID and device ID are
-fixed at 1, since a per-install value would identify the sender inside PreKey messages.
+the bundle; the accepter takes it from the invite. The bundle's registration ID and
+device ID are both 1 (see Section 8.1 for why every client uses these values).
 
 The accepter MUST rebuild the bundle with the invite's identity key and let libsignal
 verify both signatures before starting a session. A store that swaps in its own bundle
@@ -325,6 +325,11 @@ first outgoing message is a PreKey message. The accepter then:
 The inviter reads the intro queue, decrypts the PreKey message (which completes PQXDH and
 consumes the one-time prekeys) and takes the two secrets from the Hello. Both sides then
 forget the invite queues.
+
+libsignal puts the sender's registration ID in the clear inside a PreKey message. Every
+client MUST use registration ID 1 and device ID 1 for itself, both in the bundles it
+publishes as inviter and in the PreKey messages it sends as accepter, since a per-install
+value would let anyone who reads the intro queue recognise the accepter.
 
 The Hello MUST be the first content on the intro queue. Any other content there is an
 error, and a Hello received anywhere else MUST be rejected.
@@ -380,7 +385,7 @@ Groups use MLS [RFC9420] with:
 - the ratchet tree extension in Welcome messages,
 - pure ciphertext wire format: every handshake and application message is a
   PrivateMessage,
-- two past epochs kept for decrypting late application messages,
+- two past epochs whose application messages still decrypt (MLS `max_past_epochs`),
 - at most 50 members.
 
 MLS messages are TLS-serialized `MLSMessage` structures.
@@ -412,8 +417,11 @@ All group messages (application messages and commits) are fragmented into this s
 When an epoch changes, every member starts the new epoch's stream at box 0. Members keep
 reading the previous streams so messages sent just before a commit still arrive. A
 client SHOULD drop an old stream once its next box has read as empty for 600 seconds and
-none of the client's own writes to it are still unconfirmed. It keeps the current stream
-and at most two old ones, plus any older one that still holds its own unconfirmed writes.
+none of the client's own writes to it are still unconfirmed. When it enters a new epoch,
+it keeps the current stream and the two previous epochs' streams (matching the two past
+epochs MLS can still decrypt, Section 9.1), and drops older ones unless they still hold
+its own unconfirmed writes. So the usual bound is three streams, but a stream with writes
+in flight is kept past it until they settle.
 
 Several members can write to the same box. Section 13.3 covers how writers resolve that.
 
@@ -517,7 +525,11 @@ replies; purple sends up to 16.
   can be written again. When the store is over its size cap (default 50 GB) it deletes
   its oldest boxes first.
 - The store SHOULD rate-limit writes per connection. purple-store allows 10 a second with
-  a burst of 10, and delays rather than refuses writes past that.
+  a burst of 10, and delays rather than refuses writes past that. Only Puts count. A
+  client that pipelines more than 10 Puts at once (Section 11.1 allows 16) sees the
+  replies past the tenth slow down, and the Gets behind them wait too, since replies come
+  in order. purple clients write about 2 packets a second in total, spread over many
+  connections, so in practice they stay under the limit.
 - The store SHOULD close a connection that has sent nothing for 5 minutes.
 
 purple-store keeps boxes in one append-only segment file per hour, each record being the
@@ -587,6 +599,12 @@ the client writes its oldest queued real packet or, with nothing queued, a cover
 1536 random bytes to the address of a random (seed, index). A sealed real packet and a
 cover packet look the same to everyone but the recipient.
 
+A cover packet lands on a real stream's box only if a random 256-bit address matches one
+in use, which can be ignored in practice. If it did happen first, the reader would fail to
+open the cover packet and move past it (Section 13.2), and the real writer would get Taken
+(Section 13.3). On a group stream the writer reseals into the next free box. On a 1:1
+stream the writer reports the message as lost.
+
 On Pigeonhole the Katzenpost client daemon sends its own decoy traffic, so purple writes
 no cover packets there.
 
@@ -596,8 +614,8 @@ until it lands. A cover write is tried once.
 ### 13.2. Reading
 
 Every 2 seconds the client asks for the next box of every stream it reads. While a stream
-holds an incomplete message, it also asks for up to 16 boxes past the next one that it
-doesn't already hold. This round is padded with reads of random addresses up to a
+holds an incomplete message, it also reads ahead: it asks for boxes next+1 through
+next+16 that it doesn't already hold, and never further. This round is padded with reads of random addresses up to a
 multiple of 16 and shuffled, so the store sees how many reads a client makes only to the
 nearest 16. The client keeps at most 256 reads in flight.
 
@@ -608,13 +626,17 @@ circuits at unrelated times.
 When a box turns up, the client reads the boxes it now wants straight away, without
 waiting for the next poll and without padding.
 
-A read that gets no answer is tried twice and then counts as Empty; the box is asked for
-again next poll.
+A read that gets no answer is tried twice and then counts as Empty.
+
+An Empty reply MUST NOT advance the stream: the client asks for the same box again next
+poll. Section 13.3 depends on this, since a resealed or rewritten packet may land in a
+box after a reader has already found it empty.
 
 A receiver handles box `i` of a stream only when it is that stream's next box, holding
-boxes read ahead until their turn. A box that fails to open or parse still advances the
-stream, so one bad box can't block it. A box more than 16 past the next one MUST be
-rejected.
+boxes read ahead until their turn. A box that holds a packet which fails to open or parse
+still advances the stream, so one bad box can't block it. A receiver accepts boxes from
+next through next+16 and MUST reject anything beyond, which is exactly the read-ahead
+window, so a client never rejects its own read-ahead.
 
 ### 13.3. Taken boxes
 
@@ -744,7 +766,7 @@ This document has no IANA actions.
 | Stream seed length | 32 bytes |
 | Invite, max | 130 bytes / 267 characters |
 | Group members, max | 50 |
-| Past MLS epochs kept | 2 |
+| Past MLS epochs kept (see note) | 2 |
 | Old epoch stream drain time | 600 s |
 | Write rate over Tor, mean | 2 packets/s |
 | Poll interval | 2 s |
@@ -759,3 +781,7 @@ This document has no IANA actions.
 | Store size cap, default | 50 GB |
 | Route stall timeout | 1 min |
 | Store connection timeout | 2 min |
+
+Note: two past epochs is how far back MLS still decrypts, and also how many old epoch
+streams a client normally keeps. A client keeps an older stream beyond that while its own
+writes to it are unconfirmed (Section 9.3), so it isn't a hard bound on streams.
