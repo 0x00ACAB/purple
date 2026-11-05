@@ -3,16 +3,18 @@
 //! A slow circuit only holds up its own stream. Cover writes and padding reads go over a random
 //! existing connection, so they never build circuits of their own.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use purple_ipc::{BoxRef, Packet};
+use rand::Rng as _;
 use rand::seq::IteratorRandom as _;
 
 use super::socks::{COVER_ISOLATION, isolation_key, socks_connect};
@@ -26,6 +28,8 @@ const READ_ATTEMPTS: u32 = 2;
 /// Most requests sent on one connection before reading their answers. Keeps what's
 /// written ahead (about 25 KB of puts) well inside socket buffers.
 const MAX_BATCH: usize = 16;
+/// Reads spread over this window: purple-core's poll interval.
+const READ_JITTER: Duration = Duration::from_secs(2);
 /// How long one connection may sit on a connect, read or write. Building a circuit to an
 /// onion service can take tens of seconds; minutes means it's gone.
 pub const CONN_TIMEOUT: Duration = Duration::from_mins(2);
@@ -205,13 +209,17 @@ pub struct TorTransport {
     workers: HashMap<String, Sender<Job>>,
     retry_first: Duration,
     retry_max: Duration,
+    /// Each read waits a random time below this before it goes to its connection.
+    read_jitter: Duration,
+    /// The timer thread holding delayed reads, started with the first one.
+    timer: Option<Sender<Delayed>>,
 }
 
 impl TorTransport {
     /// Reach the store through `dialer`.
     #[must_use]
     pub fn new(dialer: Dialer) -> Self {
-        Self::with_retry(dialer, RETRY_FIRST, RETRY_MAX)
+        Self::with_retry(dialer, RETRY_FIRST, RETRY_MAX).with_read_jitter(READ_JITTER)
     }
 
     /// The same, retrying failed writes after `first`, doubling up to `max`.
@@ -222,7 +230,18 @@ impl TorTransport {
             workers: HashMap::new(),
             retry_first: first,
             retry_max: max,
+            read_jitter: Duration::ZERO,
+            timer: None,
         }
+    }
+
+    /// Delay each read by its own random time in `[0, window)`, so a client's reads (which
+    /// core asks for together, every poll) reach the store on their circuits at unrelated
+    /// times and can't be grouped as one person's by when they arrive.
+    #[must_use]
+    pub const fn with_read_jitter(mut self, window: Duration) -> Self {
+        self.read_jitter = window;
+        self
     }
 
     fn send(&mut self, key: String, job: Job) -> io::Result<()> {
@@ -236,9 +255,25 @@ impl TorTransport {
             thread::spawn(move || work(&key, &dialer, retry, &rx));
             tx
         });
-        worker
-            .send(job)
-            .map_err(|_| io::Error::other("a store connection thread died"))
+        let died = || io::Error::other("a store connection thread died");
+        let window = u64::try_from(self.read_jitter.as_nanos()).unwrap_or(u64::MAX);
+        if !matches!(job, Job::Read { .. }) || window == 0 {
+            return worker.send(job).map_err(|_| died());
+        }
+        let delay = Duration::from_nanos(rand::rng().random_range(0..window));
+        let delayed = Delayed {
+            due: Instant::now()
+                .checked_add(delay)
+                .unwrap_or_else(Instant::now),
+            to: worker.clone(),
+            job,
+        };
+        let timer = self.timer.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || run_timer(&rx));
+            tx
+        });
+        timer.send(delayed).map_err(|_| died())
     }
 
     /// A random existing connection's key, or the cover circuit's if there are none.
@@ -300,10 +335,56 @@ impl Transport for TorTransport {
     }
 }
 
+/// A read waiting for its moment.
+struct Delayed {
+    due: Instant,
+    to: Sender<Job>,
+    job: Job,
+}
+
+/// Hand each delayed read to its connection when it's due. When the transport is dropped,
+/// whatever is still waiting goes out at once.
+fn run_timer(delayed: &Receiver<Delayed>) {
+    let mut queue: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
+    let mut waiting: HashMap<u64, (Sender<Job>, Job)> = HashMap::new();
+    let mut next_id: u64 = 0;
+    loop {
+        while let Some(&Reverse((due, id))) = queue.peek() {
+            if due > Instant::now() {
+                break;
+            }
+            queue.pop();
+            if let Some((to, job)) = waiting.remove(&id) {
+                to.send(job).ok();
+            }
+        }
+        let arrived = match queue.peek() {
+            Some(&Reverse((due, _))) => {
+                delayed.recv_timeout(due.saturating_duration_since(Instant::now()))
+            }
+            None => delayed.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match arrived {
+            Ok(Delayed { due, to, job }) => {
+                queue.push(Reverse((due, next_id)));
+                waiting.insert(next_id, (to, job));
+                next_id = next_id.wrapping_add(1);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                for (to, job) in waiting.into_values() {
+                    to.send(job).ok();
+                }
+                return;
+            }
+        }
+    }
+}
+
 /// One connection's thread. It sends every job waiting (up to [`MAX_BATCH`]) before reading
 /// the answers, which come back in order, so one round trip through the circuit carries
 /// many requests. Jobs without an answer are retried after a backoff, reconnecting first.
-fn work(key: &str, dialer: &Dialer, retry: Retry, jobs: &mpsc::Receiver<Job>) {
+fn work(key: &str, dialer: &Dialer, retry: Retry, jobs: &Receiver<Job>) {
     let mut conn = None;
     let mut retrying: Vec<Job> = Vec::new();
     let mut wait = retry.first;
@@ -392,20 +473,19 @@ mod tests {
         slow: Mutex<Option<String>>,
         dialed: Mutex<Vec<String>>,
         dials: AtomicUsize,
+        /// When each dial happened.
+        dial_times: Mutex<Vec<Instant>>,
         /// One-way delay on every byte, like a circuit's.
         latency: Option<Duration>,
     }
 
     /// Copy `from` to `to`, delivering each chunk `delay` after it was read.
     fn delayed_copy(mut from: UnixStream, mut to: UnixStream, delay: Duration) {
-        let (tx, rx) = mpsc::channel::<(std::time::Instant, Vec<u8>)>();
+        let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n @ 1..) = from.read(&mut buf) {
-                if tx
-                    .send((std::time::Instant::now(), buf[..n].to_vec()))
-                    .is_err()
-                {
+                if tx.send((Instant::now(), buf[..n].to_vec())).is_err() {
                     return;
                 }
             }
@@ -423,6 +503,10 @@ mod tests {
     impl Dial for MemDial {
         fn dial(&self, isolation: &str) -> io::Result<Box<dyn Conn>> {
             self.dials.fetch_add(1, Ordering::SeqCst);
+            self.dial_times
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Instant::now());
             self.dialed
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -485,7 +569,7 @@ mod tests {
         Packet::from_slice(&[byte; PACKET_LEN]).unwrap()
     }
 
-    fn next(rx: &mpsc::Receiver<Done>) -> Done {
+    fn next(rx: &Receiver<Done>) -> Done {
         rx.recv_timeout(Duration::from_secs(5)).unwrap()
     }
 
@@ -600,7 +684,7 @@ mod tests {
         });
         let mut t = net(&dial);
         let (tx, rx) = mpsc::channel();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for i in 0..20 {
             t.read(&at(1, i), &tx).unwrap();
         }
@@ -613,6 +697,30 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn reads_leave_at_independent_random_times() {
+        let dial = Arc::new(MemDial::default());
+        let mut t = net(&dial).with_read_jitter(Duration::from_millis(400));
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        for stream in 0..10 {
+            t.read(&at(stream, 0), &tx).unwrap();
+        }
+        for _ in 0..10 {
+            next(&rx);
+        }
+        let times = dial.dial_times.lock().unwrap().clone();
+        let first = times.iter().min().unwrap().duration_since(start);
+        let last = times.iter().max().unwrap().duration_since(start);
+        // Ten reads asked for at once reach ten circuits spread over the window, so the
+        // store can't group them by when they arrive.
+        assert!(
+            last.saturating_sub(first) >= Duration::from_millis(100),
+            "{first:?}..{last:?}"
+        );
+        assert!(last < Duration::from_secs(1), "{last:?}");
     }
 
     #[test]
@@ -637,7 +745,7 @@ mod tests {
             port: 80,
             timeout: Duration::from_millis(100),
         };
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         assert!(dial.dial("k").is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
         drop(hold);
