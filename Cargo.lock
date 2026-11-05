@@ -2963,7 +2963,6 @@ dependencies = [
 name = "purple-torctl"
 version = "0.1.0"
 dependencies = [
- "landlock",
  "purple-harden",
  "purple-ipc",
 ]

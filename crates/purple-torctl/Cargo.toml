@@ -8,7 +8,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-landlock.workspace = true
 purple-harden.workspace = true
 purple-ipc.workspace = true
 
