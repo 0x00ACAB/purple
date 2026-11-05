@@ -687,7 +687,11 @@ impl Reads {
     }
 
     fn send(&mut self, net: &mut impl Write, at: BoxRef, purpose: Purpose) -> io::Result<()> {
-        NetMsg::Read { at }.write_to(net)?;
+        if purpose.real || purpose.check {
+            NetMsg::Read { at }.write_to(net)?;
+        } else {
+            NetMsg::ReadCover { at }.write_to(net)?;
+        }
         self.in_flight.insert(at, purpose);
         Ok(())
     }
@@ -1141,13 +1145,12 @@ mod tests {
         let mut bytes = out.as_slice();
         let reads = std::iter::from_fn(|| NetMsg::read_from(&mut bytes).unwrap())
             .map(|msg| match msg {
-                NetMsg::Read { at } => at,
+                NetMsg::Read { at } | NetMsg::ReadCover { at } => at,
                 other @ (NetMsg::Write { .. }
                 | NetMsg::Found { .. }
                 | NetMsg::Empty { .. }
                 | NetMsg::Written { .. }
                 | NetMsg::Taken { .. }
-                | NetMsg::ReadCover { .. }
                 | NetMsg::Status(_)
                 | NetMsg::Choose(_)) => {
                     panic!("not a read: {other:?}")
@@ -1254,6 +1257,25 @@ mod tests {
             }
         }
         assert!(reads.in_flight.is_empty());
+    }
+
+    #[test]
+    fn padding_reads_go_out_as_cover_reads() {
+        let mut reads = Reads::new(true);
+        let mut wire = Vec::new();
+        reads.poll(&mut wire, &[at(1, 0)]).unwrap();
+        let mut r = &wire[..];
+        let (mut plain, mut cover) = (0, 0);
+        while let Some(msg) = NetMsg::read_from(&mut r).unwrap() {
+            if let NetMsg::Read { at: read } = msg {
+                assert_eq!(read, at(1, 0));
+                plain += 1;
+            } else {
+                assert!(matches!(msg, NetMsg::ReadCover { .. }), "unexpected {msg:?}");
+                cover += 1;
+            }
+        }
+        assert_eq!((plain, cover), (1, POLL_ROUND - 1));
     }
 
     #[test]

@@ -138,8 +138,9 @@ fn serve(mut core: UnixStream, mut scheduler: Scheduler<impl Transport>) -> io::
             .saturating_duration_since(Instant::now());
         match events.recv_timeout(wait) {
             Ok(Event::Core(Ok(NetMsg::Write { at, packet }))) => scheduler.enqueue(at, packet),
-            Ok(Event::Core(Ok(NetMsg::Read { at } | NetMsg::ReadCover { at }))) => {
-                scheduler.read(&at, &done_sink)?;
+            Ok(Event::Core(Ok(NetMsg::Read { at }))) => scheduler.read(&at, &done_sink)?,
+            Ok(Event::Core(Ok(NetMsg::ReadCover { at }))) => {
+                scheduler.read_cover(&at, &done_sink)?;
             }
             Ok(Event::Core(Ok(
                 NetMsg::Found { .. }

@@ -63,6 +63,15 @@ pub trait Transport {
     /// Fails if the network can't be reached.
     fn read(&mut self, at: &BoxRef, done: &Sink) -> io::Result<()>;
 
+    /// Read box `at` for padding: nobody wants what it holds, so a transport with several
+    /// connections may use any of them. The answer goes to `done` like a read's.
+    ///
+    /// # Errors
+    /// Fails if the network can't be reached.
+    fn read_cover(&mut self, at: &BoxRef, done: &Sink) -> io::Result<()> {
+        self.read(at, done)
+    }
+
     /// Fill one slot of the cover stream with no real packet to send. The default writes
     /// random bytes to a random box, which looks like a sealed real packet.
     ///
@@ -480,6 +489,21 @@ mod tests {
             stream: StreamSeed([seed; SEED_LEN]),
             index,
         }
+    }
+
+    #[test]
+    fn cover_reads_answer_like_reads() {
+        let mut net = FakeTransport::default();
+        net.write(&at(6, 0), packet(4), None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        net.read_cover(&at(6, 0), &tx).unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Done::Read(ReadDone {
+                packet: Ok(Some(_)),
+                ..
+            }))
+        ));
     }
 
     #[test]

@@ -96,6 +96,14 @@ impl<T: Transport> Scheduler<T> {
         self.transport.read(at, done)
     }
 
+    /// Start a padding read; see [`Transport::read_cover`].
+    ///
+    /// # Errors
+    /// Fails if the transport fails.
+    pub fn read_cover(&mut self, at: &BoxRef, done: &Sink) -> io::Result<()> {
+        self.transport.read_cover(at, done)
+    }
+
     /// Let the transport finish writes still in flight.
     ///
     /// # Errors
