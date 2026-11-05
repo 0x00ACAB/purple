@@ -21,6 +21,11 @@ pub(crate) const NO_TORCTL: &str = "this purple isn't choosing routes right now"
 pub(crate) struct TorRoute {
     torctl: Option<UnixStream>,
     launcher: Option<UnixStream>,
+    /// The user sent /direct and torctl hasn't answered it yet. torctl's `GoDirect` counts
+    /// only then, so torctl alone can't start the relay.
+    direct_asked: bool,
+    /// Core asked the launcher for the relay and hasn't had its answer.
+    relay_pending: bool,
 }
 
 fn notice(ui: &mut impl Write, text: &str) -> io::Result<()> {
@@ -32,7 +37,12 @@ fn notice(ui: &mut impl Write, text: &str) -> io::Result<()> {
 
 impl TorRoute {
     pub(crate) const fn new(torctl: Option<UnixStream>, launcher: Option<UnixStream>) -> Self {
-        Self { torctl, launcher }
+        Self {
+            torctl,
+            launcher,
+            direct_asked: false,
+            relay_pending: false,
+        }
     }
 
     /// Clones of the two sockets, for reader threads.
@@ -66,7 +76,7 @@ impl TorRoute {
             .as_mut()
             .map(|t| TorCtlMsg::Choose(choice).write_to(t));
         match sent {
-            Some(Ok(())) => {}
+            Some(Ok(())) => self.direct_asked = matches!(cmd, UiCmd::UseDirect),
             Some(Err(_)) => {
                 self.torctl = None;
                 notice(ui, TORCTL_GONE)?;
@@ -86,18 +96,26 @@ impl TorRoute {
             Ok(Some(TorCtlMsg::Status(status))) => {
                 UiEvent::Network { status: *status }.write_to(ui)
             }
-            Ok(Some(TorCtlMsg::Notice(n))) => notice(ui, n.text()),
+            Ok(Some(TorCtlMsg::Notice(n))) => {
+                // torctl answered the choice with a notice, so it went nowhere.
+                self.direct_asked = false;
+                notice(ui, n.text())
+            }
+            Ok(Some(TorCtlMsg::GoDirect)) if !std::mem::take(&mut self.direct_asked) => {
+                eprintln!("purple-core: purple-torctl said go direct, but the user didn't ask");
+                Ok(())
+            }
             Ok(Some(TorCtlMsg::GoDirect)) => {
                 let asked = self
                     .launcher
                     .as_mut()
                     .map(|l| LauncherMsg::StartRelay.write_to(l));
-                if !matches!(asked, Some(Ok(()))) {
-                    self.launcher = None;
-                    self.tell_torctl(&TorCtlMsg::DirectFailed);
-                    notice(ui, RELAY_FAILED)?;
+                if matches!(asked, Some(Ok(()))) {
+                    self.relay_pending = true;
+                    return Ok(());
                 }
-                Ok(())
+                self.launcher = None;
+                self.relay_failed(ui)
             }
             Ok(Some(TorCtlMsg::Choose(_) | TorCtlMsg::DirectUp | TorCtlMsg::DirectFailed)) => {
                 eprintln!("purple-core: purple-torctl sent a message only core may send");
@@ -120,24 +138,37 @@ impl TorRoute {
         ui: &mut impl Write,
     ) -> io::Result<()> {
         match got {
+            Ok(Some(LauncherMsg::RelayUp | LauncherMsg::RelayFailed))
+                if !std::mem::take(&mut self.relay_pending) =>
+            {
+                eprintln!("purple-core: the launcher answered a request core didn't make");
+                Ok(())
+            }
             Ok(Some(LauncherMsg::RelayUp)) => {
                 NetMsg::UseDirect.write_to(net)?;
                 self.tell_torctl(&TorCtlMsg::DirectUp);
                 Ok(())
             }
-            Ok(Some(LauncherMsg::RelayFailed)) => {
-                self.tell_torctl(&TorCtlMsg::DirectFailed);
-                notice(ui, RELAY_FAILED)
-            }
+            Ok(Some(LauncherMsg::RelayFailed)) => self.relay_failed(ui),
             Ok(Some(LauncherMsg::StartRelay)) => {
                 eprintln!("purple-core: the launcher sent a message only core may send");
                 Ok(())
             }
             Ok(None) | Err(_) => {
                 self.launcher = None;
+                // Gone with a start pending: that start failed.
+                if std::mem::take(&mut self.relay_pending) {
+                    return self.relay_failed(ui);
+                }
                 Ok(())
             }
         }
+    }
+
+    /// The relay didn't start: torctl goes back to Blocked and the user hears why.
+    fn relay_failed(&mut self, ui: &mut impl Write) -> io::Result<()> {
+        self.tell_torctl(&TorCtlMsg::DirectFailed);
+        notice(ui, RELAY_FAILED)
     }
 
     fn tell_torctl(&mut self, msg: &TorCtlMsg) {
@@ -221,6 +252,8 @@ mod tests {
     fn a_failed_relay_never_reaches_net() {
         let mut p = peers();
         let (mut net, mut ui) = (Vec::new(), Vec::new());
+        p.route.choose(&UiCmd::UseDirect, &mut ui).unwrap();
+        TorCtlMsg::read_from(&mut p.torctl).unwrap();
         p.route
             .on_torctl(&Ok(Some(TorCtlMsg::GoDirect)), &mut ui)
             .unwrap();
@@ -247,6 +280,8 @@ mod tests {
         let (mut net, mut ui) = (Vec::new(), Vec::new());
         drop(p.launcher);
         p.route.on_launcher(&Ok(None), &mut net, &mut ui).unwrap();
+        p.route.choose(&UiCmd::UseDirect, &mut ui).unwrap();
+        TorCtlMsg::read_from(&mut p.torctl).unwrap();
         p.route
             .on_torctl(&Ok(Some(TorCtlMsg::GoDirect)), &mut ui)
             .unwrap();
@@ -301,6 +336,50 @@ mod tests {
             !p.route
                 .choose(&UiCmd::GroupNew { group: "g".into() }, &mut Vec::new())
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn go_direct_the_user_never_asked_for_starts_nothing() {
+        let mut p = peers();
+        let (mut net, mut ui) = (Vec::new(), Vec::new());
+        p.route
+            .on_torctl(&Ok(Some(TorCtlMsg::GoDirect)), &mut ui)
+            .unwrap();
+        // A /direct answered with a notice doesn't count as consent for later.
+        p.route.choose(&UiCmd::UseDirect, &mut ui).unwrap();
+        p.route
+            .on_torctl(&Ok(Some(TorCtlMsg::Notice(Notice::StillTrying))), &mut ui)
+            .unwrap();
+        p.route
+            .on_torctl(&Ok(Some(TorCtlMsg::GoDirect)), &mut ui)
+            .unwrap();
+        p.route
+            .on_launcher(&Ok(Some(LauncherMsg::RelayUp)), &mut net, &mut ui)
+            .unwrap();
+        drop(p.route);
+        assert_eq!(
+            LauncherMsg::read_from(&mut p.launcher).unwrap(),
+            None,
+            "no StartRelay"
+        );
+        assert!(net.is_empty());
+    }
+
+    #[test]
+    fn launcher_gone_while_starting_counts_as_failed() {
+        let mut p = peers();
+        let (mut net, mut ui) = (Vec::new(), Vec::new());
+        p.route.choose(&UiCmd::UseDirect, &mut ui).unwrap();
+        TorCtlMsg::read_from(&mut p.torctl).unwrap();
+        p.route
+            .on_torctl(&Ok(Some(TorCtlMsg::GoDirect)), &mut ui)
+            .unwrap();
+        p.route.on_launcher(&Ok(None), &mut net, &mut ui).unwrap();
+        assert!(net.is_empty());
+        assert_eq!(
+            TorCtlMsg::read_from(&mut p.torctl).unwrap(),
+            Some(TorCtlMsg::DirectFailed)
         );
     }
 }

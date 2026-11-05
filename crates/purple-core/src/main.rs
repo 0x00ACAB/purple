@@ -209,7 +209,7 @@ fn serve_ui(
             inputs_tx,
         );
     }
-    let Some((mut messenger, mut vault)) = unlock(&inputs, &mut ui, data_dir)? else {
+    let Some((mut messenger, mut vault)) = unlock(&inputs, &mut ui, data_dir, &mut route)? else {
         return Ok(());
     };
     eprintln!(
@@ -362,6 +362,7 @@ fn unlock(
     inputs: &Receiver<Input>,
     ui: &mut UnixStream,
     data_dir: &Path,
+    route: &mut TorRoute,
 ) -> io::Result<Option<(Messenger, Vault)>> {
     loop {
         let new = !Vault::exists(data_dir);
@@ -372,12 +373,12 @@ fn unlock(
                 Ok(Input::Ui(Ok(None))) | Err(_) => return Ok(None),
                 Ok(Input::Ui(Err(err)) | Input::Net(Err(err))) => return Err(err),
                 Ok(Input::Net(Ok(None))) => return Err(net_closed()),
-                // purple-torctl reports how Tor is doing from its first second on.
-                Ok(Input::Tor(Ok(Some(TorCtlMsg::Status(status))))) => {
-                    UiEvent::Network { status }.write_to(ui)?;
-                }
-                // Nothing can ask for a route before unlock.
-                Ok(Input::Tor(_) | Input::Launcher(_)) => {}
+                // purple-torctl reports how Tor is doing from its first second on, and may
+                // stop before unlock; the user can't choose a route yet, so torctl's other
+                // messages change nothing here.
+                Ok(Input::Tor(got)) => route.on_torctl(&got, ui)?,
+                // Nothing has asked the launcher for anything yet.
+                Ok(Input::Launcher(_)) => {}
                 Ok(Input::Net(Ok(Some(_)))) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1363,6 +1364,31 @@ mod tests {
     }
 
     #[test]
+    fn torctl_gone_during_unlock_is_told() {
+        let dir = std::env::temp_dir().join(format!("purple-unlock-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Input::Tor(Ok(None))).unwrap();
+        tx.send(Input::Ui(Ok(None))).unwrap();
+        let (mut ui, mut ui_peer) = UnixStream::pair().unwrap();
+        let (to_torctl, _torctl) = UnixStream::pair().unwrap();
+        let mut route = TorRoute::new(Some(to_torctl), None);
+        assert!(unlock(&rx, &mut ui, &dir, &mut route).unwrap().is_none());
+        drop(ui);
+        assert_eq!(
+            UiEvent::read_from(&mut ui_peer).unwrap(),
+            Some(UiEvent::NeedPassphrase { new: true })
+        );
+        assert_eq!(
+            UiEvent::read_from(&mut ui_peer).unwrap(),
+            Some(UiEvent::Notice {
+                text: tor_route::TORCTL_GONE.into()
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn status_from_torctl_during_unlock_goes_to_the_ui() {
         let dir = std::env::temp_dir().join(format!("purple-unlock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1375,7 +1401,11 @@ mod tests {
             .unwrap();
         tx.send(Input::Ui(Ok(None))).unwrap();
         let (mut ui, mut ui_peer) = UnixStream::pair().unwrap();
-        assert!(unlock(&rx, &mut ui, &dir).unwrap().is_none());
+        assert!(
+            unlock(&rx, &mut ui, &dir, &mut TorRoute::new(None, None))
+                .unwrap()
+                .is_none()
+        );
         drop(ui);
         assert_eq!(
             UiEvent::read_from(&mut ui_peer).unwrap(),
