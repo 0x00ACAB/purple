@@ -35,6 +35,118 @@ const TAG_FOUND: u8 = 3;
 const TAG_EMPTY: u8 = 4;
 const TAG_WRITTEN: u8 = 5;
 const TAG_TAKEN: u8 = 6;
+const TAG_READ_COVER: u8 = 7;
+const TAG_STATUS: u8 = 8;
+const TAG_CHOOSE: u8 = 9;
+
+/// Longest bridge text the user may paste: a few bridge lines.
+pub const MAX_BRIDGE_TEXT: usize = 1400;
+const _: () = assert!(2 + MAX_BRIDGE_TEXT <= MAX_NET_FRAME);
+
+/// How purple-net reaches the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// Tor with no bridge.
+    Tor,
+    /// Tor over the built-in obfs4 bridges.
+    Obfs4,
+    /// Tor over Snowflake.
+    Snowflake,
+    /// Tor over the built-in webtunnel bridges.
+    WebTunnel,
+    /// Tor over bridge lines the user pasted.
+    Pasted,
+    /// Straight to the store, without Tor.
+    Direct,
+}
+
+impl Route {
+    /// Wire code.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Tor => 0,
+            Self::Obfs4 => 1,
+            Self::Snowflake => 2,
+            Self::WebTunnel => 3,
+            Self::Pasted => 4,
+            Self::Direct => 5,
+        }
+    }
+
+    /// The route with wire code `code`.
+    ///
+    /// # Errors
+    /// Fails on an unknown code.
+    pub fn from_code(code: u8) -> io::Result<Self> {
+        Ok(match code {
+            0 => Self::Tor,
+            1 => Self::Obfs4,
+            2 => Self::Snowflake,
+            3 => Self::WebTunnel,
+            4 => Self::Pasted,
+            5 => Self::Direct,
+            _ => return Err(invalid("unknown route")),
+        })
+    }
+}
+
+/// What purple-net tells core about its connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetStatus {
+    /// Bootstrapping over `route`, `percent` done.
+    Connecting {
+        /// The route being tried.
+        route: Route,
+        /// Tor's bootstrap progress, 0 to 100.
+        percent: u8,
+    },
+    /// Connected over `route`.
+    Connected {
+        /// The route in use.
+        route: Route,
+    },
+    /// Every automatic route failed; the user has to choose.
+    Blocked,
+}
+
+impl NetStatus {
+    /// Wire form: kind, route code, percent.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 3] {
+        match self {
+            Self::Connecting { route, percent } => [0, route.code(), percent],
+            Self::Connected { route } => [1, route.code(), 0],
+            Self::Blocked => [2, 0, 0],
+        }
+    }
+
+    /// Parse the wire form.
+    ///
+    /// # Errors
+    /// Fails on an unknown kind or route, or a percent over 100.
+    pub fn from_bytes([kind, route, percent]: [u8; 3]) -> io::Result<Self> {
+        if percent > 100 {
+            return Err(invalid("percent over 100"));
+        }
+        let route = Route::from_code(route)?;
+        Ok(match kind {
+            0 => Self::Connecting { route, percent },
+            1 => Self::Connected { route },
+            2 => Self::Blocked,
+            _ => return Err(invalid("unknown status")),
+        })
+    }
+}
+
+/// What the user chose after [`NetStatus::Blocked`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetChoice {
+    /// Connect to the store without Tor, until purple exits.
+    Direct,
+    /// Try these bridge lines, one per line.
+    Bridges(String),
+}
 
 /// Identifies one append-only stream of boxes to the transport.
 ///
@@ -128,22 +240,50 @@ pub enum NetMsg {
         /// The box.
         at: BoxRef,
     },
+    /// core to net: a padding read of box `at`. Answered like [`NetMsg::Read`]; purple-net
+    /// may send it over any connection, since nobody wants what it finds.
+    ReadCover {
+        /// The box.
+        at: BoxRef,
+    },
+    /// net to core: how the connection is going.
+    Status(NetStatus),
+    /// core to net: the user's answer to [`NetStatus::Blocked`].
+    Choose(NetChoice),
 }
 
 impl NetMsg {
     /// Encode to the wire layout: tag, stream seed, index, then the packet if the message
-    /// has one.
+    /// has one. Status is the tag and three bytes; a choice is the tag, a kind byte and the
+    /// bridge text.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(MAX_NET_FRAME);
         let (tag, at, packet) = match self {
             Self::Write { at, packet } => (TAG_WRITE, at, Some(packet)),
             Self::Read { at } => (TAG_READ, at, None),
+            Self::ReadCover { at } => (TAG_READ_COVER, at, None),
             Self::Found { at, packet } => (TAG_FOUND, at, Some(packet)),
             Self::Empty { at } => (TAG_EMPTY, at, None),
             Self::Written { at } => (TAG_WRITTEN, at, None),
             Self::Taken { at } => (TAG_TAKEN, at, None),
+            Self::Status(status) => {
+                out.push(TAG_STATUS);
+                out.extend_from_slice(&status.to_bytes());
+                return out;
+            }
+            Self::Choose(choice) => {
+                out.push(TAG_CHOOSE);
+                match choice {
+                    NetChoice::Direct => out.push(0),
+                    NetChoice::Bridges(lines) => {
+                        out.push(1);
+                        out.extend_from_slice(lines.as_bytes());
+                    }
+                }
+                return out;
+            }
         };
-        let mut out = Vec::with_capacity(MAX_NET_FRAME);
         out.push(tag);
         out.extend_from_slice(&at.stream.0);
         out.extend_from_slice(&at.index.to_be_bytes());
@@ -158,6 +298,20 @@ impl NetMsg {
     /// # Errors
     /// Fails on an unknown tag or a length that doesn't match the tag.
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        match bytes {
+            [TAG_STATUS, kind, route, percent] => {
+                return Ok(Self::Status(NetStatus::from_bytes([*kind, *route, *percent])?));
+            }
+            [TAG_STATUS, ..] => return Err(invalid("status has the wrong length")),
+            [TAG_CHOOSE, 0] => return Ok(Self::Choose(NetChoice::Direct)),
+            [TAG_CHOOSE, 1, lines @ ..] if lines.len() <= MAX_BRIDGE_TEXT => {
+                let lines =
+                    std::str::from_utf8(lines).map_err(|_| invalid("bridges aren't UTF-8"))?;
+                return Ok(Self::Choose(NetChoice::Bridges(lines.to_owned())));
+            }
+            [TAG_CHOOSE, ..] => return Err(invalid("malformed choice")),
+            _ => {}
+        }
         let (&tag, rest) = bytes
             .split_first()
             .ok_or_else(|| invalid("empty message"))?;
@@ -180,10 +334,13 @@ impl NetMsg {
                 at,
                 packet: Packet::from_slice(body)?,
             }),
-            TAG_READ | TAG_EMPTY | TAG_WRITTEN | TAG_TAKEN if !body.is_empty() => {
+            TAG_READ | TAG_READ_COVER | TAG_EMPTY | TAG_WRITTEN | TAG_TAKEN
+                if !body.is_empty() =>
+            {
                 Err(invalid("trailing bytes"))
             }
             TAG_READ => Ok(Self::Read { at }),
+            TAG_READ_COVER => Ok(Self::ReadCover { at }),
             TAG_EMPTY => Ok(Self::Empty { at }),
             TAG_WRITTEN => Ok(Self::Written { at }),
             TAG_TAKEN => Ok(Self::Taken { at }),
@@ -194,8 +351,13 @@ impl NetMsg {
     /// Write this message as one frame.
     ///
     /// # Errors
-    /// Fails if the write fails.
+    /// Fails if the bridge text is too long, or the write fails.
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
+        if let Self::Choose(NetChoice::Bridges(lines)) = self
+            && lines.len() > MAX_BRIDGE_TEXT
+        {
+            return Err(invalid("too much bridge text"));
+        }
         write_frame(w, &self.encode(), MAX_NET_FRAME)
     }
 
@@ -379,5 +541,38 @@ mod tests {
         bytes.pop();
         assert!(read_frame(&mut &bytes[..], MAX_NET_FRAME).is_err());
         assert!(read_frame(&mut &bytes[..2], MAX_NET_FRAME).is_err());
+    }
+
+    #[test]
+    fn status_and_choice_messages_round_trip() {
+        let at = BoxRef {
+            stream: StreamSeed([7; SEED_LEN]),
+            index: 3,
+        };
+        for msg in [
+            NetMsg::ReadCover { at },
+            NetMsg::Status(NetStatus::Connecting {
+                route: Route::Snowflake,
+                percent: 45,
+            }),
+            NetMsg::Status(NetStatus::Connected { route: Route::Direct }),
+            NetMsg::Status(NetStatus::Blocked),
+            NetMsg::Choose(NetChoice::Direct),
+            NetMsg::Choose(NetChoice::Bridges("obfs4 192.0.2.1:443 AAAA cert=x iat-mode=0".into())),
+        ] {
+            assert_eq!(NetMsg::decode(&msg.encode()).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn status_messages_reject_garbage() {
+        assert!(NetMsg::decode(&[TAG_STATUS, 9, 0, 0]).is_err(), "unknown status kind");
+        assert!(NetMsg::decode(&[TAG_STATUS, 0, 99, 0]).is_err(), "unknown route");
+        assert!(NetMsg::decode(&[TAG_STATUS, 0, 0, 101]).is_err(), "percent over 100");
+        assert!(NetMsg::decode(&[TAG_STATUS, 2, 0, 0, 1]).is_err(), "trailing bytes");
+        assert!(NetMsg::decode(&[TAG_CHOOSE, 0, 1]).is_err(), "direct takes no body");
+        assert!(NetMsg::decode(&[TAG_CHOOSE, 1, 0xff]).is_err(), "bridges must be UTF-8");
+        let long = NetMsg::Choose(NetChoice::Bridges("a".repeat(MAX_BRIDGE_TEXT + 1)));
+        assert!(long.write_to(&mut Vec::new()).is_err());
     }
 }

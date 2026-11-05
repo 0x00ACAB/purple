@@ -5,7 +5,7 @@
 
 use std::io::{self, Read, Write};
 
-use crate::{invalid, read_frame, write_frame};
+use crate::{MAX_BRIDGE_TEXT, NetStatus, invalid, read_frame, write_frame};
 
 /// Longest contact name, in bytes.
 pub const MAX_NAME_LEN: usize = 64;
@@ -39,6 +39,8 @@ const CMD_GROUP_JOIN: u8 = 10;
 const CMD_GROUP_LEAVE: u8 = 11;
 const CMD_GROUP_MEMBERS: u8 = 12;
 const CMD_GROUP_SEND: u8 = 13;
+const CMD_USE_DIRECT: u8 = 14;
+const CMD_ADD_BRIDGES: u8 = 15;
 
 const EVENT_INVITE_CREATED: u8 = 1;
 const EVENT_CONNECTED: u8 = 2;
@@ -57,6 +59,7 @@ const EVENT_GROUP_SENT: u8 = 14;
 const EVENT_GROUP_NOTICE: u8 = 15;
 const EVENT_GROUP_LEFT: u8 = 16;
 const EVENT_GROUP_MEMBERS: u8 = 17;
+const EVENT_NETWORK: u8 = 18;
 
 /// What the user asked for, sent from `purple-ui` to `purple-core`.
 #[derive(Clone, PartialEq, Eq)]
@@ -140,6 +143,14 @@ pub enum UiCmd {
         /// Message text.
         body: String,
     },
+    /// Connect to the store without Tor, until purple exits. Only after
+    /// [`NetStatus::Blocked`].
+    UseDirect,
+    /// Try these bridge lines, one per line.
+    AddBridges {
+        /// The pasted lines.
+        lines: String,
+    },
 }
 
 /// Debug without the passphrase.
@@ -188,6 +199,8 @@ impl std::fmt::Debug for UiCmd {
                 .debug_struct("GroupSend")
                 .field("group", group)
                 .finish_non_exhaustive(),
+            Self::UseDirect => f.write_str("UseDirect"),
+            Self::AddBridges { .. } => f.write_str("AddBridges { .. }"),
         }
     }
 }
@@ -296,6 +309,11 @@ pub enum UiEvent {
         /// Each member's name and whether they're one of your contacts.
         members: Vec<(String, bool)>,
     },
+    /// How the connection to the store is going.
+    Network {
+        /// purple-net's latest status.
+        status: NetStatus,
+    },
 }
 
 /// Debug without the recovery code; message text is shown, as the UI shows it anyway.
@@ -371,6 +389,7 @@ impl std::fmt::Debug for UiEvent {
                 .field("group", group)
                 .field("members", members)
                 .finish(),
+            Self::Network { status } => f.debug_struct("Network").field("status", status).finish(),
         }
     }
 }
@@ -442,6 +461,11 @@ impl UiCmd {
                 out.str(group, MAX_NAME_LEN)?;
                 out.str(body, MAX_BODY_LEN)?;
             }
+            Self::UseDirect => out.tag(CMD_USE_DIRECT),
+            Self::AddBridges { lines } => {
+                out.tag(CMD_ADD_BRIDGES);
+                out.str(lines, MAX_BRIDGE_TEXT)?;
+            }
         }
         write_frame(w, &out.0, MAX_UI_FRAME)
     }
@@ -501,6 +525,10 @@ impl UiCmd {
             CMD_GROUP_SEND => Self::GroupSend {
                 group: d.str(MAX_NAME_LEN)?,
                 body: d.str(MAX_BODY_LEN)?,
+            },
+            CMD_USE_DIRECT => Self::UseDirect,
+            CMD_ADD_BRIDGES => Self::AddBridges {
+                lines: d.str(MAX_BRIDGE_TEXT)?,
             },
             _ => return Err(invalid("unknown UI command")),
         };
@@ -601,6 +629,12 @@ impl UiEvent {
                     out.tag(u8::from(*verified));
                 }
             }
+            Self::Network { status } => {
+                out.tag(EVENT_NETWORK);
+                for byte in status.to_bytes() {
+                    out.tag(byte);
+                }
+            }
         }
         write_frame(w, &out.0, MAX_UI_FRAME)
     }
@@ -678,6 +712,9 @@ impl UiEvent {
                 }
                 Self::GroupMembers { group, members }
             }
+            EVENT_NETWORK => Self::Network {
+                status: NetStatus::from_bytes([d.tag()?, d.tag()?, d.tag()?])?,
+            },
             _ => return Err(invalid("unknown UI event")),
         };
         d.finish()?;
@@ -752,6 +789,7 @@ impl Decoder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Route;
 
     fn s(text: &str) -> String {
         text.to_owned()
@@ -1030,5 +1068,28 @@ mod tests {
             body: s("secret words"),
         };
         assert!(!format!("{cmd:?}").contains("secret"));
+    }
+
+    #[test]
+    fn network_events_and_commands_round_trip() {
+        let event = UiEvent::Network {
+            status: NetStatus::Connecting {
+                route: Route::Obfs4,
+                percent: 10,
+            },
+        };
+        let mut frame = Vec::new();
+        event.write_to(&mut frame).unwrap();
+        assert_eq!(UiEvent::read_from(&mut &frame[..]).unwrap(), Some(event));
+        for cmd in [
+            UiCmd::UseDirect,
+            UiCmd::AddBridges {
+                lines: "snowflake 192.0.2.3:80 FINGERPRINT".into(),
+            },
+        ] {
+            let mut cmd_frame = Vec::new();
+            cmd.write_to(&mut cmd_frame).unwrap();
+            assert_eq!(UiCmd::read_from(&mut &cmd_frame[..]).unwrap(), Some(cmd));
+        }
     }
 }

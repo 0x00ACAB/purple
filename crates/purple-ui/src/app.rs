@@ -487,6 +487,8 @@ fn on_core_event(model: &mut Model, event: UiEvent) {
         | UiEvent::GroupNotice { .. }
         | UiEvent::GroupLeft { .. }
         | UiEvent::GroupMembers { .. } => on_group_event(model, event),
+        // Shown from Task 14 on; nothing sends it yet.
+        UiEvent::Network { .. } => {}
     }
 }
 

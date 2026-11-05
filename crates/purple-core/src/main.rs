@@ -486,6 +486,9 @@ fn handle(cmd: UiCmd, messenger: &mut Messenger) -> session::Result<Effects> {
         | UiCmd::GroupLeave { .. }
         | UiCmd::GroupMembers { .. }
         | UiCmd::GroupSend { .. }) => handle_group(group, messenger, &mut effects)?,
+        UiCmd::UseDirect | UiCmd::AddBridges { .. } => {
+            return Err(session::Error::State("purple-net isn't asking for a route"));
+        }
     }
     Ok(effects)
 }
@@ -694,13 +697,16 @@ impl Reads {
         let (at, packet) = match reply {
             NetMsg::Found { at, packet } => (at, Some(packet)),
             NetMsg::Empty { at } => (at, None),
-            NetMsg::Read { .. } | NetMsg::Write { .. } => {
+            NetMsg::Read { .. }
+            | NetMsg::ReadCover { .. }
+            | NetMsg::Write { .. }
+            | NetMsg::Choose(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "purple-net sent a message only purple-core may send",
                 ));
             }
-            NetMsg::Written { .. } | NetMsg::Taken { .. } => {
+            NetMsg::Written { .. } | NetMsg::Taken { .. } | NetMsg::Status(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "a write report isn't a read reply",
@@ -1140,7 +1146,10 @@ mod tests {
                 | NetMsg::Found { .. }
                 | NetMsg::Empty { .. }
                 | NetMsg::Written { .. }
-                | NetMsg::Taken { .. }) => {
+                | NetMsg::Taken { .. }
+                | NetMsg::ReadCover { .. }
+                | NetMsg::Status(_)
+                | NetMsg::Choose(_)) => {
                     panic!("not a read: {other:?}")
                 }
             })
