@@ -38,6 +38,10 @@ const WRITE_WORKERS: usize = 8;
 const READ_TIMEOUT: Duration = Duration::from_mins(2);
 /// How long to wait for writes still in flight at exit.
 const FINISH_TIMEOUT: Duration = Duration::from_mins(1);
+/// The wait before retrying a failed write; it doubles with each failure up to
+/// [`WRITE_RETRY_MAX`].
+const WRITE_RETRY_FIRST: Duration = Duration::from_secs(5);
+const WRITE_RETRY_MAX: Duration = Duration::from_mins(2);
 
 /// Namenlos's `MaxPlaintextPayloadLength`. The daemon's geometry is checked at runtime;
 /// this catches a `PACKET_LEN` change that would break the network purple targets.
@@ -91,8 +95,12 @@ impl Transport for PigeonholeTransport {
         let client = Arc::clone(&self.client);
         let seed = box_seed(at);
         let job: Job = Box::new(move || {
-            if let Err(err) = write_box(&client, &seed, &packet) {
-                eprintln!("purple-net: a box write failed: {err}");
+            if let Err(err) = with_retries(
+                || write_box(&client, &seed, &packet),
+                WRITE_RETRY_FIRST,
+                WRITE_RETRY_MAX,
+            ) {
+                eprintln!("purple-net: lost a box write: {err}");
             }
         });
         self.writes
@@ -155,6 +163,29 @@ fn write_box(client: &Client, seed: &[u8; 32], packet: &Packet) -> io::Result<()
     let keys = client.new_keypair(seed)?;
     let envelope = client.encrypt_write(packet.as_bytes(), &keys.write_cap, &keys.first_index)?;
     client.send_write(&envelope, &keys.write_cap)
+}
+
+/// Run `attempt` until it succeeds, waiting `first` after the first failure and twice as
+/// long after each one after that, up to `max`. Only a lost daemon connection
+/// (`BrokenPipe`) ends it early: anything else may be the network, and a write that
+/// actually landed the first time succeeds when repeated.
+fn with_retries(
+    mut attempt: impl FnMut() -> io::Result<()>,
+    first: Duration,
+    max: Duration,
+) -> io::Result<()> {
+    let mut wait = first;
+    loop {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => return Err(err),
+            Err(err) => {
+                eprintln!("purple-net: a box write failed, retrying in {wait:?}: {err}");
+                thread::sleep(wait);
+                wait = wait.saturating_mul(2).min(max);
+            }
+        }
+    }
 }
 
 /// Read one box. Only a lost daemon connection is an error: anything else (a timeout, a
@@ -221,6 +252,45 @@ mod tests {
             stream: StreamSeed([seed; SEED_LEN]),
             index,
         }
+    }
+
+    #[test]
+    fn writes_are_retried_until_they_succeed() {
+        let mut failures = 3;
+        let mut calls = 0;
+        let started = Instant::now();
+        with_retries(
+            || {
+                calls += 1;
+                if failures == 0 {
+                    return Ok(());
+                }
+                failures -= 1;
+                Err(io::Error::other("no PKI document available"))
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .unwrap();
+        assert_eq!(calls, 4);
+        // Waits of 1, 2 and 2 ms: the backoff stops at the cap.
+        assert!(started.elapsed() >= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn writes_stop_when_the_daemon_is_gone() {
+        let mut calls = 0;
+        let err = with_retries(
+            || {
+                calls += 1;
+                Err(stopped())
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(calls, 1);
     }
 
     #[test]
