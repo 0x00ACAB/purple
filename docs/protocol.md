@@ -83,8 +83,9 @@ Queue
   queue secret.
 
 Store
-: The server that holds boxes. purple's own store is `purple-store`, published as a Tor
-  onion service. Katzenpost's Pigeonhole storage can stand in for it.
+: The server that holds boxes. purple's own store is `purple-memory-alpha` (named
+  `purple-store` before November 2026), published as a Tor onion service. Katzenpost's
+  Pigeonhole storage can stand in for it.
 
 Inviter, Accepter
 : The user who creates an invite, and the user who accepts it.
@@ -489,7 +490,7 @@ The client process that talks to the network sees stream seeds and indices. The 
 neither. Each transport maps a box to an address with a one-way function:
 
 ```
-   purple-store, dev provider:
+   purple-memory-alpha, dev provider:
      addr = HKDF(salt = "purple box address v1", ikm = seed, info = uint64(index), L = 32)
 
    Pigeonhole (Katzenpost):
@@ -539,17 +540,17 @@ replies; purple sends up to 16.
 - Boxes expire. A box older than the retention period (default 7 days) reads as Empty and
   can be written again. When the store is over its size cap (default 50 GB) it deletes
   its oldest boxes first.
-- The store SHOULD rate-limit writes per connection. purple-store allows 10 a second with
-  a burst of 10, and delays rather than refuses writes past that. Only Puts count. A
-  client that pipelines more than 10 Puts at once (Section 11.1 allows 16) sees the
-  replies past the tenth slow down, and the Gets behind them wait too, since replies come
-  in order. purple clients write about 2 packets a second in total, spread over many
+- The store SHOULD rate-limit writes per connection. purple-memory-alpha allows 10 a
+  second with a burst of 10, and delays rather than refuses writes past that. Only Puts
+  count. A client that pipelines more than 10 Puts at once (Section 11.1 allows 16) sees
+  the replies past the tenth slow down, and the Gets behind them wait too, since replies
+  come in order. purple clients write about 2 packets a second in total, spread over many
   connections, so in practice they stay under the limit.
 - The store SHOULD close a connection that has sent nothing for 5 minutes.
 
-purple-store keeps boxes in one append-only segment file per hour, each record being the
-8-byte storage time, the address and the packet, so expiry and the size cap delete whole
-files.
+purple-memory-alpha keeps boxes in one append-only segment file per hour, each record
+being the 8-byte storage time, the address and the packet, so expiry and the size cap
+delete whole files.
 
 ## 12. Reaching the Store
 

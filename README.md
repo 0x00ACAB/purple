@@ -34,18 +34,21 @@ Each job runs in its own process and its own bubblewrap sandbox, with seccomp an
 Landlock on top. The process that holds keys never touches the network, and the one that
 touches the network never sees a key.
 
-| Crate | Job |
-|---|---|
-| `purple` | Launcher: starts everything below, sandboxed, and wires up their sockets |
-| `purple-core` | Keys, crypto and the encrypted vault. No network, no display |
-| `purple-net` | Talks to the box store. Never holds keys |
-| `purple-ui` | Terminal UI. No network, no keys |
-| `purple-torctl` | Drives tor's control port and the bridge fallback |
-| `purple-relay` | Direct (non-Tor) connection to the store, started only if you ask |
-| `purple-store` | The box store server, published as an onion service |
-| `purple-ipc` | Messages and framing between the processes |
-| `purple-harden` | Hardening every process applies at startup |
-| `purple-devprovider` | Local stand-in network for running several instances on one machine |
+| Crate | Was | Job |
+|---|---|---|
+| `purple` | | Launcher: starts everything below, sandboxed, and wires up their sockets |
+| `purple-data` | `purple-core` | Keys, crypto and the encrypted vault. No network, no display |
+| `purple-subspace` | `purple-net` | Talks to the box store. Never holds keys |
+| `purple-lcars` | `purple-ui` | Terminal UI. No network, no keys |
+| `purple-cloak` | `purple-torctl` | Drives tor's control port and the bridge fallback |
+| `purple-transporter` | `purple-relay` | Direct (non-Tor) connection to the store, started only if you ask |
+| `purple-memory-alpha` | `purple-store` | The box store server, published as an onion service |
+| `purple-combadge` | `purple-ipc` | Messages and framing between the processes |
+| `purple-shields` | `purple-harden` | Hardening every process applies at startup |
+| `purple-holodeck` | `purple-devprovider` | Local stand-in network for running several instances on one machine |
+
+The component names are a nod to Star Trek: The Next Generation and Picard. "Was" gives
+the name each crate had before November 2026, which older commits use.
 
 ## Requirements
 
@@ -69,8 +72,8 @@ Run the self-test, which uses an in-memory network and finishes in a few seconds
 ./target/release/purple --no-ui
 ```
 
-To chat for real you need a store. Run `purple-store` on a machine with tor, publish its
-socket as an onion service, then tell the client where it is in
+To chat for real you need a store. Run `purple-memory-alpha` on a machine with tor,
+publish its socket as an onion service, then tell the client where it is in
 `~/.config/purple/store.conf`:
 
 ```
