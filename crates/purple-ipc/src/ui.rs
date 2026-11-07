@@ -41,6 +41,7 @@ const CMD_GROUP_MEMBERS: u8 = 12;
 const CMD_GROUP_SEND: u8 = 13;
 const CMD_USE_DIRECT: u8 = 14;
 const CMD_ADD_BRIDGES: u8 = 15;
+const CMD_GROUP_REKEY: u8 = 16;
 
 const EVENT_INVITE_CREATED: u8 = 1;
 const EVENT_CONNECTED: u8 = 2;
@@ -137,6 +138,11 @@ pub enum UiCmd {
         /// The group's name.
         group: String,
     },
+    /// Replace this user's key in a group now.
+    GroupRekey {
+        /// The group's name.
+        group: String,
+    },
     /// Send text to a group.
     GroupSend {
         /// The group's name.
@@ -194,6 +200,10 @@ impl std::fmt::Debug for UiCmd {
             }
             Self::GroupMembers { group } => f
                 .debug_struct("GroupMembers")
+                .field("group", group)
+                .finish(),
+            Self::GroupRekey { group } => f
+                .debug_struct("GroupRekey")
                 .field("group", group)
                 .finish(),
             Self::GroupSend { group, .. } => f
@@ -463,6 +473,10 @@ impl UiCmd {
                 out.tag(CMD_GROUP_MEMBERS);
                 out.str(group, MAX_NAME_LEN)?;
             }
+            Self::GroupRekey { group } => {
+                out.tag(CMD_GROUP_REKEY);
+                out.str(group, MAX_NAME_LEN)?;
+            }
             Self::GroupSend { group, body } => {
                 out.tag(CMD_GROUP_SEND);
                 out.str(group, MAX_NAME_LEN)?;
@@ -527,6 +541,9 @@ impl UiCmd {
                 group: d.str(MAX_NAME_LEN)?,
             },
             CMD_GROUP_MEMBERS => Self::GroupMembers {
+                group: d.str(MAX_NAME_LEN)?,
+            },
+            CMD_GROUP_REKEY => Self::GroupRekey {
                 group: d.str(MAX_NAME_LEN)?,
             },
             CMD_GROUP_SEND => Self::GroupSend {
@@ -1030,6 +1047,7 @@ mod tests {
             },
             UiCmd::GroupLeave { group: s("team") },
             UiCmd::GroupMembers { group: s("team") },
+            UiCmd::GroupRekey { group: s("team") },
             UiCmd::GroupSend {
                 group: s("team"),
                 body: "x".repeat(MAX_BODY_LEN),

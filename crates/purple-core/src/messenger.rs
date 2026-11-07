@@ -116,6 +116,28 @@ pub struct Step {
     pub outgoing: Vec<Outgoing>,
 }
 
+/// What [`Messenger::tick`] produced.
+#[derive(Debug, Default)]
+pub struct Ticked {
+    /// Boxes to write.
+    pub outgoing: Vec<Outgoing>,
+    /// Whether anything needs saving.
+    pub changed: bool,
+    /// Groups whose timers failed, and why. Their other state is untouched.
+    pub errors: Vec<(String, Error)>,
+}
+
+/// What [`Messenger::rekey_group`] did.
+#[derive(Debug)]
+pub enum Rekey {
+    /// This member proposed a fresh key; it takes effect when the creator commits it.
+    Proposed(Outgoing),
+    /// This creator committed every update it held, with a fresh key of its own.
+    Committed(Outgoing),
+    /// This creator is alone in the group, so there is nothing to commit.
+    Alone,
+}
+
 struct Contact {
     send: QueueSecret,
     receive: QueueSecret,
@@ -539,6 +561,51 @@ impl Messenger {
             .collect()
     }
 
+    /// Run every group's key-update timers at `now` (unix seconds). Core calls this on
+    /// every poll.
+    pub fn tick(&mut self, now: u64) -> Ticked {
+        let mut ticked = Ticked::default();
+        for (name, group) in &mut self.groups {
+            match group.tick(&self.mls, now) {
+                Ok(tick) => {
+                    ticked.changed |= tick.changed;
+                    ticked.outgoing.extend(tick.out);
+                }
+                Err(err) => ticked.errors.push((name.clone(), err)),
+            }
+        }
+        ticked
+    }
+
+    /// Replace this user's leaf key in `group` now.
+    ///
+    /// # Errors
+    /// Fails if there's no such group, or a member's update is already waiting.
+    pub fn rekey_group(&mut self, group: &str) -> Result<Rekey> {
+        let state = self
+            .groups
+            .get_mut(group)
+            .ok_or(Error::State("no such group"))?;
+        if state.creator().is_some() {
+            return state.propose_update(&self.mls).map(Rekey::Proposed);
+        }
+        Ok(state
+            .commit_updates(&self.mls)?
+            .map_or(Rekey::Alone, Rekey::Committed))
+    }
+
+    /// Groups this user may have fallen behind in, with their creator's name: purple
+    /// last ran with them more than 7 days before `now`, longer than the store keeps
+    /// boxes.
+    #[must_use]
+    pub fn stale_groups(&self, now: u64) -> Vec<(String, String)> {
+        self.groups
+            .iter()
+            .filter(|(_, group)| group.stale(now))
+            .filter_map(|(name, group)| Some((name.clone(), group.creator()?.to_owned())))
+            .collect()
+    }
+
     /// Keep `out`'s packets until the network confirms each one with [`Self::written`].
     pub fn keep_until_written(&mut self, out: &Outgoing) {
         self.outbox.extend(out.writes.iter().cloned());
@@ -676,8 +743,8 @@ impl Messenger {
         Ok(w.finish())
     }
 
-    /// Restore a messenger from [`Self::to_snapshot`], or from an older snapshot: version 4
-    /// had no groups, version 3 also no partial messages, version 2 also no outbox.
+    /// Restore a messenger from [`Self::to_snapshot`], or from an older snapshot: version 5
+    /// had no key-update timers in groups, version 4 had no groups, version 3 also no partial messages, version 2 also no outbox.
     ///
     /// # Errors
     /// Fails on an unknown version or any malformed field.
@@ -725,7 +792,7 @@ impl Messenger {
             let mls = Mls::decode(&mut r)?;
             for _ in 0..r.len()? {
                 let name = r.string()?;
-                groups.insert(name, Group::decode(&mut r, &mls)?);
+                groups.insert(name, Group::decode(&mut r, &mls, version)?);
             }
             for _ in 0..r.len()? {
                 requests.insert((r.string()?, r.string()?));
@@ -1188,7 +1255,7 @@ impl Messenger {
 /// instead of 45.
 pub const READ_AHEAD: u64 = 16;
 
-const SNAPSHOT_VERSION: u8 = 5;
+const SNAPSHOT_VERSION: u8 = 6;
 
 fn secret(bytes: &[u8]) -> Result<QueueSecret> {
     let array: [u8; 32] = bytes
@@ -1250,6 +1317,7 @@ pub(crate) fn outgoing(queue: &Queue, first: u64, message: &[u8]) -> Result<(Out
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::group::{BATCH_SECS, STALE_SECS, UPDATE_SECS};
 
     /// An in-memory box store: write-once, reads don't consume.
     #[derive(Default)]
@@ -1559,7 +1627,8 @@ mod tests {
         // Each older version lacks counts at the end: version 4 the four group counts
         // (MLS storage, groups, requests, joins), version 3 also the partial messages,
         // version 2 also the outbox.
-        for (version, cut) in [(4, 16), (3, 20), (2, 24)] {
+        // Version 5 differs only inside each group, and this messenger has none.
+        for (version, cut) in [(5, 0), (4, 16), (3, 20), (2, 24)] {
             let mut old = current.clone();
             old[0] = version;
             old.truncate(old.len() - cut);
@@ -2042,5 +2111,91 @@ mod tests {
         }
         assert!(alice.leave_group("team").unwrap().is_empty());
         assert!(alice.groups().is_empty());
+    }
+
+    const T0: u64 = 1_000_000;
+
+    #[test]
+    fn a_daily_update_goes_round_the_group_and_messages_keep_flowing() {
+        let mut provider = Provider::default();
+        let (mut alice, mut bob, mut carol) = team(&mut provider);
+        // Not the creator: its first tick, later, starts its own day.
+        for m in [&mut bob, &mut carol] {
+            assert!(m.tick(T0).outgoing.is_empty());
+        }
+        let ticked = bob.tick(T0 + UPDATE_SECS);
+        assert!(ticked.changed && ticked.errors.is_empty());
+        for out in ticked.outgoing {
+            provider.deliver(out);
+        }
+        assert!(provider.poll(&mut alice).is_empty(), "a proposal shows nothing");
+        assert!(provider.poll(&mut carol).is_empty());
+
+        let start = T0 + UPDATE_SECS;
+        assert!(alice.tick(start).outgoing.is_empty(), "the window opens");
+        let commit = alice.tick(start + BATCH_SECS).outgoing;
+        assert_eq!(commit.len(), 1);
+        for out in commit {
+            provider.deliver(out);
+        }
+        assert!(provider.poll(&mut bob).is_empty(), "no membership notices");
+        assert!(provider.poll(&mut carol).is_empty());
+
+        provider.deliver(carol.send_group("team", b"still here").unwrap());
+        assert_eq!(
+            provider.poll(&mut bob),
+            [said("team", "carol", false, b"still here")]
+        );
+    }
+
+    #[test]
+    fn rekey_proposes_for_members_and_commits_for_the_creator() {
+        let mut provider = Provider::default();
+        let (mut alice, mut bob, _carol) = team(&mut provider);
+        let Rekey::Proposed(out) = bob.rekey_group("team").unwrap() else {
+            panic!("a member proposes");
+        };
+        provider.deliver(out);
+        assert!(bob.rekey_group("team").is_err(), "already waiting");
+        provider.poll(&mut alice);
+        assert!(matches!(alice.rekey_group("team").unwrap(), Rekey::Committed(_)));
+        assert!(bob.rekey_group("nope").is_err());
+
+        let mut solo = Messenger::new().unwrap();
+        solo.create_group("me-only").unwrap();
+        assert!(matches!(solo.rekey_group("me-only").unwrap(), Rekey::Alone));
+    }
+
+    #[test]
+    fn a_proposal_behind_a_removal_is_dropped_quietly_and_sent_again() {
+        let mut provider = Provider::default();
+        let (mut alice, mut bob, _carol) = team(&mut provider);
+        let Rekey::Proposed(proposal) = bob.rekey_group("team").unwrap() else {
+            panic!("a member proposes");
+        };
+        // Alice removes Carol before reading Bob's proposal. Both aimed at the same box;
+        // Alice's lands first, and `send` moves Bob's to the next free box, behind it.
+        for out in alice.remove_from_group("team", "carol").unwrap() {
+            provider.deliver(out);
+        }
+        provider.send(&mut bob, proposal);
+        let (_, errors) = provider.poll_counting_errors(&mut alice);
+        assert_eq!(errors, 0, "an old-epoch proposal isn't an error");
+        provider.poll(&mut bob);
+        assert!(matches!(bob.rekey_group("team").unwrap(), Rekey::Proposed(_)));
+    }
+
+    #[test]
+    fn stale_groups_name_the_creator() {
+        let mut provider = Provider::default();
+        let (mut alice, mut bob, _carol) = team(&mut provider);
+        bob.tick(T0);
+        alice.tick(T0);
+        assert!(bob.stale_groups(T0 + STALE_SECS).is_empty());
+        assert_eq!(
+            bob.stale_groups(T0 + STALE_SECS + 1),
+            [("team".to_owned(), "alice".to_owned())]
+        );
+        assert!(alice.stale_groups(T0 + STALE_SECS + 1).is_empty());
     }
 }

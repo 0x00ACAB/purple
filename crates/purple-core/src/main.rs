@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use landlock::RulesetStatus;
 use purple_core::invite::{Invite, StoreRef};
-use purple_core::messenger::{Event, Messenger, Outgoing, Taken};
+use purple_core::messenger::{Event, Messenger, Outgoing, Rekey, Taken};
 use purple_core::session;
 use purple_core::tpm::{Sealer, TPM_DEVICE, Tpm};
 use purple_core::vault::{GroupSender, HistoryEntry, KdfParams, UnlockedBy, Vault};
@@ -218,6 +218,14 @@ fn serve_ui(
     );
     messenger.set_store(store);
     replay(&messenger, &vault, &mut ui)?;
+    // Before the first tick moves the last-seen times on.
+    for (group, creator) in messenger.stale_groups(now()?) {
+        UiEvent::GroupNotice {
+            text: format!("you may have missed changes in #{group}; ask {creator} to re-add you"),
+            group,
+        }
+        .write_to(&mut ui)?;
+    }
     resend_unwritten(&messenger, net)?;
 
     // Polls run on a fixed clock, never in response to what the user does, so their
@@ -259,6 +267,7 @@ fn serve_ui(
             }
         }
         if Instant::now() >= next_poll {
+            tick(&mut messenger, &mut vault, net, &mut ui)?;
             reads.poll(net, &messenger.reads().map_err(io::Error::other)?)?;
             next_poll = next_on_grid(next_poll);
         }
@@ -525,6 +534,26 @@ fn commit(
     Ok(())
 }
 
+/// Run the groups' key-update timers, saving before anything they produce is sent.
+fn tick(
+    messenger: &mut Messenger,
+    vault: &mut Vault,
+    net: &mut UnixStream,
+    ui: &mut UnixStream,
+) -> io::Result<()> {
+    let ticked = messenger.tick(now()?);
+    // To stderr, not the UI: a group whose timer keeps failing would report every poll.
+    for (group, err) in &ticked.errors {
+        eprintln!("purple-core: key update in {group} failed: {err}");
+    }
+    let effects = Effects {
+        outgoing: ticked.outgoing,
+        changed: ticked.changed,
+        ..Effects::default()
+    };
+    commit(effects, messenger, vault, net, ui)
+}
+
 /// Run `read` on its own thread and pass what it returns to `inputs`, wrapped by `wrap`,
 /// so the main loop can poll on a timer. Stops after the end of the stream or an error.
 fn spawn_reader<T: Send + 'static>(
@@ -588,6 +617,7 @@ fn handle(cmd: UiCmd, messenger: &mut Messenger) -> session::Result<Effects> {
         | UiCmd::GroupJoin { .. }
         | UiCmd::GroupLeave { .. }
         | UiCmd::GroupMembers { .. }
+        | UiCmd::GroupRekey { .. }
         | UiCmd::GroupSend { .. }) => handle_group(group, messenger, &mut effects)?,
         // serve_ui sends these to purple-net before they get here.
         UiCmd::UseDirect | UiCmd::AddBridges { .. } => {
@@ -659,6 +689,23 @@ fn handle_group(
             effects
                 .events
                 .push(UiEvent::GroupMembers { group, members });
+        }
+        UiCmd::GroupRekey { group } => {
+            let text = match messenger.rekey_group(&group)? {
+                Rekey::Proposed(out) => {
+                    effects.outgoing.push(out);
+                    "key update sent; it takes effect when the creator commits it"
+                }
+                Rekey::Committed(out) => {
+                    effects.outgoing.push(out);
+                    "rekeyed: your key and every waiting member update are replaced"
+                }
+                Rekey::Alone => {
+                    effects.changed = false;
+                    "nobody else is in the group yet"
+                }
+            };
+            effects.events.push(notice(group, text.into()));
         }
         UiCmd::GroupSend { group, body } => {
             let at = now()?;
@@ -1627,6 +1674,22 @@ mod tests {
             [UiEvent::GroupMembers {
                 group: "team".into(),
                 members: vec![("me".into(), true)]
+            }]
+        );
+
+        let rekeyed = handle(
+            UiCmd::GroupRekey {
+                group: "team".into(),
+            },
+            &mut messenger,
+        )
+        .unwrap();
+        assert!(rekeyed.outgoing.is_empty());
+        assert_eq!(
+            rekeyed.events,
+            [UiEvent::GroupNotice {
+                group: "team".into(),
+                text: "nobody else is in the group yet".into(),
             }]
         );
 

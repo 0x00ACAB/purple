@@ -35,6 +35,7 @@ const HELP: &[&str] = &[
     "/group join CREATOR NAME     accept a request to join a group",
     "/group leave NAME            leave a group",
     "/group members NAME          list members: ✓ for your contacts",
+    "/group rekey NAME            replace your key in a group now (after a suspected compromise)",
     "/bridges LINE         try a Tor bridge line, once Tor can't connect",
     "/direct               connect to the store without Tor, once Tor can't connect",
     "/quit                 exit (also Esc or Ctrl-C)",
@@ -315,12 +316,13 @@ fn group_command(model: &mut Model, verb: &str, first: &str, second: Option<&str
         ("new", None) => UiCmd::GroupNew { group: a },
         ("leave", None) => UiCmd::GroupLeave { group: a },
         ("members", None) => UiCmd::GroupMembers { group: a },
+        ("rekey", None) => UiCmd::GroupRekey { group: a },
         ("add", Some(contact)) => UiCmd::GroupAdd { group: a, contact },
         ("remove", Some(member)) => UiCmd::GroupRemove { group: a, member },
         ("join", Some(group)) => UiCmd::GroupJoin { creator: a, group },
         _ => {
             model.log(
-                "usage: /group new|leave|members NAME, /group add|remove NAME CONTACT, \
+                "usage: /group new|leave|members|rekey NAME, /group add|remove NAME CONTACT, \
                        /group join CREATOR NAME",
             );
             return Vec::new();
@@ -1170,6 +1172,10 @@ mod tests {
         assert_eq!(
             type_line(&mut m, "/group leave team"),
             [UiCmd::GroupLeave { group: group() }]
+        );
+        assert_eq!(
+            type_line(&mut m, "/group rekey team"),
+            [UiCmd::GroupRekey { group: group() }]
         );
         assert_eq!(
             type_line(&mut m, "/group members team"),

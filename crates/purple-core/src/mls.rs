@@ -38,6 +38,16 @@ pub(crate) fn mls_error(err: impl Display) -> Error {
     Error::Mls(err.to_string())
 }
 
+/// This user's leaf encryption key in `group`, serialized, to tell when it changes.
+pub(crate) fn own_leaf_key(group: &openmls::prelude::MlsGroup) -> Result<Vec<u8>> {
+    group
+        .own_leaf()
+        .ok_or(Error::State("not a member of this group"))?
+        .encryption_key()
+        .tls_serialize_detached()
+        .map_err(mls_error)
+}
+
 fn poisoned<T>(_: T) -> Error {
     Error::State("MLS storage lock poisoned")
 }
