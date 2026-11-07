@@ -40,9 +40,6 @@ pub const BATCH_SECS: u64 = 5 * 60;
 pub const STALE_SECS: u64 = 7 * 24 * 3600;
 /// How often the last-seen time is saved while purple runs.
 const SEEN_SAVE_SECS: u64 = 3600;
-/// Most update proposals held per epoch. The creator and every member keep the first ones
-/// read, in stream order, so the creator's set is always among each member's.
-pub const MAX_HELD: usize = 2 * MAX_MEMBERS;
 /// An old epoch's stream is dropped once it has read as empty for this long. A write takes
 /// up to half a minute on Namenlos and is retried for longer, so this is generous.
 pub const DRAIN_SECS: u64 = 600;
@@ -289,7 +286,8 @@ pub struct Group {
     /// When purple last ran with this group (unix seconds), saved about hourly. `None`
     /// until the first tick after an upgrade from snapshot version 5.
     last_seen: Option<u64>,
-    /// Update proposals read in this epoch, this user's own included. They stay out of
+    /// Update proposals read in this epoch, this user's own included: the first from each
+    /// sender that keeps their identity, so every member holds the same ones. They stay out of
     /// OpenMLS's proposal store, because OpenMLS refuses to send while it holds any; they
     /// go in only just before an update commit is built or processed.
     held: Vec<QueuedProposal>,
@@ -822,9 +820,14 @@ impl Group {
             }
             ProcessedMessageContent::ProposalMessage(queued) => {
                 // Members may only replace their own leaf, as themselves. Every member
-                // holds it, since the creator's commit names proposals by reference.
-                if Self::keeps_identity(queued.proposal(), &from) && self.held.len() < MAX_HELD
-                {
+                // holds it, since the creator's commit names proposals by reference. Only a
+                // sender's first counts: a cap on the total would let one member crowd out
+                // the others, and leave a member who proposed short of one the commit names.
+                let first = !self
+                    .held
+                    .iter()
+                    .any(|held| held.sender() == queued.sender());
+                if first && Self::keeps_identity(queued.proposal(), &from) {
                     self.held.push(*queued);
                 }
                 Ok(Received::Nothing)
@@ -1803,10 +1806,11 @@ mod tests {
     }
 
     #[test]
-    fn at_most_max_held_updates_are_kept() {
+    fn only_a_senders_first_update_is_kept() {
         let (alice, mut group, bob, mut bobs) = pair();
         let creator = alice.account.identity_key();
-        for _ in 0..=MAX_HELD {
+        let mut first = None;
+        for _ in 0..3 {
             let (proposal, _) = bobs
                 .mls
                 .propose_self_update(
@@ -1817,7 +1821,48 @@ mod tests {
                 .unwrap();
             let bytes = mls::encode_message(proposal).unwrap();
             group.receive(&alice.provider, &bytes, &creator).unwrap();
+            first.get_or_insert_with(|| group.held[0].proposal_reference_ref().clone());
         }
-        assert_eq!(group.held.len(), MAX_HELD);
+        assert_eq!(group.held.len(), 1);
+        assert_eq!(Some(group.held[0].proposal_reference_ref().clone()), first);
+    }
+
+    #[test]
+    fn a_flooding_member_neither_crowds_out_nor_strands_an_honest_update() {
+        let (alice, mut group, bob, mut bobs, carol, mut carols) = trio();
+        let creator = alice.account.identity_key();
+        // Carol fills the stream with updates OpenMLS won't commit, then one it will, all
+        // in boxes before Bob's. Bob proposed before reading them.
+        let mut flood: Vec<Vec<u8>> = (1..2 * MAX_MEMBERS)
+            .map(|_| hostile_update(&carol, &mut carols))
+            .collect();
+        let (good, _) = carols
+            .mls
+            .propose_self_update(
+                &carol.provider,
+                &carols.key.signer(&carol.provider),
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        carols
+            .mls
+            .clear_pending_proposals(carol.provider.storage())
+            .unwrap();
+        flood.push(mls::encode_message(good).unwrap());
+        let before = bobs.leaf_key();
+        let own = bobs.propose_update(&bob.provider).unwrap();
+        for bytes in &flood {
+            group.receive(&alice.provider, bytes, &creator).unwrap();
+            bobs.receive(&bob.provider, bytes, &creator).unwrap();
+        }
+        group
+            .receive(&alice.provider, &message(&bobs.streams()[0], &own), &creator)
+            .unwrap();
+
+        let commit = group.commit_updates(&alice.provider).unwrap().unwrap();
+        let commit = message(&bobs.streams()[0], &commit);
+        let got = bobs.receive(&bob.provider, &commit, &creator);
+        assert!(got.is_ok(), "Bob holds every proposal the commit names: {got:?}");
+        assert!(bobs.leaf_key() != before, "Bob's update went in");
     }
 }

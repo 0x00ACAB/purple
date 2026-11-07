@@ -456,9 +456,9 @@ commit whose sender is not the creator.
 Key updates: each member replaces its leaf key about once a day. When 24 hours have passed
 since its leaf last changed, a member sends an MLS Update proposal to the current epoch's
 stream, at most one per epoch. Every member MUST keep each Update proposal whose new
-leaf's credential verifies to the sender's identity key, up to 100 per epoch in the order
-read, because the creator's commit names proposals by reference; it MUST ignore any other
-proposal. Kept proposals stay outside the MLS proposal store (an OpenMLS client can't send
+leaf's credential verifies to the sender's identity key, only the first such proposal
+from each sender in the order read, because the creator's commit names proposals by
+reference and every member must hold the same ones; it MUST ignore any other proposal. Kept proposals stay outside the MLS proposal store (an OpenMLS client can't send
 application messages while that store is non-empty) and are loaded into it just before a
 commit is built or processed. The creator commits the kept proposals 5 minutes after the
 first one arrives, with an update path, which also replaces its own leaf; with no
