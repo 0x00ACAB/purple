@@ -1,0 +1,19 @@
+[package]
+name = "purple-lcars"
+description = "purple's terminal UI: no network, no keys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+landlock.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+purple-shields.workspace = true
+purple-combadge.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

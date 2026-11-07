@@ -1,0 +1,16 @@
+[package]
+name = "purple-holodeck"
+description = "Local stand-in for the mixnet and providers, for running several purple instances on one machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+landlock.workspace = true
+purple-shields.workspace = true
+purple-subspace = { path = "../purple-subspace" }
+
+[lints]
+workspace = true

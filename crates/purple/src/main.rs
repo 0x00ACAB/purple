@@ -1,4 +1,4 @@
-//! purple launcher: starts `purple-net`, `purple-core` and `purple-ui`, each in its own
+//! purple launcher: starts `purple-subspace`, `purple-data` and `purple-lcars`, each in its own
 //! bubblewrap sandbox, connected only by the sockets passed in here.
 //!
 //! Usage: `purple [--no-ui] [--store-config <file>] [--dev-provider <addr>]
@@ -7,13 +7,13 @@
 //!
 //! The TUI uses the box store named in the store config (`--store-config`, by default
 //! `$XDG_CONFIG_HOME/purple/store.conf`), reached through C tor in its own sandbox, and,
-//! if the config has a direct port and the user asks for it, through purple-relay, which
-//! the launcher starts only when core asks. purple-torctl drives tor's control port. The
+//! if the config has a direct port and the user asks for it, through purple-transporter, which
+//! the launcher starts only when core asks. purple-cloak drives tor's control port. The
 //! self-test uses an in-memory network unless given a store config. `--dev-provider` points
-//! `purple-net` at a local `purple-devprovider`. `--send-interval-ms` sets the mean gap
+//! `purple-subspace` at a local `purple-holodeck`. `--send-interval-ms` sets the mean gap
 //! between packets in the cover stream (default 500 over Tor, 1000 otherwise; the self-test
 //! uses 50 unless told otherwise). `--kpclientd` and `--kp-config` run Katzenpost's client
-//! daemon instead of tor, with its socket shared read-only with `purple-net`, which then
+//! daemon instead of tor, with its socket shared read-only with `purple-subspace`, which then
 //! stores boxes on Pigeonhole.
 
 mod sandbox;
@@ -34,19 +34,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use purple_harden::sandbox::{Network, seccomp_programs};
-use purple_ipc::torctl::LauncherMsg;
-use purple_ipc::{
+use purple_combadge::torctl::LauncherMsg;
+use purple_combadge::{
     CORE_LAUNCHER_FD, CORE_NET_FD, CORE_TORCTL_FD, CORE_UI_FD, NET_CORE_FD, TORCTL_CORE_FD,
     UI_CORE_FD,
 };
+use purple_shields::sandbox::{Network, seccomp_programs};
 use sandbox::Profile;
 
 const USAGE: &str = "usage: purple [--no-ui] [--store-config <file>] [--dev-provider <addr>] \
                      [--send-interval-ms <ms>] [--kpclientd <binary> --kp-config <file>]";
 /// kpclientd's socket, in the directory the launcher makes for it.
 const KP_SOCKET_NAME: &str = "kpclientd.sock";
-/// tor's SOCKS socket and purple-relay's socket, in the directories made for them.
+/// tor's SOCKS socket and purple-transporter's socket, in the directories made for them.
 const TOR_SOCKS_NAME: &str = "socks.sock";
 const RELAY_SOCKET_NAME: &str = "relay.sock";
 /// How long a daemon may take to open its socket, and how often to look.
@@ -83,7 +83,7 @@ struct Options {
 enum Mode {
     /// An in-memory network only this run can see (the self-test).
     Memory,
-    /// A local `purple-devprovider`.
+    /// A local `purple-holodeck`.
     Dev(String),
     /// Pigeonhole, through kpclientd.
     Katzenpost(KpSetup),
@@ -180,7 +180,7 @@ fn run() -> io::Result<bool> {
         }
         Mode::Memory | Mode::Dev(_) => (Vec::new(), None),
     };
-    // With the TUI over Tor, core gets sockets to purple-torctl and to the launcher's relay
+    // With the TUI over Tor, core gets sockets to purple-cloak and to the launcher's relay
     // thread. The self-test needs neither.
     let route = match (&tor_dirs, &wayland_display) {
         (Some((config, dirs)), Some(_)) => Some(start_route(
@@ -235,7 +235,7 @@ fn run() -> io::Result<bool> {
     Ok(all_ok)
 }
 
-/// Start kpclientd and wait for its socket; returns the directory purple-net mounts.
+/// Start kpclientd and wait for its socket; returns the directory purple-subspace mounts.
 fn start_kpclientd(
     (binary, config, socket_dir): &KpSetup,
     bin_dir: &Path,
@@ -250,14 +250,14 @@ fn start_kpclientd(
     Ok(vec![(socket_dir.clone(), sandbox::KP_SOCKET_DIR)])
 }
 
-/// Core's ends of its sockets to purple-torctl and to the relay thread, and the relay.
+/// Core's ends of its sockets to purple-cloak and to the relay thread, and the relay.
 struct Route {
     core_torctl: UnixStream,
     core_launcher: UnixStream,
     starter: Arc<RelayStarter>,
 }
 
-/// Start purple-torctl on tor's control directory, and the thread that starts purple-relay
+/// Start purple-cloak on tor's control directory, and the thread that starts purple-transporter
 /// when core asks.
 fn start_route(
     config: &StoreConfig,
@@ -323,7 +323,7 @@ fn start_route(
 
 type SpawnRelay = Box<dyn Fn() -> io::Result<(String, Child)> + Send + Sync>;
 
-/// Starts purple-relay when core asks, at most once per run.
+/// Starts purple-transporter when core asks, at most once per run.
 struct RelayStarter {
     dir: PathBuf,
     wait: Duration,
@@ -392,7 +392,7 @@ fn serve_relay(mut core: UnixStream, starter: &RelayStarter) {
             LauncherMsg::StartRelay => match starter.start() {
                 Ok(()) => LauncherMsg::RelayUp,
                 Err(err) => {
-                    eprintln!("purple: purple-relay didn't start: {err}");
+                    eprintln!("purple: purple-transporter didn't start: {err}");
                     LauncherMsg::RelayFailed
                 }
             },
@@ -404,7 +404,7 @@ fn serve_relay(mut core: UnixStream, starter: &RelayStarter) {
     }
 }
 
-/// Daemons that don't exit on their own (kpclientd, tor, purple-relay), and the
+/// Daemons that don't exit on their own (kpclientd, tor, purple-transporter), and the
 /// directories and files made for them.
 #[derive(Default)]
 struct Daemons {
@@ -478,8 +478,8 @@ fn choose_mode(
     parse_store_config(&text).map(Mode::Tor)
 }
 
-/// The directories made for tor: what purple-net mounts, tor's control directory (for
-/// purple-torctl only), and the empty directory purple-relay makes its socket in if core
+/// The directories made for tor: what purple-subspace mounts, tor's control directory (for
+/// purple-cloak only), and the empty directory purple-transporter makes its socket in if core
 /// asks for it.
 struct TorDirs {
     net_sockets: Vec<(PathBuf, &'static str)>,
@@ -487,8 +487,8 @@ struct TorDirs {
     relay_dir: PathBuf,
 }
 
-/// Start tor and make the directories purple-net, purple-torctl and purple-relay need.
-/// tor bootstraps in the background; purple-torctl watches it. purple-relay isn't started
+/// Start tor and make the directories purple-subspace, purple-cloak and purple-transporter need.
+/// tor bootstraps in the background; purple-cloak watches it. purple-transporter isn't started
 /// here.
 fn start_tor(
     state_root: &Path,
@@ -533,10 +533,10 @@ fn start_tor(
     })
 }
 
-/// Start `purple-core`, and `purple-ui` when there's a display. With no display, core runs
+/// Start `purple-data`, and `purple-lcars` when there's a display. With no display, core runs
 /// its self-test. Core is told which store it uses, and pads its polls except over
 /// Katzenpost, which sends cover traffic of its own. With `route`, core also gets its
-/// sockets to purple-torctl and the relay thread.
+/// sockets to purple-cloak and the relay thread.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one thing core or the UI is started with"
@@ -643,7 +643,7 @@ fn fresh_private_dir(dir: &Path) -> io::Result<PathBuf> {
     Ok(dir.to_path_buf())
 }
 
-/// Wait up to `wait` until a daemon has made its socket, so `purple-net` can connect at
+/// Wait up to `wait` until a daemon has made its socket, so `purple-subspace` can connect at
 /// once.
 fn wait_for_socket(
     path: &Path,
@@ -676,7 +676,7 @@ fn core_store_arg(mode: &Mode) -> Option<String> {
     }
 }
 
-/// `purple-net`'s Tor flags, with tor's SOCKS socket and purple-relay's where its sandbox
+/// `purple-subspace`'s Tor flags, with tor's SOCKS socket and purple-transporter's where its sandbox
 /// mounts them. Two packets a second unless told otherwise.
 fn tor_net_args(config: &StoreConfig, send_interval_ms: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = ["--tor", sandbox::TOR_SOCKS, "--onion"]
@@ -707,7 +707,7 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// Arguments for `purple-net`.
+/// Arguments for `purple-subspace`.
 fn net_args(mode: &Mode, send_interval_ms: Option<&str>, no_ui: bool) -> Vec<String> {
     let mut args = Vec::new();
     match mode {
@@ -779,7 +779,7 @@ fn spawn_daemon(
     Ok((profile.binary().to_owned(), child))
 }
 
-/// Refuse a `kpclientd` config that wouldn't listen where `purple-net` connects, or that
+/// Refuse a `kpclientd` config that wouldn't listen where `purple-subspace` connects, or that
 /// also listens on an abstract socket, which any local process could connect to.
 fn check_kp_config(text: &str) -> io::Result<()> {
     if !text.contains(sandbox::KP_SOCKET) {
@@ -830,7 +830,7 @@ fn spawn(
     Ok((profile.binary().to_owned(), cmd.spawn()?))
 }
 
-/// `purple-ui` inherits the terminal.
+/// `purple-lcars` inherits the terminal.
 fn spawn_ui(
     wayland_display: OsString,
     bin_dir: &Path,
@@ -954,7 +954,8 @@ mod tests {
 
     #[test]
     fn no_relay_until_asked_and_only_once() {
-        let dir = std::env::temp_dir().join(format!("purple-relay-start-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("purple-transporter-start-{}", std::process::id()));
         fresh_private_dir(&dir).unwrap();
         let spawned = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&spawned);
@@ -966,7 +967,7 @@ mod tests {
                 count.fetch_add(1, Ordering::SeqCst);
                 fs::write(&socket, b"")?;
                 Ok((
-                    "purple-relay".to_owned(),
+                    "purple-transporter".to_owned(),
                     Command::new("sleep").arg("30").spawn()?,
                 ))
             }),
@@ -981,14 +982,15 @@ mod tests {
 
     #[test]
     fn a_relay_without_a_socket_fails_and_is_stopped() {
-        let dir = std::env::temp_dir().join(format!("purple-relay-fail-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("purple-transporter-fail-{}", std::process::id()));
         fresh_private_dir(&dir).unwrap();
         let starter = RelayStarter::new(
             dir.clone(),
             Duration::from_millis(200),
             Box::new(|| {
                 Ok((
-                    "purple-relay".to_owned(),
+                    "purple-transporter".to_owned(),
                     Command::new("sleep").arg("30").spawn()?,
                 ))
             }),
@@ -1000,7 +1002,8 @@ mod tests {
 
     #[test]
     fn the_relay_socket_speaks_launcher_messages() {
-        let dir = std::env::temp_dir().join(format!("purple-relay-ipc-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("purple-transporter-ipc-{}", std::process::id()));
         fresh_private_dir(&dir).unwrap();
         let socket = dir.join(RELAY_SOCKET_NAME);
         let starter = RelayStarter::new(
@@ -1009,7 +1012,7 @@ mod tests {
             Box::new(move || {
                 fs::write(&socket, b"")?;
                 Ok((
-                    "purple-relay".to_owned(),
+                    "purple-transporter".to_owned(),
                     Command::new("sleep").arg("30").spawn()?,
                 ))
             }),

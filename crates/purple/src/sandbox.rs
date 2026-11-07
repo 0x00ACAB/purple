@@ -9,26 +9,26 @@ use std::process::{Command, Stdio};
 
 /// Where the binaries directory is mounted inside every sandbox.
 const APP_DIR: &str = "/app";
-/// Where `purple-net` keeps its state inside its sandbox.
+/// Where `purple-subspace` keeps its state inside its sandbox.
 const NET_STATE_DIR: &str = "/state";
-/// Where `purple-core` keeps its database inside its sandbox.
+/// Where `purple-data` keeps its database inside its sandbox.
 pub(crate) const CORE_DATA_DIR: &str = "/data";
-/// Where `kpclientd`'s socket directory is mounted, in its sandbox and in `purple-net`'s.
+/// Where `kpclientd`'s socket directory is mounted, in its sandbox and in `purple-subspace`'s.
 pub(crate) const KP_SOCKET_DIR: &str = "/run/kp";
 /// The socket path `kpclientd`'s config must listen on.
 pub(crate) const KP_SOCKET: &str = "/run/kp/kpclientd.sock";
 /// Where the `kpclientd` binary and its config are mounted in its sandbox.
 const KP_BINARY: &str = "/opt/kpclientd";
 pub(crate) const KP_CONFIG: &str = "/etc/purple/kpclientd.toml";
-/// The TPM resource manager, the one device `purple-core` gets (same as
-/// `purple_core::tpm::TPM_DEVICE`).
+/// The TPM resource manager, the one device `purple-data` gets (same as
+/// `purple_data::tpm::TPM_DEVICE`).
 const TPM_DEVICE: &str = "/dev/tpmrm0";
-/// Where tor's socket directory is mounted, in its sandbox and in `purple-net`'s.
+/// Where tor's socket directory is mounted, in its sandbox and in `purple-subspace`'s.
 pub(crate) const TOR_SOCKET_DIR: &str = "/run/tor";
 /// tor's SOCKS socket.
 pub(crate) const TOR_SOCKS: &str = "/run/tor/socks.sock";
-/// Where tor's control socket directory is mounted, in tor's sandbox and purple-torctl's.
-/// Never in purple-net's.
+/// Where tor's control socket directory is mounted, in tor's sandbox and purple-cloak's.
+/// Never in purple-subspace's.
 pub(crate) const TORCTL_SOCKET_DIR: &str = "/run/torctl";
 /// tor's control socket.
 pub(crate) const TOR_CONTROL: &str = "/run/torctl/control.sock";
@@ -40,9 +40,9 @@ pub(crate) const TOR_DATA_DIR: &str = "/var/lib/tor";
 pub(crate) const TOR_RC: &str = "/etc/purple/torrc";
 /// The tor binary, from the system package.
 const TOR_BINARY: &str = "/usr/bin/tor";
-/// Where purple-relay's socket directory is mounted, in its sandbox and in `purple-net`'s.
+/// Where purple-transporter's socket directory is mounted, in its sandbox and in `purple-subspace`'s.
 pub(crate) const RELAY_SOCKET_DIR: &str = "/run/relay";
-/// purple-relay's socket.
+/// purple-transporter's socket.
 pub(crate) const RELAY_SOCKET: &str = "/run/relay/relay.sock";
 /// Fds bwrap reads the seccomp filters for daemons purple can't modify (kpclientd, tor)
 /// from.
@@ -63,7 +63,7 @@ pub(crate) enum Profile {
     /// Its own data directory. No network, no display.
     Core { data_dir: PathBuf },
     /// The terminal it inherits only. No network, nothing writable. `WAYLAND_DISPLAY` is
-    /// passed through so `purple-ui` can refuse to run outside a Wayland session.
+    /// passed through so `purple-lcars` can refuse to run outside a Wayland session.
     Ui { wayland_display: OsString },
     /// Katzenpost's client daemon: network access, its config read-only, and the directory
     /// it creates its socket in. purple can't modify it, so bwrap installs purple's seccomp
@@ -84,22 +84,22 @@ pub(crate) enum Profile {
         control_dir: PathBuf,
         torrc: PathBuf,
     },
-    /// purple-relay: network access and the directory it makes its socket in.
+    /// purple-transporter: network access and the directory it makes its socket in.
     Relay { socket_dir: PathBuf },
-    /// purple-torctl: tor's control directory read-only. No network, nothing writable.
+    /// purple-cloak: tor's control directory read-only. No network, nothing writable.
     TorCtl { control_dir: PathBuf },
 }
 
 impl Profile {
     pub(crate) const fn binary(&self) -> &'static str {
         match self {
-            Self::Net { .. } => "purple-net",
-            Self::Core { .. } => "purple-core",
-            Self::Ui { .. } => "purple-ui",
+            Self::Net { .. } => "purple-subspace",
+            Self::Core { .. } => "purple-data",
+            Self::Ui { .. } => "purple-lcars",
             Self::KpClientd { .. } => "kpclientd",
             Self::Tor { .. } => "tor",
-            Self::Relay { .. } => "purple-relay",
-            Self::TorCtl { .. } => "purple-torctl",
+            Self::Relay { .. } => "purple-transporter",
+            Self::TorCtl { .. } => "purple-cloak",
         }
     }
 
@@ -172,7 +172,7 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
             if sockets.is_empty() {
                 share_net(&mut out);
             }
-            // Otherwise the daemons do the networking; purple-net gets only their sockets
+            // Otherwise the daemons do the networking; purple-subspace gets only their sockets
             // and no network namespace of its own.
             for (dir, inside) in sockets {
                 out.extend(["--ro-bind".into(), dir.into(), (*inside).into()]);
@@ -361,7 +361,7 @@ mod tests {
             .unwrap();
         assert_eq!(with[at - 1], "--ro-bind");
         assert_eq!(with[at + 1], KP_SOCKET_DIR);
-        // With kpclientd doing the networking, purple-net gets none.
+        // With kpclientd doing the networking, purple-subspace gets none.
         assert!(!has(&with, "--share-net"));
         let without = bwrap_args(
             &Profile::Net {
@@ -536,7 +536,7 @@ mod tests {
         assert!(has(&net, "--share-net"));
         assert!(!has(&core, "--share-net"));
         assert!(!has(&ui, "--share-net"));
-        // The daemons that do the networking for purple-net get it too.
+        // The daemons that do the networking for purple-subspace get it too.
         for daemon in [
             tor(),
             Profile::Relay {
@@ -581,7 +581,7 @@ mod tests {
             Path::new("/b"),
             &["--no-ui"],
         );
-        assert_eq!(args[args.len() - 2], "/app/purple-core");
+        assert_eq!(args[args.len() - 2], "/app/purple-data");
         assert_eq!(args[args.len() - 1], "--no-ui");
     }
 
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(args[at - 1], "--ro-bind");
         assert_eq!(args[at + 1], TORCTL_SOCKET_DIR);
         assert!(!has(&args, TOR_SOCKET_DIR) && !has(&args, RELAY_SOCKET_DIR));
-        assert_eq!(args[args.len() - 1], "/app/purple-torctl");
+        assert_eq!(args[args.len() - 1], "/app/purple-cloak");
     }
 
     #[test]
@@ -644,7 +644,8 @@ mod tests {
         if !bwrap_works() {
             return;
         }
-        let base = std::env::temp_dir().join(format!("purple-net-sees-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("purple-subspace-sees-{}", std::process::id()));
         let (socks, relay, ctl) = (base.join("tor"), base.join("relay"), base.join("torctl"));
         for d in [&socks, &relay, &ctl] {
             std::fs::create_dir_all(d).unwrap();
@@ -658,7 +659,7 @@ mod tests {
             Path::new("/usr/bin"),
             &[],
         );
-        args.pop(); // the purple-net path
+        args.pop(); // the purple-subspace path
         let sees = |path: &str| {
             let mut probe = args.clone();
             probe.extend(["/usr/bin/test", "-e", path].map(OsString::from));

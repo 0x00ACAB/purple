@@ -1,0 +1,15 @@
+[package]
+name = "purple-cloak"
+description = "Drives tor for purple: watches its bootstrap, walks the bridge fallback, asks the user when blocked"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+purple-shields.workspace = true
+purple-combadge.workspace = true
+
+[lints]
+workspace = true

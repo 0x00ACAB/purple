@@ -1,0 +1,123 @@
+//! purple-lcars: the terminal UI. Talks only to `purple-data`; has no network and no keys.
+
+mod app;
+
+use std::io::{self, stdout};
+use std::os::unix::net::UnixStream;
+use std::process::ExitCode;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
+
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::execute;
+use landlock::RulesetStatus;
+use purple_combadge::ui::{UiCmd, UiEvent};
+use purple_combadge::{UI_CORE_FD, inherited_stream};
+use purple_shields::sandbox::{Network, Policy, restrict};
+use ratatui::DefaultTerminal;
+use zeroize::Zeroize;
+
+use app::{Model, Msg, update, view};
+
+/// How long to wait for a key before checking for events from `purple-data`.
+const TICK: Duration = Duration::from_millis(100);
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("purple-lcars: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[expect(unsafe_code, reason = "adopting the socket the launcher passed in")]
+fn run() -> io::Result<()> {
+    purple_shields::harden()?;
+    let sandbox = restrict(&Policy {
+        writable: &[],
+        network: Network::Denied,
+    })?;
+    // On X11 any client can read keystrokes and screenshot other windows.
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return Err(io::Error::other(
+            "WAYLAND_DISPLAY is not set; purple only runs on Wayland",
+        ));
+    }
+    // SAFETY: the launcher hands this fd to purple-lcars and nothing else here uses it.
+    let mut core = unsafe { inherited_stream(UI_CORE_FD)? };
+    let events = spawn_event_reader(core.try_clone()?);
+
+    let mut terminal = ratatui::try_init()?;
+    execute!(stdout(), EnableBracketedPaste)?;
+    let mut model = Model::new();
+    if sandbox.landlock != RulesetStatus::FullyEnforced {
+        model.note(format!(
+            "warning: Landlock only {:?} on this kernel",
+            sandbox.landlock
+        ));
+    }
+    let result = event_loop(&mut terminal, &mut model, &mut core, &events);
+    execute!(stdout(), DisableBracketedPaste).ok();
+    ratatui::try_restore()?;
+    result
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "resize redraws on the next tick anyway; mouse and focus events are unused"
+)]
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    model: &mut Model,
+    core: &mut UnixStream,
+    events: &Receiver<Msg>,
+) -> io::Result<()> {
+    while !model.should_quit() {
+        terminal.draw(|frame| view(model, frame))?;
+        while let Ok(msg) = events.try_recv() {
+            apply(model, msg, core)?;
+        }
+        if event::poll(TICK)? {
+            let msg = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => Msg::Key(key),
+                Event::Paste(text) => Msg::Paste(text),
+                _ => continue,
+            };
+            apply(model, msg, core)?;
+        }
+    }
+    Ok(())
+}
+
+fn apply(model: &mut Model, msg: Msg, core: &mut UnixStream) -> io::Result<()> {
+    for mut cmd in update(model, msg) {
+        let written = cmd.write_to(core);
+        if let UiCmd::Unlock { passphrase } = &mut cmd {
+            passphrase.zeroize();
+        }
+        written?;
+    }
+    Ok(())
+}
+
+/// Read events from `purple-data` on their own thread and hand them to the UI loop.
+fn spawn_event_reader(mut core: UnixStream) -> Receiver<Msg> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            let msg = match UiEvent::read_from(&mut core) {
+                Ok(Some(event)) => Msg::Core(event),
+                Ok(None) => Msg::CoreGone("closed the connection".to_owned()),
+                Err(err) => Msg::CoreGone(err.to_string()),
+            };
+            let gone = matches!(msg, Msg::CoreGone(_));
+            if tx.send(msg).is_err() || gone {
+                return;
+            }
+        }
+    });
+    rx
+}

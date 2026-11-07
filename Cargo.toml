@@ -38,8 +38,8 @@ sha2 = "0.10"
 snow = "0.9"
 p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
 zeroize = "1"
-purple-harden = { path = "crates/purple-harden" }
-purple-ipc = { path = "crates/purple-ipc" }
+purple-shields = { path = "crates/purple-shields" }
+purple-combadge = { path = "crates/purple-combadge" }
 
 [workspace.lints.rust]
 # Every unsafe operation is opted into explicitly with #[expect(unsafe_code, reason = "...")].

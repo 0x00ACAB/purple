@@ -1,0 +1,17 @@
+[package]
+name = "purple-memory-alpha"
+description = "purple's box store: write-once boxes on disk, served over a Tor onion service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+landlock.workspace = true
+purple-shields.workspace = true
+purple-combadge.workspace = true
+purple-subspace = { path = "../purple-subspace" }
+
+[lints]
+workspace = true

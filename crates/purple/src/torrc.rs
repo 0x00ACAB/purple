@@ -1,5 +1,5 @@
 //! The torrc purple runs tor with: a client only, with its SOCKS socket in the directory
-//! purple-net sees and its control socket in one only purple-torctl sees, and a circuit
+//! purple-subspace sees and its control socket in one only purple-cloak sees, and a circuit
 //! per SOCKS username.
 
 use crate::sandbox::{TOR_CONTROL, TOR_COOKIE, TOR_DATA_DIR, TOR_SOCKS};
