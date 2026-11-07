@@ -428,7 +428,7 @@ Several members can write to the same box. Section 13.3 covers how writers resol
 ### 9.4. Membership
 
 Only the creator commits. Since commits come from one member, they never conflict and need
-no ordering.
+no ordering. Members change only their own leaf, through Update proposals (below).
 
 Adding a contact `C` to group `G`:
 
@@ -452,6 +452,21 @@ On receiving a Welcome, `C` MUST check every member's credential and that the cr
 Removing: the creator commits a Remove. A member who wants to leave sends
 `GroupLeave(G)` over 1:1 and the creator commits the removal. A member MUST reject a
 commit whose sender is not the creator.
+
+Key updates: each member replaces its leaf key about once a day. When 24 hours have passed
+since its leaf last changed, a member sends an MLS Update proposal to the current epoch's
+stream, at most one per epoch. Every member MUST keep each Update proposal whose new
+leaf's credential verifies to the sender's identity key, up to 100 per epoch in the order
+read, because the creator's commit names proposals by reference; it MUST ignore any other
+proposal. Kept proposals stay outside the MLS proposal store (an OpenMLS client can't send
+application messages while that store is non-empty) and are loaded into it just before a
+commit is built or processed. The creator commits the kept proposals 5 minutes after the
+first one arrives, with an update path, which also replaces its own leaf; with no
+proposals for 24 hours it commits a path alone. Before committing, the creator MUST leave
+out any proposal with which the commit can't be built, so one member can't block commits.
+Add and Remove commits carry no proposals. Any epoch change discards kept proposals, and
+a proposal for an ended epoch fails with a wrong-epoch error and MUST be ignored; its
+sender proposes again in the new epoch.
 
 ### 9.5. Group content
 
@@ -687,6 +702,10 @@ pretends a box is empty. Forging or moving packets fails authentication (Section
 - In direct mode the store sees the client's IP address (Section 12.3).
 - Anyone who sees an invite can tell when it was used, by watching its bundle and intro
   queues. Invites SHOULD be passed over a channel the user trusts and used once.
+- A member whose client hasn't run for longer than the box retention (7 days) misses the
+  commits made meanwhile, since their boxes have expired, and stays in the old epoch.
+  With daily key updates there is always such a commit. The client warns at start and the
+  creator has to remove and re-add the member.
 
 ### 14.3. Cryptographic choices
 
@@ -697,6 +716,10 @@ packet layer itself uses classical X25519.
 Group members' identities rest on the identity-key signature in their credential
 (Section 9.2), checked by every member, not on trust in the creator. The creator does
 control who is in the group and the display names members see for people they don't know.
+
+Daily key updates give members post-compromise security within about a day: a leaf key
+stolen from a member's device stops decrypting new epochs once that member's next update
+is committed. A creator that refuses to commit updates can withhold this.
 
 ### 14.4. Endpoint security
 
@@ -768,6 +791,9 @@ This document has no IANA actions.
 | Group members, max | 50 |
 | Past MLS epochs kept (see note) | 2 |
 | Old epoch stream drain time | 600 s |
+| Member key update interval | 24 h |
+| Update batching window | 5 min |
+| Stale group warning | 7 days |
 | Write rate over Tor, mean | 2 packets/s |
 | Poll interval | 2 s |
 | Read padding multiple | 16 |
