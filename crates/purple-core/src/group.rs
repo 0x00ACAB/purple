@@ -12,7 +12,7 @@ use std::fmt;
 use libsignal_protocol::IdentityKey;
 use openmls::prelude::{
     ContentType, GroupId, KeyPackage, LeafNodeParameters, MlsGroup, ProcessMessageError,
-    ProcessedMessageContent, ProtocolMessage, Proposal, QueuedProposal, Sender, StagedWelcome,
+    ProcessedMessageContent, Proposal, ProtocolMessage, QueuedProposal, Sender, StagedWelcome,
     ValidationError,
 };
 use openmls_traits::OpenMlsProvider;
@@ -1458,7 +1458,10 @@ mod tests {
             "one proposal per epoch"
         );
         let bytes = message(&bobs.streams()[0], &proposal);
-        for (provider, state) in [(&alice.provider, &mut group), (&carol.provider, &mut carols)] {
+        for (provider, state) in [
+            (&alice.provider, &mut group),
+            (&carol.provider, &mut carols),
+        ] {
             assert!(matches!(
                 state.receive(provider, &bytes, &creator).unwrap(),
                 Received::Nothing
@@ -1522,7 +1525,8 @@ mod tests {
             .unwrap();
         assert!(group.held.is_empty());
         let commit_bytes = message(&bobs.streams()[0], &commit.unwrap());
-        bobs.receive(&bob.provider, &commit_bytes, &creator).unwrap();
+        bobs.receive(&bob.provider, &commit_bytes, &creator)
+            .unwrap();
         carols
             .receive(&carol.provider, &commit_bytes, &creator)
             .unwrap();
@@ -1587,7 +1591,12 @@ mod tests {
         // Bob's first tick stamps his fresh leaf; nothing is due yet. The creator's first
         // tick comes later, so its own day starts then and doesn't overlap the window.
         assert!(bobs.tick(&bob.provider, T0).unwrap().out.is_none());
-        assert!(bobs.tick(&bob.provider, T0 + UPDATE_SECS - 1).unwrap().out.is_none());
+        assert!(
+            bobs.tick(&bob.provider, T0 + UPDATE_SECS - 1)
+                .unwrap()
+                .out
+                .is_none()
+        );
 
         let proposal = bobs
             .tick(&bob.provider, T0 + UPDATE_SECS)
@@ -1595,7 +1604,10 @@ mod tests {
             .out
             .unwrap();
         assert!(
-            bobs.tick(&bob.provider, T0 + UPDATE_SECS + 2).unwrap().out.is_none(),
+            bobs.tick(&bob.provider, T0 + UPDATE_SECS + 2)
+                .unwrap()
+                .out
+                .is_none(),
             "not twice in one epoch"
         );
         let bytes = message(&bobs.streams()[0], &proposal);
@@ -1605,33 +1617,68 @@ mod tests {
         let now = T0 + UPDATE_SECS;
         let opened = group.tick(&alice.provider, now).unwrap();
         assert!(opened.out.is_none() && opened.changed);
-        assert!(group.tick(&alice.provider, now + BATCH_SECS - 1).unwrap().out.is_none());
+        assert!(
+            group
+                .tick(&alice.provider, now + BATCH_SECS - 1)
+                .unwrap()
+                .out
+                .is_none()
+        );
         let commit = group
             .tick(&alice.provider, now + BATCH_SECS)
             .unwrap()
             .out
             .unwrap();
         let commit_bytes = message(&bobs.streams()[0], &commit);
-        bobs.receive(&bob.provider, &commit_bytes, &creator).unwrap();
+        bobs.receive(&bob.provider, &commit_bytes, &creator)
+            .unwrap();
 
         // Bob's update landed: stamped, and not due again for a day.
         let at = T0 + UPDATE_SECS + 400;
         assert!(bobs.tick(&bob.provider, at).unwrap().changed);
-        assert!(bobs.tick(&bob.provider, at + UPDATE_SECS - 1).unwrap().out.is_none());
-        assert!(bobs.tick(&bob.provider, at + UPDATE_SECS).unwrap().out.is_some());
+        assert!(
+            bobs.tick(&bob.provider, at + UPDATE_SECS - 1)
+                .unwrap()
+                .out
+                .is_none()
+        );
+        assert!(
+            bobs.tick(&bob.provider, at + UPDATE_SECS)
+                .unwrap()
+                .out
+                .is_some()
+        );
     }
 
     #[test]
     fn the_creator_self_updates_after_a_quiet_day_unless_alone() {
         let (alice, mut group, _bob, _bobs) = pair();
         group.tick(&alice.provider, T0).unwrap();
-        assert!(group.tick(&alice.provider, T0 + UPDATE_SECS - 1).unwrap().out.is_none());
-        assert!(group.tick(&alice.provider, T0 + UPDATE_SECS).unwrap().out.is_some());
+        assert!(
+            group
+                .tick(&alice.provider, T0 + UPDATE_SECS - 1)
+                .unwrap()
+                .out
+                .is_none()
+        );
+        assert!(
+            group
+                .tick(&alice.provider, T0 + UPDATE_SECS)
+                .unwrap()
+                .out
+                .is_some()
+        );
 
         let solo = member();
         let mut alone = Group::create(&solo.provider, &solo.account).unwrap();
         alone.tick(&solo.provider, T0).unwrap();
-        assert!(alone.tick(&solo.provider, T0 + 10 * UPDATE_SECS).unwrap().out.is_none());
+        assert!(
+            alone
+                .tick(&solo.provider, T0 + 10 * UPDATE_SECS)
+                .unwrap()
+                .out
+                .is_none()
+        );
     }
 
     #[test]
@@ -1642,7 +1689,11 @@ mod tests {
         bobs.tick(&bob.provider, T0).unwrap();
         let proposal = bobs.propose_update(&bob.provider).unwrap();
         group
-            .receive(&alice.provider, &message(&bobs.streams()[0], &proposal), &creator)
+            .receive(
+                &alice.provider,
+                &message(&bobs.streams()[0], &proposal),
+                &creator,
+            )
             .unwrap();
         group.tick(&alice.provider, T0 + 10).unwrap();
 
@@ -1654,7 +1705,13 @@ mod tests {
         let provider = Provider::decode(&mut r).unwrap();
         let mut restored = Group::decode(&mut r, &provider, 6).unwrap();
         r.finish().unwrap();
-        assert!(restored.tick(&provider, T0 + 10 + BATCH_SECS).unwrap().out.is_some());
+        assert!(
+            restored
+                .tick(&provider, T0 + 10 + BATCH_SECS)
+                .unwrap()
+                .out
+                .is_some()
+        );
     }
 
     #[test]
@@ -1665,7 +1722,10 @@ mod tests {
         group.tick(&alice.provider, T0).unwrap();
         assert!(!bobs.stale(T0 + STALE_SECS));
         assert!(bobs.stale(T0 + STALE_SECS + 1));
-        assert!(!group.stale(T0 + STALE_SECS + 1), "the creator can't fall behind");
+        assert!(
+            !group.stale(T0 + STALE_SECS + 1),
+            "the creator can't fall behind"
+        );
     }
 
     /// Save and restore `state` the way a restart does.
@@ -1776,7 +1836,10 @@ mod tests {
         assert_ne!(carols.leaf_key(), carol_before, "the honest update went in");
 
         let out = group
-            .send(&alice.provider, &GroupContent::Text(b"still one group".to_vec()))
+            .send(
+                &alice.provider,
+                &GroupContent::Text(b"still one group".to_vec()),
+            )
             .unwrap();
         let text = message(&bobs.streams()[0], &out);
         assert!(matches!(
@@ -1856,13 +1919,20 @@ mod tests {
             bobs.receive(&bob.provider, bytes, &creator).unwrap();
         }
         group
-            .receive(&alice.provider, &message(&bobs.streams()[0], &own), &creator)
+            .receive(
+                &alice.provider,
+                &message(&bobs.streams()[0], &own),
+                &creator,
+            )
             .unwrap();
 
         let commit = group.commit_updates(&alice.provider).unwrap().unwrap();
         let commit = message(&bobs.streams()[0], &commit);
         let got = bobs.receive(&bob.provider, &commit, &creator);
-        assert!(got.is_ok(), "Bob holds every proposal the commit names: {got:?}");
+        assert!(
+            got.is_ok(),
+            "Bob holds every proposal the commit names: {got:?}"
+        );
         assert!(bobs.leaf_key() != before, "Bob's update went in");
     }
 }

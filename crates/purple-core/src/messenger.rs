@@ -2128,7 +2128,10 @@ mod tests {
         for out in ticked.outgoing {
             provider.deliver(out);
         }
-        assert!(provider.poll(&mut alice).is_empty(), "a proposal shows nothing");
+        assert!(
+            provider.poll(&mut alice).is_empty(),
+            "a proposal shows nothing"
+        );
         assert!(provider.poll(&mut carol).is_empty());
 
         let start = T0 + UPDATE_SECS;
@@ -2158,7 +2161,10 @@ mod tests {
         provider.deliver(out);
         assert!(bob.rekey_group("team").is_err(), "already waiting");
         provider.poll(&mut alice);
-        assert!(matches!(alice.rekey_group("team").unwrap(), Rekey::Committed(_)));
+        assert!(matches!(
+            alice.rekey_group("team").unwrap(),
+            Rekey::Committed(_)
+        ));
         assert!(bob.rekey_group("nope").is_err());
 
         let mut solo = Messenger::new().unwrap();
@@ -2182,7 +2188,10 @@ mod tests {
         let (_, errors) = provider.poll_counting_errors(&mut alice);
         assert_eq!(errors, 0, "an old-epoch proposal isn't an error");
         provider.poll(&mut bob);
-        assert!(matches!(bob.rekey_group("team").unwrap(), Rekey::Proposed(_)));
+        assert!(matches!(
+            bob.rekey_group("team").unwrap(),
+            Rekey::Proposed(_)
+        ));
     }
 
     #[test]

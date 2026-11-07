@@ -202,10 +202,9 @@ impl std::fmt::Debug for UiCmd {
                 .debug_struct("GroupMembers")
                 .field("group", group)
                 .finish(),
-            Self::GroupRekey { group } => f
-                .debug_struct("GroupRekey")
-                .field("group", group)
-                .finish(),
+            Self::GroupRekey { group } => {
+                f.debug_struct("GroupRekey").field("group", group).finish()
+            }
             Self::GroupSend { group, .. } => f
                 .debug_struct("GroupSend")
                 .field("group", group)
