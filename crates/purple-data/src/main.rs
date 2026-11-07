@@ -133,7 +133,7 @@ fn run() -> io::Result<()> {
             store,
             torctl,
         } => {
-            // SAFETY: the launcher hands this fd to purple-data and nothing else here uses it.
+            // SAFETY: the launcher passes this fd only to purple-data; nothing else uses it.
             let ui = unsafe { inherited_stream(CORE_UI_FD)? };
             let route = if torctl {
                 // SAFETY: with --torctl the launcher hands this fd to purple-data and
@@ -391,7 +391,7 @@ fn unlock(
                 Ok(Input::Net(Ok(Some(_)))) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "purple-subspace replied before core read anything",
+                        "purple-subspace replied before purple-data read anything",
                     ));
                 }
             }
@@ -877,7 +877,7 @@ impl Reads {
             })),
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "purple-subspace answered a read core didn't send",
+                "purple-subspace answered a read purple-data didn't send",
             )),
         }
     }

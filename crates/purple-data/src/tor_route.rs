@@ -118,7 +118,7 @@ impl TorRoute {
                 self.relay_failed(ui)
             }
             Ok(Some(TorCtlMsg::Choose(_) | TorCtlMsg::DirectUp | TorCtlMsg::DirectFailed)) => {
-                eprintln!("purple-data: purple-cloak sent a message only core may send");
+                eprintln!("purple-data: purple-cloak sent a message only purple-data may send");
                 Ok(())
             }
             Ok(None) | Err(_) => {
@@ -141,7 +141,7 @@ impl TorRoute {
             Ok(Some(LauncherMsg::RelayUp | LauncherMsg::RelayFailed))
                 if !std::mem::take(&mut self.relay_pending) =>
             {
-                eprintln!("purple-data: the launcher answered a request core didn't make");
+                eprintln!("purple-data: the launcher answered a request purple-data didn't make");
                 Ok(())
             }
             Ok(Some(LauncherMsg::RelayUp)) => {
@@ -151,7 +151,7 @@ impl TorRoute {
             }
             Ok(Some(LauncherMsg::RelayFailed)) => self.relay_failed(ui),
             Ok(Some(LauncherMsg::StartRelay)) => {
-                eprintln!("purple-data: the launcher sent a message only core may send");
+                eprintln!("purple-data: the launcher sent a message only purple-data may send");
                 Ok(())
             }
             Ok(None) | Err(_) => {

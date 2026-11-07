@@ -635,8 +635,8 @@ const BLOCKED_HELP: &[&str] = &[
     "    The store will see your IP address and when you're online. Your ISP will see that you use this store. If your contact also connects directly, the store can tell that you two talk.",
 ];
 
-/// The rule purple-subspace applies to bridge lines (`check_bridge_line`), checked here too so
-/// the user hears at once: not empty, at most 1000 bytes, printable ASCII without quotes
+/// The rule purple-subspace applies to bridge lines (`check_bridge_line`), checked here too
+/// so the user hears at once: not empty, at most 1000 bytes, printable ASCII without quotes
 /// or backslashes.
 fn safe_bridge_line(line: &str) -> bool {
     !line.is_empty()

@@ -1,7 +1,7 @@
-//! purple-transporter: the one process that may reach the store without Tor, used only after the
-//! user chose a direct connection. It pipes each connection on its Unix socket to one fixed
-//! IP address and port; it never sees plaintext (purple-subspace runs Noise through it) and can't
-//! be pointed anywhere else.
+//! purple-transporter: the one process that may reach the store without Tor, used only
+//! after the user chose a direct connection. It pipes each connection on its Unix socket to
+//! one fixed IP address and port; it never sees plaintext (purple-subspace runs Noise
+//! through it) and can't be pointed anywhere else.
 //!
 //! Usage: `purple-transporter --listen <socket> --connect <ip:port>`.
 

@@ -1,20 +1,20 @@
-//! purple launcher: starts `purple-subspace`, `purple-data` and `purple-lcars`, each in its own
-//! bubblewrap sandbox, connected only by the sockets passed in here.
+//! purple launcher: starts `purple-subspace`, `purple-data` and `purple-lcars`, each in its
+//! own bubblewrap sandbox, connected only by the sockets passed in here.
 //!
 //! Usage: `purple [--no-ui] [--store-config <file>] [--dev-provider <addr>]
 //! [--send-interval-ms <ms>] [--kpclientd <binary> --kp-config <file>]`. `--no-ui` runs the
 //! self-test instead of the TUI.
 //!
 //! The TUI uses the box store named in the store config (`--store-config`, by default
-//! `$XDG_CONFIG_HOME/purple/store.conf`), reached through C tor in its own sandbox, and,
-//! if the config has a direct port and the user asks for it, through purple-transporter, which
+//! `$XDG_CONFIG_HOME/purple/store.conf`), reached through C tor in its own sandbox, and, if
+//! the config has a direct port and the user asks for it, through purple-transporter, which
 //! the launcher starts only when core asks. purple-cloak drives tor's control port. The
 //! self-test uses an in-memory network unless given a store config. `--dev-provider` points
 //! `purple-subspace` at a local `purple-holodeck`. `--send-interval-ms` sets the mean gap
 //! between packets in the cover stream (default 500 over Tor, 1000 otherwise; the self-test
 //! uses 50 unless told otherwise). `--kpclientd` and `--kp-config` run Katzenpost's client
-//! daemon instead of tor, with its socket shared read-only with `purple-subspace`, which then
-//! stores boxes on Pigeonhole.
+//! daemon instead of tor, with its socket shared read-only with `purple-subspace`, which
+//! then stores boxes on Pigeonhole.
 
 mod sandbox;
 mod store_config;
@@ -257,8 +257,8 @@ struct Route {
     starter: Arc<RelayStarter>,
 }
 
-/// Start purple-cloak on tor's control directory, and the thread that starts purple-transporter
-/// when core asks.
+/// Start purple-cloak on tor's control directory, and the thread that starts
+/// purple-transporter when core asks.
 fn start_route(
     config: &StoreConfig,
     dirs: &TorDirs,
@@ -479,17 +479,17 @@ fn choose_mode(
 }
 
 /// The directories made for tor: what purple-subspace mounts, tor's control directory (for
-/// purple-cloak only), and the empty directory purple-transporter makes its socket in if core
-/// asks for it.
+/// purple-cloak only), and the empty directory purple-transporter makes its socket in if
+/// core asks for it.
 struct TorDirs {
     net_sockets: Vec<(PathBuf, &'static str)>,
     control_dir: PathBuf,
     relay_dir: PathBuf,
 }
 
-/// Start tor and make the directories purple-subspace, purple-cloak and purple-transporter need.
-/// tor bootstraps in the background; purple-cloak watches it. purple-transporter isn't started
-/// here.
+/// Start tor and make the directories purple-subspace, purple-cloak and purple-transporter
+/// need. tor bootstraps in the background; purple-cloak watches it. purple-transporter
+/// isn't started here.
 fn start_tor(
     state_root: &Path,
     bin_dir: &Path,
@@ -533,8 +533,8 @@ fn start_tor(
     })
 }
 
-/// Start `purple-data`, and `purple-lcars` when there's a display. With no display, core runs
-/// its self-test. Core is told which store it uses, and pads its polls except over
+/// Start `purple-data`, and `purple-lcars` when there's a display. With no display, core
+/// runs its self-test. Core is told which store it uses, and pads its polls except over
 /// Katzenpost, which sends cover traffic of its own. With `route`, core also gets its
 /// sockets to purple-cloak and the relay thread.
 #[expect(
@@ -643,8 +643,8 @@ fn fresh_private_dir(dir: &Path) -> io::Result<PathBuf> {
     Ok(dir.to_path_buf())
 }
 
-/// Wait up to `wait` until a daemon has made its socket, so `purple-subspace` can connect at
-/// once.
+/// Wait up to `wait` until a daemon has made its socket, so `purple-subspace` can connect
+/// at once.
 fn wait_for_socket(
     path: &Path,
     (name, daemon): &mut (String, Child),
@@ -676,8 +676,8 @@ fn core_store_arg(mode: &Mode) -> Option<String> {
     }
 }
 
-/// `purple-subspace`'s Tor flags, with tor's SOCKS socket and purple-transporter's where its sandbox
-/// mounts them. Two packets a second unless told otherwise.
+/// `purple-subspace`'s Tor flags, with tor's SOCKS socket and purple-transporter's where
+/// its sandbox mounts them. Two packets a second unless told otherwise.
 fn tor_net_args(config: &StoreConfig, send_interval_ms: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = ["--tor", sandbox::TOR_SOCKS, "--onion"]
         .map(str::to_owned)
@@ -779,8 +779,8 @@ fn spawn_daemon(
     Ok((profile.binary().to_owned(), child))
 }
 
-/// Refuse a `kpclientd` config that wouldn't listen where `purple-subspace` connects, or that
-/// also listens on an abstract socket, which any local process could connect to.
+/// Refuse a `kpclientd` config that wouldn't listen where `purple-subspace` connects, or
+/// that also listens on an abstract socket, which any local process could connect to.
 fn check_kp_config(text: &str) -> io::Result<()> {
     if !text.contains(sandbox::KP_SOCKET) {
         return Err(io::Error::other(format!(

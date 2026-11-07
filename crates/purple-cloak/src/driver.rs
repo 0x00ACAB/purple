@@ -51,7 +51,7 @@ pub fn drive(
             Ok(TorCtlMsg::DirectUp) => fallback.direct_up(),
             Ok(TorCtlMsg::DirectFailed) => fallback.direct_failed(),
             Ok(TorCtlMsg::Status(_) | TorCtlMsg::GoDirect | TorCtlMsg::Notice(_)) => {
-                eprintln!("purple-cloak: core sent a message only torctl may send");
+                eprintln!("purple-cloak: purple-data sent a message only purple-cloak may send");
                 Vec::new()
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),

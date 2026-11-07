@@ -148,7 +148,7 @@ impl TorCtlMsg {
             )),
             [TAG_DIRECT_UP] => Self::DirectUp,
             [TAG_DIRECT_FAILED] => Self::DirectFailed,
-            _ => return Err(invalid("malformed torctl message")),
+            _ => return Err(invalid("malformed purple-cloak message")),
         }))
     }
 }

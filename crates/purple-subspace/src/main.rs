@@ -1,15 +1,17 @@
-//! purple-subspace: relays packets between `purple-data` and the network, sending real packets
-//! only in the slots of a constant-rate cover stream (see [`purple_subspace::scheduler`]).
+//! purple-subspace: relays packets between `purple-data` and the network, sending real
+//! packets only in the slots of a constant-rate cover stream (see
+//! [`purple_subspace::scheduler`]).
 //!
 //! Usage: `purple-subspace [--katzenpost <socket> | --dev-provider <addr> | --tor <socks>
 //! --onion <host>:<port> [--direct-relay <socket> --direct-key <hex>]]
 //! [--send-interval-ms <ms>]`. With `--tor` it reaches the store's onion service through
-//! tor's SOCKS socket, and when core says so, through purple-transporter to the store's direct
-//! port; it opens no network connection of its own and never sees tor's control port. With `--katzenpost` it stores boxes on Pigeonhole through
-//! the kpclientd listening on `socket`, and may not open any other connection. With
-//! `--dev-provider` it forwards to a local `purple-holodeck`, so several purple
-//! instances on one machine can talk. With neither, it uses an in-memory network only
-//! this instance can see. `--send-interval-ms` is the mean gap between packets.
+//! tor's SOCKS socket, and when core says so, through purple-transporter to the store's
+//! direct port; it opens no network connection of its own and never sees tor's control
+//! port. With `--katzenpost` it stores boxes on Pigeonhole through the kpclientd listening
+//! on `socket`, and may not open any other connection. With `--dev-provider` it forwards to
+//! a local `purple-holodeck`, so several purple instances on one machine can talk. With
+//! neither, it uses an in-memory network only this instance can see. `--send-interval-ms`
+//! is the mean gap between packets.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -64,7 +66,8 @@ struct TorNet {
     socks: PathBuf,
     host: String,
     port: u16,
-    /// purple-transporter's socket and the store's Noise key, if the store has a direct port.
+    /// purple-transporter's socket and the store's Noise key, if the store has a direct
+    /// port.
     direct: Option<(PathBuf, [u8; 32])>,
 }
 
@@ -193,8 +196,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> io::Result<Options> {
 fn run() -> io::Result<()> {
     purple_shields::harden()?;
     let options = parse_args(std::env::args().skip(1))?;
-    // With Katzenpost or Tor, kpclientd or tor (and purple-transporter) do all the networking:
-    // purple-subspace only needs their sockets.
+    // With Katzenpost or Tor, kpclientd or tor (and purple-transporter) do all the
+    // networking: purple-subspace only needs their sockets.
     let network = match options.store {
         Store::Katzenpost(_) | Store::Tor(_) => Network::Local,
         Store::InMemory | Store::DevProvider(_) => Network::Allowed,

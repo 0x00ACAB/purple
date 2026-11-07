@@ -13,7 +13,8 @@ const APP_DIR: &str = "/app";
 const NET_STATE_DIR: &str = "/state";
 /// Where `purple-data` keeps its database inside its sandbox.
 pub(crate) const CORE_DATA_DIR: &str = "/data";
-/// Where `kpclientd`'s socket directory is mounted, in its sandbox and in `purple-subspace`'s.
+/// Where `kpclientd`'s socket directory is mounted, in its sandbox and in
+/// `purple-subspace`'s.
 pub(crate) const KP_SOCKET_DIR: &str = "/run/kp";
 /// The socket path `kpclientd`'s config must listen on.
 pub(crate) const KP_SOCKET: &str = "/run/kp/kpclientd.sock";
@@ -40,7 +41,8 @@ pub(crate) const TOR_DATA_DIR: &str = "/var/lib/tor";
 pub(crate) const TOR_RC: &str = "/etc/purple/torrc";
 /// The tor binary, from the system package.
 const TOR_BINARY: &str = "/usr/bin/tor";
-/// Where purple-transporter's socket directory is mounted, in its sandbox and in `purple-subspace`'s.
+/// Where purple-transporter's socket directory is mounted, in its sandbox and in
+/// `purple-subspace`'s.
 pub(crate) const RELAY_SOCKET_DIR: &str = "/run/relay";
 /// purple-transporter's socket.
 pub(crate) const RELAY_SOCKET: &str = "/run/relay/relay.sock";
@@ -172,8 +174,8 @@ pub(crate) fn bwrap_args(profile: &Profile, bin_dir: &Path, args: &[&str]) -> Ve
             if sockets.is_empty() {
                 share_net(&mut out);
             }
-            // Otherwise the daemons do the networking; purple-subspace gets only their sockets
-            // and no network namespace of its own.
+            // Otherwise the daemons do the networking; purple-subspace gets only their
+            // sockets and no network namespace of its own.
             for (dir, inside) in sockets {
                 out.extend(["--ro-bind".into(), dir.into(), (*inside).into()]);
             }

@@ -3,8 +3,8 @@
 //!
 //! A queue secret yields two things by HKDF: the stream seed, which is all the transport
 //! gets, and the key that seals every packet. The transport can't derive the key from the
-//! seed, so whoever stores the boxes (or runs `purple-subspace`) sees only random bytes. Each
-//! packet's AAD is its box index, so boxes can't be swapped or replayed at another
+//! seed, so whoever stores the boxes (or runs `purple-subspace`) sees only random bytes.
+//! Each packet's AAD is its box index, so boxes can't be swapped or replayed at another
 //! position undetected.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};

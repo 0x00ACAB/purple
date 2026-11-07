@@ -1,5 +1,5 @@
-//! Messages between purple's processes, and the framing that carries them. Messages
-//! between `purple-data` and `purple-subspace` are here; those with `purple-lcars` are in [`ui`].
+//! Messages between purple's processes, and the framing that carries them. Messages between
+//! `purple-data` and `purple-subspace` are here; those with `purple-lcars` are in [`ui`].
 //!
 //! Every message has a fixed layout and the decoder rejects anything else: unknown tags,
 //! wrong lengths, oversized frames. Keep it that way, since `purple-data` parses these
@@ -247,8 +247,8 @@ pub enum NetMsg {
         /// The box.
         at: BoxRef,
     },
-    /// core to net: a padding read of box `at`. Answered like [`NetMsg::Read`]; purple-subspace
-    /// may send it over any connection, since nobody wants what it finds.
+    /// core to net: a padding read of box `at`. Answered like [`NetMsg::Read`];
+    /// purple-subspace may send it over any connection, since nobody wants what it finds.
     ReadCover {
         /// The box.
         at: BoxRef,

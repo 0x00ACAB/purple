@@ -71,8 +71,8 @@ impl Dial for OnionDial {
     }
 }
 
-/// Through purple-transporter to the store's direct port, encrypted with Noise to the store's
-/// pinned key. No circuits, so the isolation key is unused.
+/// Through purple-transporter to the store's direct port, encrypted with Noise to the
+/// store's pinned key. No circuits, so the isolation key is unused.
 #[derive(Debug)]
 pub struct DirectDial {
     /// purple-transporter's socket.

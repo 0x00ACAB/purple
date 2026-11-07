@@ -4,8 +4,8 @@
 //! Every purple box is its own one-box BACAP stream. Its seed is derived from the purple
 //! stream seed and the index (see [`box_seed`]), and the daemon turns that into the
 //! capabilities and box ID. So reaching any box costs the same, padding reads of random
-//! boxes included, and purple-subspace keeps no per-stream state. Replicas see unrelated box
-//! IDs; couriers don't learn who sent a request, since it came through the mixnet.
+//! boxes included, and purple-subspace keeps no per-stream state. Replicas see unrelated
+//! box IDs; couriers don't learn who sent a request, since it came through the mixnet.
 //!
 //! Cover traffic is the daemon's job here: it sends one Sphinx packet per Poisson tick,
 //! a decoy when nothing is queued, so [`Transport::cover`] does nothing. Writing random
