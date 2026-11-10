@@ -47,9 +47,6 @@ touches the network never sees a key.
 | `purple-shields` | `purple-harden` | Hardening every process applies at startup |
 | `purple-holodeck` | `purple-devprovider` | Local stand-in network for running several instances on one machine |
 
-The component names are a nod to Star Trek: The Next Generation and Picard. "Was" gives
-the name each crate had before November 2026, which older commits use.
-
 ## Requirements
 
 - Linux with unprivileged user namespaces (for bubblewrap)
