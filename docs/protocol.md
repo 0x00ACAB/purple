@@ -48,12 +48,17 @@ purple aims to hide who talks to whom from an adversary who can watch and modify
 network traffic and who may also run the server. Content confidentiality alone is not
 enough for that, so the protocol has three goals:
 
-1. The store learns nothing from what it holds. Every box holds 1536 bytes that are
-   indistinguishable from random, at an address that can't be linked to any other box.
-2. Traffic looks the same whether a user is talking or idle. Clients write at a constant
-   average rate and pad their reads.
-3. No identifier links a user across conversations. There are no accounts, usernames,
-   phone numbers or device IDs. Contacts are added by exchanging an invite out of band.
+1. The store learns nothing from the contents of what it holds. Every box holds 1536
+   bytes that are indistinguishable from random, at an address that can't be linked to any
+   other box by looking at it. What the store can still work out from who reads and writes
+   which box, and when, is in Section 14.1.
+2. To someone watching a user's connection, traffic looks the same whether the user is
+   talking or idle. Clients write at a constant average rate, pad their reads, and get
+   replies of one size.
+3. Nothing a user registers anywhere identifies them. There are no accounts, usernames,
+   phone numbers or device IDs. Contacts are added by exchanging an invite out of band. A
+   user does have one long-term identity key, which their contacts and fellow group
+   members see (Section 14.2).
 
 The protocol has no server-side logic beyond "store this packet at this address if the
 address is free" and "return what is at this address". All structure (who a box belongs
@@ -287,7 +292,7 @@ where `derive` is the construction in Section 5.1.
 
 Anyone who sees the invite can read these queues. That is acceptable because the bundle is
 public key material that is checked against the identity key in the invite, and the intro
-message is a PQXDH initial message only the inviter can decrypt.
+message is sealed to the inviter's prekeys (Section 8.1), so only the inviter can open it.
 
 ### 7.3. Prekey bundle
 
@@ -321,11 +326,34 @@ first outgoing message is a PreKey message. The accepter then:
 1. picks two fresh random queue secrets, `S_ab` (accepter to inviter) and `S_ba` (inviter
    to accepter),
 2. encrypts a Hello (Section 8.3) carrying both,
-3. writes it to the intro queue from box 0.
+3. seals the resulting PreKey message to the inviter's prekeys (below),
+4. writes the sealed intro to the intro queue from box 0.
 
-The inviter reads the intro queue, decrypts the PreKey message (which completes PQXDH and
-consumes the one-time prekeys) and takes the two secrets from the Hello. Both sides then
-forget the invite queues.
+The inviter reads the intro queue, opens the seal, decrypts the PreKey message (which
+completes PQXDH and consumes the one-time prekeys) and takes the two secrets from the
+Hello. Both sides then forget the invite queues, and the inviter deletes the invite's
+signed prekey.
+
+A PreKey message carries its sender's identity key in the clear, and anyone who saw the
+invite can read the intro queue. So the accepter seals it to the signed X25519 prekey
+`SPK` and the ML-KEM prekey from the bundle, after libsignal has verified both:
+
+```
+   (e, E)      = fresh X25519 key pair
+   dh          = X25519(e, SPK)
+   (ss, kem)   = ML-KEM-1024.Encapsulate(Kyber prekey)
+   key         = HKDF(salt = "purple intro seal v1", ikm = dh || ss,
+                      info = E || SPK || kem, L = 32)
+   sealed      = XChaCha20-Poly1305(key, nonce = 0, tagged PreKey message, aad = "")
+
+   intro = 0x03 | uint32 signed prekey ID | uint32 Kyber prekey ID
+                | E | kem | sealed            (each length-prefixed, Section 4.1)
+```
+
+`E`, `SPK` and `kem` are in libsignal's serialization. The key is used once, since `e` is
+fresh, so the nonce is fixed. The inviter MUST refuse an intro that isn't sealed, that
+doesn't open, or whose PreKey message names a different signed prekey than the seal.
+Tag 3 MUST be rejected anywhere but the intro queue.
 
 libsignal puts the sender's registration ID in the clear inside a PreKey message. Every
 client MUST use registration ID 1 and device ID 1 for itself, both in the bundles it
@@ -348,7 +376,8 @@ ratchet combined with the SPQR post-quantum ratchet) and carried as:
      Tag 2: SignalMessage (ordinary ratchet message)
 ```
 
-Any other tag MUST be rejected. That byte string is one message for fragmentation and goes
+Any other tag MUST be rejected. A tag 1 message only ever travels inside a sealed intro
+(Section 8.1). That byte string is one message for fragmentation and goes
 into the sender's send queue at the sender's next unused index.
 
 ### 8.3. Content
@@ -374,6 +403,23 @@ Version is 1. Kinds:
 | 6 | GroupLeave | group name |
 
 Kinds 3 to 6 use the encoding in Section 4.1. Unknown versions or kinds MUST be rejected.
+
+### 8.4. Verifying a contact
+
+An invite is only as trustworthy as the channel it travelled over. Someone who changes it
+on the way can sit between the two users, and someone who reads it can accept it first. To
+detect both, each client can show a number for a contact:
+
+```
+   h      = SHA-512("purple fingerprint v1" || low || high)
+   number = twelve groups of five decimal digits; group i is
+            uint40(h[5i .. 5i+5]) mod 100000
+```
+
+where `low` and `high` are the two users' serialized identity keys (33 bytes each) in
+byte order. Both users see the same number if and only if each holds the other's real
+identity key. Users SHOULD compare it over a channel an attacker on the invite's channel
+doesn't control, such as in person.
 
 ## 9. Groups
 
@@ -479,6 +525,12 @@ The plaintext of an MLS application message is:
      kind 2 Names: list of (identity key, name)
 ```
 
+Receivers MUST drop an application message whose sender is not a member in the receiver's
+current epoch. MLS still decrypts messages from the last two epochs, and a removed member
+keeps those epochs' keys; without this rule they could go on posting until two more
+commits had passed. The price is that a message a member sent just before being removed
+is lost if it arrives after the removal.
+
 Receivers MUST ignore Names from anyone but the creator. Names are display hints: a
 member shows its own name for a member who is also its contact, and the creator's name
 otherwise. Names MUST be 1 to 32 characters from `[A-Za-z0-9_-]`. The names "me" and
@@ -510,23 +562,28 @@ Without the seed, one box's address says nothing about any other box's address.
 The client and store exchange frames (Section 4.2) whose body is:
 
 ```
-   +-----+------------------+-------------------------------+
-   | Tag | Box address (32) | Packet (1536), if tag has one |
-   +-----+------------------+-------------------------------+
+   +-----+------------------+-----------------------------------------+
+   | Tag | Box address (32) | Packet or padding (1536), all but Get   |
+   +-----+------------------+-----------------------------------------+
 ```
 
-| Tag | Name | Direction | Packet |
+| Tag | Name | Direction | After the address |
 |---|---|---|---|
-| 1 | Put | client to store | yes |
-| 2 | Get | client to store | no |
-| 3 | Found | store to client | yes |
-| 4 | Empty | store to client | no |
-| 5 | Stored | store to client | no |
-| 6 | Taken | store to client | no |
+| 1 | Put | client to store | packet |
+| 2 | Get | client to store | nothing |
+| 3 | Found | store to client | packet |
+| 4 | Empty | store to client | 1536 zero bytes |
+| 5 | Stored | store to client | 1536 zero bytes |
+| 6 | Taken | store to client | 1536 zero bytes |
 
-The largest frame body is 1569 bytes. Any other tag, a wrong length, or trailing bytes is
-a protocol error. A client that sends a store-to-client message is in error and the store
-closes the connection.
+Every reply from the store is 1569 bytes, whatever it says. Otherwise the size of what
+comes back would tell anyone watching the client's connection whether a read found a box,
+which is to say when the user receives a message. The zeros travel inside the encrypted
+link to the store (Section 12).
+
+The largest frame body is 1569 bytes. Any other tag, a wrong length, non-zero padding, or
+trailing bytes is a protocol error. A client that sends a store-to-client message is in
+error and the store closes the connection.
 
 The store answers each request with exactly one reply, in request order: Put gets Stored
 or Taken, Get gets Found or Empty. A client MAY send several requests before reading
@@ -683,11 +740,29 @@ box that already holds one.
 
 ### 14.1. What the store learns
 
-The store sees fixed-size random packets at unlinkable addresses, the time each write and
-read arrives, and which Tor connection it arrives on. Over Tor it doesn't see client IP
-addresses. Since each stream has its own circuit, it can group the boxes of one stream if
-it sees them on one connection; it can't tie two streams to one client except through
-timing, which the read jitter and Poisson write schedule are meant to blur.
+The store sees fixed-size random packets at addresses that don't relate to each other,
+the time each write and read arrives, and which Tor connection it arrives on. Over Tor it
+doesn't see client IP addresses. It never sees content. From the pattern of requests,
+though, a store that wants to can work out a good deal:
+
+- Which writes are real. A cover packet goes to a random address that nobody ever reads. A
+  real box was being polled every 2 seconds before it was written and is read afterwards.
+  So cover traffic hides a user's activity from the network, not from the store, which
+  sees when each stream carries a message and how many boxes long it is.
+- Which reads are real. A real read asks for the same address until it fills; a padding
+  read asks once. The store can count the streams in use.
+- Which boxes form a stream, since each stream has its own circuit and connection.
+- Which streams belong to one client, roughly. A client's connections all appear when
+  purple starts and go when it stops. The read jitter and Poisson writes blur timing
+  within a session but not that. Over days this groups a user's streams into one
+  pseudonymous client.
+- Which clients talk, once it has those groups: both ends of a stream touch the same
+  boxes. A group stream is read by every member, so it also sees group sizes.
+
+Over Tor none of this has an IP address attached. It gets one if a user connects
+directly (Section 12.3), or if the store works with someone who watches users'
+connections. Hiding the request pattern itself would take a mixnet in front of the store
+or private information retrieval; purple has neither on this path.
 
 The store can always drop, delay or refuse packets. Clients can't detect a store that
 pretends a box is empty. Forging or moving packets fails authentication (Section 5.2).
@@ -700,6 +775,14 @@ pretends a box is empty. Forging or moving packets fails authentication (Section
   padding hides only to the nearest 16.
 - A client's constant send rate tells an observer purple is running, though not whether
   the user is talking.
+- A user has one identity key. It is in every invite they make and every group credential
+  they hold, so their contacts and fellow group members can tell, by comparing notes, that
+  they know the same person.
+- 1:1 queue secrets last as long as the contact. Someone who later obtains a device's
+  vault and the store's records can tell when that conversation's past messages were sent.
+- The seal on the intro (Section 8.1) hides the accepter's identity key from whoever saw
+  the invite, but the prekey IDs on the bundle and on the seal are a counter, so they
+  still show that person how many invites the inviter had made before this one.
 - In direct mode the store sees the client's IP address (Section 12.3).
 - Anyone who sees an invite can tell when it was used, by watching its bundle and intro
   queues. Invites SHOULD be passed over a channel the user trusts and used once.

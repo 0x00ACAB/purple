@@ -18,7 +18,10 @@ directory, and traffic that looks the same whether you're chatting or idle.
 - 1:1 chats and group chats, plus files and images
 - Contacts are added by invite only (`/invite`, `/accept`), there is no user directory
 - Messages go to a box store reached as a Tor onion service, at a constant packet rate
-  with cover traffic, so timing doesn't give away when you're talking
+  with cover traffic, so someone watching your connection can't tell when you're talking.
+  The store itself never sees content or IP addresses, but it can tell real traffic from
+  cover (see "What the store learns" in [the protocol](docs/protocol.md))
+- `/verify NAME` shows a number to compare with a contact, so a swapped invite gets noticed
 - If Tor is blocked, purple tries bridges, then asks before connecting to the store
   directly
 - Your keys and history live in an encrypted vault, unlocked with a passphrase and
