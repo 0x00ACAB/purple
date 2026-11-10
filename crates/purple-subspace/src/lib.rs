@@ -314,25 +314,26 @@ const TAG_STORED: u8 = 5;
 const TAG_TAKEN: u8 = 6;
 
 impl ProviderMsg {
-    /// Write as one frame: tag, address, then the packet if there is one.
+    /// Write as one frame: tag, address, then the packet if there is one. A reply without
+    /// a packet carries zeros in its place, so every reply is the same length and someone
+    /// watching the client's link can't tell a box that turned up from an empty one.
     ///
     /// # Errors
     /// Fails if the write fails.
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
-        let (tag, addr, packet) = match self {
-            Self::Put { addr, packet } => (TAG_PUT, addr, Some(packet)),
-            Self::Get { addr } => (TAG_GET, addr, None),
-            Self::Found { addr, packet } => (TAG_FOUND, addr, Some(packet)),
-            Self::Empty { addr } => (TAG_EMPTY, addr, None),
-            Self::Stored { addr } => (TAG_STORED, addr, None),
-            Self::Taken { addr } => (TAG_TAKEN, addr, None),
+        const PADDING: [u8; PACKET_LEN] = [0; PACKET_LEN];
+        let (tag, addr, body): (_, _, &[u8]) = match self {
+            Self::Put { addr, packet } => (TAG_PUT, addr, packet.as_bytes()),
+            Self::Get { addr } => (TAG_GET, addr, &[]),
+            Self::Found { addr, packet } => (TAG_FOUND, addr, packet.as_bytes()),
+            Self::Empty { addr } => (TAG_EMPTY, addr, &PADDING),
+            Self::Stored { addr } => (TAG_STORED, addr, &PADDING),
+            Self::Taken { addr } => (TAG_TAKEN, addr, &PADDING),
         };
         let mut out = Vec::with_capacity(MAX_PROVIDER_FRAME);
         out.push(tag);
         out.extend_from_slice(&addr.0);
-        if let Some(packet) = packet {
-            out.extend_from_slice(packet.as_bytes());
-        }
+        out.extend_from_slice(body);
         write_frame(w, &out, MAX_PROVIDER_FRAME)
     }
 
@@ -360,8 +361,11 @@ impl ProviderMsg {
                 addr,
                 packet: Packet::from_slice(body)?,
             },
-            TAG_GET | TAG_EMPTY | TAG_STORED | TAG_TAKEN if !body.is_empty() => {
-                return Err(invalid("trailing bytes"));
+            TAG_GET if !body.is_empty() => return Err(invalid("trailing bytes")),
+            TAG_EMPTY | TAG_STORED | TAG_TAKEN
+                if body.len() != PACKET_LEN || body.iter().any(|&b| b != 0) =>
+            {
+                return Err(invalid("reply isn't padded to a packet's length"));
             }
             TAG_GET => Self::Get { addr },
             TAG_EMPTY => Self::Empty { addr },
@@ -562,6 +566,48 @@ mod tests {
             stream: StreamSeed([seed; SEED_LEN]),
             index,
         }
+    }
+
+    fn framed(msg: &ProviderMsg) -> Vec<u8> {
+        let mut out = Vec::new();
+        msg.write_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn every_store_reply_is_the_same_length() {
+        let addr = BoxAddr([3; 32]);
+        let found = framed(&ProviderMsg::Found {
+            addr,
+            packet: packet(1),
+        });
+        for reply in [
+            ProviderMsg::Empty { addr },
+            ProviderMsg::Stored { addr },
+            ProviderMsg::Taken { addr },
+        ] {
+            let bytes = framed(&reply);
+            assert_eq!(bytes.len(), found.len(), "{reply:?}");
+            assert_eq!(
+                ProviderMsg::read_from(&mut bytes.as_slice()).unwrap(),
+                Some(reply)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unpadded_or_badly_padded_reply_is_refused() {
+        let mut short = vec![TAG_EMPTY];
+        short.extend_from_slice(&[3; 32]);
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &short, MAX_PROVIDER_FRAME).unwrap();
+        assert!(ProviderMsg::read_from(&mut frame.as_slice()).is_err());
+
+        let mut dirty = short;
+        dirty.extend_from_slice(&[1; PACKET_LEN]);
+        let mut dirty_frame = Vec::new();
+        write_frame(&mut dirty_frame, &dirty, MAX_PROVIDER_FRAME).unwrap();
+        assert!(ProviderMsg::read_from(&mut dirty_frame.as_slice()).is_err());
     }
 
     #[test]

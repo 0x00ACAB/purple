@@ -27,6 +27,7 @@ const MIN_PASSPHRASE_CHARS: usize = 8;
 const HELP: &[&str] = &[
     "/invite NAME          create an invite for a new contact called NAME",
     "/accept NAME INVITE   accept an invite (paste it) from a contact called NAME",
+    "/verify NAME          show a number to compare with NAME over another channel",
     "/passphrase           change the vault passphrase (Esc cancels)",
     "/tpm                  seal the vault to this machine's TPM; you get a recovery code",
     "/group new NAME              create a group (shown as #NAME)",
@@ -265,6 +266,11 @@ fn submit(model: &mut Model) -> Vec<UiCmd> {
             vec![UiCmd::AcceptInvite {
                 contact: name.to_owned(),
                 invite: invite.to_owned(),
+            }]
+        }
+        (Some("verify"), Some(name), None, None) => {
+            vec![UiCmd::Verify {
+                contact: name.to_owned(),
             }]
         }
         (Some("direct"), None, None, None) => {
@@ -514,6 +520,14 @@ fn on_core_event(model: &mut Model, event: UiEvent) {
         | UiEvent::GroupNotice { .. }
         | UiEvent::GroupLeft { .. }
         | UiEvent::GroupMembers { .. } => on_group_event(model, event),
+        UiEvent::Fingerprint { contact, digits } => {
+            let contact = sanitize(&contact);
+            model.log(format!(
+                "ask {contact} for theirs (in person or on a call). The same number means \
+                 nobody sits between you; a different one means someone does:"
+            ));
+            model.log(format!("    {}", sanitize(&digits)));
+        }
         UiEvent::Network { status } => on_network(model, status),
     }
 }
@@ -1071,6 +1085,28 @@ mod tests {
             }]
         );
         assert_eq!(m.chats["bob"].last().unwrap().from, "me");
+    }
+
+    #[test]
+    fn verify_asks_core_and_shows_the_number_to_compare() {
+        let mut m = open_model();
+        assert_eq!(
+            type_line(&mut m, "/verify bob"),
+            [UiCmd::Verify {
+                contact: "bob".into()
+            }]
+        );
+        let digits = ["12345"; 12].join(" ");
+        core_event(
+            &mut m,
+            UiEvent::Fingerprint {
+                contact: "bob".into(),
+                digits: digits.clone(),
+            },
+        );
+        let log = m.system.join("\n");
+        assert!(log.contains(&digits), "{log}");
+        assert!(log.contains("bob") && log.contains("same number"), "{log}");
     }
 
     #[test]

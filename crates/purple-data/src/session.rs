@@ -7,17 +7,22 @@
 use std::fmt;
 use std::time::SystemTime;
 
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use futures_executor::block_on;
+use hkdf::Hkdf;
 use libsignal_protocol::kem::KeyType;
 use libsignal_protocol::{
     CiphertextMessage, DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair,
     IdentityKeyStore, KeyPair, KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle,
-    PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore, ProtocolAddress, SignalMessage,
-    SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
-    message_decrypt, message_encrypt, process_prekey_bundle,
+    PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey,
+    SignalMessage, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    Timestamp, message_decrypt, message_encrypt, process_prekey_bundle,
 };
 use rand::TryRngCore;
 use rand::rngs::OsRng;
+use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::codec::{Reader, Writer};
 use crate::invite::{Invite, StoreRef, encode_bundle};
@@ -35,6 +40,10 @@ const LOCAL_NAME: &str = "self";
 pub const TAG_PREKEY: u8 = 1;
 /// Wire tag of an ordinary ratchet message.
 pub const TAG_WHISPER: u8 = 2;
+/// Wire tag of an intro: a `PreKey` message sealed to the inviter's prekeys. Only the
+/// intro queue carries it.
+pub const TAG_SEALED_INTRO: u8 = 3;
+const SEAL_SALT: &[u8] = b"purple intro seal v1";
 
 /// Errors from establishing sessions or encrypting and decrypting messages.
 #[derive(Debug)]
@@ -297,6 +306,121 @@ impl Account {
         Ok(plaintext)
     }
 
+    /// Seal `wire`, the accepter's first message, to the signed and Kyber prekeys in the
+    /// inviter's `bundle`, which must already have been verified ([`Self::start_session`]).
+    /// A `PreKey` message shows its sender's identity key, and anyone who saw the invite
+    /// can read the intro queue; sealed, only the inviter can.
+    ///
+    /// Layout: [`TAG_SEALED_INTRO`], signed prekey ID, Kyber prekey ID, then the ephemeral
+    /// public key, the KEM ciphertext and the sealed message, each length-prefixed.
+    ///
+    /// # Errors
+    /// Fails if the bundle's keys can't be used.
+    pub(crate) fn seal_intro(bundle: &PreKeyBundle, wire: &[u8]) -> Result<Vec<u8>> {
+        let mut rng = rng();
+        let ephemeral = KeyPair::generate(&mut rng);
+        let signed = bundle.signed_pre_key_public()?;
+        let dh = Zeroizing::new(
+            ephemeral
+                .private_key
+                .calculate_agreement(&signed)
+                .map_err(SignalProtocolError::from)?,
+        );
+        let (kem_secret, kem_ciphertext) = bundle.kyber_pre_key_public()?.encapsulate(&mut rng)?;
+        let kem_secret = Zeroizing::new(kem_secret);
+        let ephemeral_public = ephemeral.public_key.serialize();
+        let cipher = intro_cipher(
+            &dh,
+            &kem_secret,
+            &ephemeral_public,
+            &signed.serialize(),
+            &kem_ciphertext,
+        )?;
+        let sealed = cipher
+            .encrypt(&XNonce::default(), wire)
+            .map_err(|_| Error::Malformed("sealing the intro failed"))?;
+
+        let mut w = Writer::default();
+        w.u8(TAG_SEALED_INTRO);
+        w.u32(bundle.signed_pre_key_id()?.into());
+        w.u32(bundle.kyber_pre_key_id()?.into());
+        w.bytes(&ephemeral_public)?;
+        w.bytes(&kem_ciphertext)?;
+        w.bytes(&sealed)?;
+        Ok(w.finish().to_vec())
+    }
+
+    /// Open an intro sealed by [`Self::seal_intro`] to one of this account's invites.
+    /// Returns the `PreKey` message inside and the ID of the signed prekey it was sealed to,
+    /// which is also the one the message itself must name.
+    ///
+    /// # Errors
+    /// Fails if the intro isn't sealed, names prekeys this account doesn't hold, or doesn't
+    /// open.
+    pub(crate) fn open_intro(&self, sealed: &[u8]) -> Result<(Vec<u8>, u32)> {
+        let mut r = Reader::new(sealed);
+        if r.u8()? != TAG_SEALED_INTRO {
+            return Err(Error::Malformed("the intro isn't sealed"));
+        }
+        let signed_id = r.u32()?;
+        let kyber_id = r.u32()?;
+        let ephemeral_public = r.bytes()?;
+        let kem_ciphertext: Box<[u8]> = r.bytes()?.into();
+        let ciphertext = r.bytes()?;
+        r.finish()?;
+
+        let signed = block_on(
+            self.stores
+                .signed_pre_keys
+                .get_signed_pre_key(SignedPreKeyId::from(signed_id)),
+        )?;
+        let kyber = block_on(
+            self.stores
+                .kyber_pre_keys
+                .get_kyber_pre_key(KyberPreKeyId::from(kyber_id)),
+        )?;
+        let ephemeral =
+            PublicKey::deserialize(ephemeral_public).map_err(SignalProtocolError::from)?;
+        let dh = Zeroizing::new(
+            signed
+                .private_key()?
+                .calculate_agreement(&ephemeral)
+                .map_err(SignalProtocolError::from)?,
+        );
+        let kem_secret = Zeroizing::new(kyber.secret_key()?.decapsulate(&kem_ciphertext)?);
+        let cipher = intro_cipher(
+            &dh,
+            &kem_secret,
+            ephemeral_public,
+            &signed.public_key()?.serialize(),
+            &kem_ciphertext,
+        )?;
+        let wire = cipher
+            .decrypt(&XNonce::default(), ciphertext)
+            .map_err(|_| Error::Malformed("the intro doesn't open"))?;
+        let names = match wire.split_first() {
+            Some((&TAG_PREKEY, body)) => PreKeySignalMessage::try_from(body)?.signed_pre_key_id(),
+            _ => return Err(Error::Malformed("the intro doesn't hold a handshake")),
+        };
+        if u32::from(names) != signed_id {
+            return Err(Error::Malformed(
+                "the intro is sealed to another invite's key",
+            ));
+        }
+        Ok((wire, signed_id))
+    }
+
+    /// Drop a signed prekey once its invite has been used. libsignal deletes the one-time
+    /// and Kyber prekeys itself but has no call for this one.
+    pub(crate) fn forget_signed_prekey(&mut self, id: u32) {
+        self.stores.signed_pre_keys.remove(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signed_prekey_count(&self) -> usize {
+        self.stores.signed_pre_keys.len()
+    }
+
     #[cfg(test)]
     fn snapshot(&self) -> Self {
         let mut w = Writer::default();
@@ -337,6 +461,27 @@ impl Account {
 /// which is the only safe response: there is no fallback for missing entropy.
 fn rng() -> impl rand::CryptoRng {
     OsRng.unwrap_err()
+}
+
+/// The cipher that seals an intro: keyed by both shared secrets, bound to every public
+/// value in the exchange. The ephemeral key is fresh for each seal, so the key is used
+/// once and the nonce can be fixed.
+fn intro_cipher(
+    dh: &[u8],
+    kem_secret: &[u8],
+    ephemeral_public: &[u8],
+    signed_public: &[u8],
+    kem_ciphertext: &[u8],
+) -> Result<XChaCha20Poly1305> {
+    let ikm = Zeroizing::new([dh, kem_secret].concat());
+    let mut key = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(SEAL_SALT), &ikm)
+        .expand_multi_info(
+            &[ephemeral_public, signed_public, kem_ciphertext],
+            key.as_mut_slice(),
+        )
+        .map_err(|_| Error::Malformed("HKDF output length invalid"))?;
+    Ok(XChaCha20Poly1305::new(Key::from_slice(key.as_slice())))
 }
 
 pub(crate) fn device_id() -> Result<DeviceId> {

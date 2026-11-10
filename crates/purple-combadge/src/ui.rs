@@ -19,6 +19,8 @@ pub const MAX_ERROR_LEN: usize = 512;
 pub const MAX_PASSPHRASE_LEN: usize = 1024;
 /// Longest recovery code text, in bytes.
 pub const MAX_RECOVERY_LEN: usize = 64;
+/// Longest fingerprint text, in bytes: 12 groups of 5 digits and the spaces between.
+pub const MAX_FINGERPRINT_LEN: usize = 71;
 /// Most members a group member list may hold; groups are capped at 50.
 pub const MAX_GROUP_MEMBERS: usize = 50;
 
@@ -42,6 +44,7 @@ const CMD_GROUP_SEND: u8 = 13;
 const CMD_USE_DIRECT: u8 = 14;
 const CMD_ADD_BRIDGES: u8 = 15;
 const CMD_GROUP_REKEY: u8 = 16;
+const CMD_VERIFY: u8 = 17;
 
 const EVENT_INVITE_CREATED: u8 = 1;
 const EVENT_CONNECTED: u8 = 2;
@@ -62,6 +65,7 @@ const EVENT_GROUP_LEFT: u8 = 16;
 const EVENT_GROUP_MEMBERS: u8 = 17;
 const EVENT_NETWORK: u8 = 18;
 const EVENT_NOTICE: u8 = 19;
+const EVENT_FINGERPRINT: u8 = 20;
 
 /// What the user asked for, sent from `purple-lcars` to `purple-data`.
 #[derive(Clone, PartialEq, Eq)]
@@ -150,6 +154,11 @@ pub enum UiCmd {
         /// Message text.
         body: String,
     },
+    /// Show the number to compare with a contact, to check nobody sits in between.
+    Verify {
+        /// The contact.
+        contact: String,
+    },
     /// Connect to the store without Tor, until purple exits. Only after
     /// [`NetStatus::Blocked`].
     UseDirect,
@@ -209,6 +218,7 @@ impl std::fmt::Debug for UiCmd {
                 .debug_struct("GroupSend")
                 .field("group", group)
                 .finish_non_exhaustive(),
+            Self::Verify { contact } => f.debug_struct("Verify").field("contact", contact).finish(),
             Self::UseDirect => f.write_str("UseDirect"),
             Self::AddBridges { .. } => f.write_str("AddBridges { .. }"),
         }
@@ -324,6 +334,13 @@ pub enum UiEvent {
         /// Each member's name and whether they're one of your contacts.
         members: Vec<(String, bool)>,
     },
+    /// The number both sides of a contact see, for [`UiCmd::Verify`].
+    Fingerprint {
+        /// The contact.
+        contact: String,
+        /// Twelve groups of five digits.
+        digits: String,
+    },
     /// How the connection to the store is going.
     Network {
         /// purple-subspace's latest status.
@@ -405,6 +422,11 @@ impl std::fmt::Debug for UiEvent {
                 .field("group", group)
                 .field("members", members)
                 .finish(),
+            Self::Fingerprint { contact, digits } => f
+                .debug_struct("Fingerprint")
+                .field("contact", contact)
+                .field("digits", digits)
+                .finish(),
             Self::Network { status } => f.debug_struct("Network").field("status", status).finish(),
         }
     }
@@ -481,6 +503,10 @@ impl UiCmd {
                 out.str(group, MAX_NAME_LEN)?;
                 out.str(body, MAX_BODY_LEN)?;
             }
+            Self::Verify { contact } => {
+                out.tag(CMD_VERIFY);
+                out.str(contact, MAX_NAME_LEN)?;
+            }
             Self::UseDirect => out.tag(CMD_USE_DIRECT),
             Self::AddBridges { lines } => {
                 out.tag(CMD_ADD_BRIDGES);
@@ -549,6 +575,9 @@ impl UiCmd {
                 group: d.str(MAX_NAME_LEN)?,
                 body: d.str(MAX_BODY_LEN)?,
             },
+            CMD_VERIFY => Self::Verify {
+                contact: d.str(MAX_NAME_LEN)?,
+            },
             CMD_USE_DIRECT => Self::UseDirect,
             CMD_ADD_BRIDGES => Self::AddBridges {
                 lines: d.str(MAX_BRIDGE_TEXT)?,
@@ -565,6 +594,7 @@ impl UiEvent {
     ///
     /// # Errors
     /// Fails if a field is too long, or the write fails.
+    #[expect(clippy::too_many_lines, reason = "one short arm per event")]
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         let mut out = Encoder::default();
         match self {
@@ -656,6 +686,11 @@ impl UiEvent {
                     out.tag(u8::from(*verified));
                 }
             }
+            Self::Fingerprint { contact, digits } => {
+                out.tag(EVENT_FINGERPRINT);
+                out.str(contact, MAX_NAME_LEN)?;
+                out.str(digits, MAX_FINGERPRINT_LEN)?;
+            }
             Self::Network { status } => {
                 out.tag(EVENT_NETWORK);
                 for byte in status.to_bytes() {
@@ -742,6 +777,10 @@ impl UiEvent {
                 }
                 Self::GroupMembers { group, members }
             }
+            EVENT_FINGERPRINT => Self::Fingerprint {
+                contact: d.str(MAX_NAME_LEN)?,
+                digits: d.str(MAX_FINGERPRINT_LEN)?,
+            },
             EVENT_NETWORK => Self::Network {
                 status: NetStatus::from_bytes([d.tag()?, d.tag()?, d.tag()?])?,
             },
@@ -823,6 +862,17 @@ mod tests {
 
     fn s(text: &str) -> String {
         text.to_owned()
+    }
+
+    #[test]
+    fn a_fingerprint_round_trips() {
+        let event = UiEvent::Fingerprint {
+            contact: s("bob"),
+            digits: ["12345"; 12].join(" "),
+        };
+        let mut buf = Vec::new();
+        event.write_to(&mut buf).unwrap();
+        assert_eq!(UiEvent::read_from(&mut &buf[..]).unwrap(), Some(event));
     }
 
     #[test]
@@ -1047,6 +1097,7 @@ mod tests {
             UiCmd::GroupLeave { group: s("team") },
             UiCmd::GroupMembers { group: s("team") },
             UiCmd::GroupRekey { group: s("team") },
+            UiCmd::Verify { contact: s("bob") },
             UiCmd::GroupSend {
                 group: s("team"),
                 body: "x".repeat(MAX_BODY_LEN),

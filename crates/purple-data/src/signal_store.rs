@@ -219,6 +219,17 @@ impl SignedPreKeyStore for SignedPreKeys {
     }
 }
 
+impl SignedPreKeys {
+    pub(crate) fn remove(&mut self, id: u32) {
+        self.0.remove(&id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 #[async_trait(?Send)]
 impl KyberPreKeyStore for KyberPreKeys {
     async fn get_kyber_pre_key(&self, id: KyberPreKeyId) -> SignalResult<KyberPreKeyRecord> {

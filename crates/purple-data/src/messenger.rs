@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use libsignal_protocol::IdentityKey;
 use purple_combadge::{BoxRef, Packet, StreamSeed};
+use sha2::{Digest, Sha512};
 use zeroize::Zeroizing;
 
 use crate::codec::{Reader, Writer};
@@ -404,6 +405,39 @@ impl Messenger {
             state.next_send = next;
         }
         Ok(out)
+    }
+
+    /// The number both sides of a contact see: twelve groups of five digits from a hash of
+    /// the two identity keys. Compared over another channel, a match shows that nobody
+    /// swapped the invite or accepted it in the contact's place.
+    ///
+    /// # Errors
+    /// Fails if `contact` isn't a connected contact.
+    pub fn fingerprint(&self, contact: &str) -> Result<String> {
+        let own = self.account.identity_key().serialize();
+        let theirs = self.contact_identity(contact)?.serialize();
+        // Sorted, so both sides hash the same bytes.
+        let (low, high) = if own <= theirs {
+            (own, theirs)
+        } else {
+            (theirs, own)
+        };
+        let hash = Sha512::new()
+            .chain_update(FINGERPRINT_LABEL)
+            .chain_update(low)
+            .chain_update(high)
+            .finalize();
+        let groups: Vec<String> = hash
+            .chunks_exact(5)
+            .take(FINGERPRINT_GROUPS)
+            .map(|chunk| {
+                let value = chunk
+                    .iter()
+                    .fold(0u64, |acc, &byte| (acc << 8) | u64::from(byte));
+                format!("{:05}", value % 100_000)
+            })
+            .collect();
+        Ok(groups.join(" "))
     }
 
     /// Create a group with this user as its only member.
@@ -843,7 +877,10 @@ impl Messenger {
             to_accepter: to_accepter.clone(),
         };
         let wire = self.account.encrypt(name, &hello.encode()?)?;
-        let (intro, _) = outgoing(&invite.intro_queue()?, 0, &wire)?;
+        // The handshake message shows this user's identity key, and the intro queue is
+        // open to anyone who saw the invite.
+        let sealed = Account::seal_intro(&invite.decode_bundle(bundle)?, &wire)?;
+        let (intro, _) = outgoing(&invite.intro_queue()?, 0, &sealed)?;
 
         self.accepting.remove(name);
         self.reassemblers.remove(&stream);
@@ -862,14 +899,16 @@ impl Messenger {
         })
     }
 
-    fn finish_invite(&mut self, name: &str, stream: StreamSeed, wire: &[u8]) -> Result<Step> {
+    fn finish_invite(&mut self, name: &str, stream: StreamSeed, sealed: &[u8]) -> Result<Step> {
+        let (wire, signed_prekey) = self.account.open_intro(sealed)?;
         let Content::Hello {
             to_inviter,
             to_accepter,
-        } = Content::decode(&self.account.decrypt(name, wire)?)?
+        } = Content::decode(&self.account.decrypt(name, &wire)?)?
         else {
             return Err(Error::Malformed("expected a hello on the intro stream"));
         };
+        self.account.forget_signed_prekey(signed_prekey);
         self.invites.remove(name);
         self.reassemblers.remove(&stream);
         self.contacts.insert(
@@ -1257,6 +1296,9 @@ pub const READ_AHEAD: u64 = 16;
 
 const SNAPSHOT_VERSION: u8 = 6;
 
+const FINGERPRINT_LABEL: &[u8] = b"purple fingerprint v1";
+const FINGERPRINT_GROUPS: usize = 12;
+
 fn secret(bytes: &[u8]) -> Result<QueueSecret> {
     let array: [u8; 32] = bytes
         .try_into()
@@ -1429,6 +1471,100 @@ mod tests {
         assert_eq!(provider.poll(&mut alice), [Event::Connected("bob".into())]);
         assert_eq!(provider.poll(&mut bob), [Event::Connected("alice".into())]);
         (alice, bob)
+    }
+
+    /// The first message in `queue`, as someone holding its secret reads it off the store.
+    fn first_message(provider: &Provider, queue: &Queue) -> Vec<u8> {
+        let mut reassembler = Reassembler::default();
+        (0..)
+            .find_map(|index| {
+                let at = BoxRef {
+                    stream: queue.stream(),
+                    index,
+                };
+                let fragment = queue.open(index, &provider.0[&at]).unwrap();
+                reassembler.push(&fragment).unwrap()
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn the_intro_hides_the_accepters_identity_key_from_someone_holding_the_invite() {
+        let mut provider = Provider::default();
+        let mut alice = Messenger::new().unwrap();
+        let mut bob = Messenger::new().unwrap();
+        let (invite, bundle) = bob.create_invite("alice").unwrap();
+        provider.deliver(bundle);
+        alice.accept_invite("bob", invite.clone()).unwrap();
+        provider.poll(&mut alice);
+
+        let intro = first_message(&provider, &invite.intro_queue().unwrap());
+        let identity = alice.account.identity_key();
+        let key = identity.public_key().public_key_bytes();
+        assert!(
+            !intro.windows(key.len()).any(|window| window == key),
+            "the intro carries the accepter's identity key in the clear"
+        );
+        assert_eq!(provider.poll(&mut bob), [Event::Connected("alice".into())]);
+    }
+
+    #[test]
+    fn an_unsealed_intro_is_refused() {
+        let mut provider = Provider::default();
+        let mut alice = Messenger::new().unwrap();
+        let mut bob = Messenger::new().unwrap();
+        let (invite, written) = bob.create_invite("alice").unwrap();
+        provider.deliver(written);
+        let bundle = first_message(&provider, &invite.bundle_queue().unwrap());
+        alice
+            .account
+            .accept_invite("bob", &invite, &bundle)
+            .unwrap();
+        let hello = Content::Hello {
+            to_inviter: QueueSecret::random().unwrap(),
+            to_accepter: QueueSecret::random().unwrap(),
+        };
+        let wire = alice
+            .account
+            .encrypt("bob", &hello.encode().unwrap())
+            .unwrap();
+        let (intro, _) = outgoing(&invite.intro_queue().unwrap(), 0, &wire).unwrap();
+        provider.deliver(intro);
+
+        let (events, errors) = provider.poll_counting_errors(&mut bob);
+        assert_eq!((events, errors), (Vec::new(), 1));
+        assert_eq!(bob.contacts().count(), 0);
+    }
+
+    #[test]
+    fn the_invites_signed_prekey_is_forgotten_once_the_invite_is_used() {
+        let mut provider = Provider::default();
+        let (_, bob) = connected(&mut provider);
+        assert_eq!(bob.account.signed_prekey_count(), 0);
+    }
+
+    #[test]
+    fn both_sides_of_a_contact_see_the_same_fingerprint() {
+        let mut provider = Provider::default();
+        let (mut alice, bob) = connected(&mut provider);
+        let digits = alice.fingerprint("bob").unwrap();
+        assert_eq!(digits, bob.fingerprint("alice").unwrap());
+        let groups: Vec<&str> = digits.split(' ').collect();
+        assert_eq!(groups.len(), 12);
+        assert!(
+            groups
+                .iter()
+                .all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_digit()))
+        );
+
+        // Another contact gives another number; a stranger gives none.
+        let mut carol = Messenger::new().unwrap();
+        let (invite, bundle) = carol.create_invite("alice").unwrap();
+        provider.deliver(bundle);
+        alice.accept_invite("carol", invite).unwrap();
+        provider.poll(&mut alice);
+        assert_ne!(alice.fingerprint("carol").unwrap(), digits);
+        assert!(alice.fingerprint("dave").is_err());
     }
 
     fn text(from: &str, body: &[u8]) -> Event {

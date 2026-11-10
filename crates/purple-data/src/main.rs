@@ -543,8 +543,9 @@ fn tick(
 ) -> io::Result<()> {
     let ticked = messenger.tick(now()?);
     // To stderr, not the UI: a group whose timer keeps failing would report every poll.
-    for (group, err) in &ticked.errors {
-        eprintln!("purple-data: key update in {group} failed: {err}");
+    // The log file isn't encrypted, so the group's name stays out of it.
+    for (_, err) in &ticked.errors {
+        eprintln!("purple-data: a group's key update failed: {err}");
     }
     let effects = Effects {
         outgoing: ticked.outgoing,
@@ -597,6 +598,13 @@ fn handle(cmd: UiCmd, messenger: &mut Messenger) -> session::Result<Effects> {
         }
         UiCmd::AcceptInvite { contact, invite } => {
             messenger.accept_invite(&contact, Invite::from_text(&invite)?)?;
+        }
+        UiCmd::Verify { contact } => {
+            effects.changed = false;
+            let digits = messenger.fingerprint(&contact)?;
+            effects
+                .events
+                .push(UiEvent::Fingerprint { contact, digits });
         }
         UiCmd::Send { contact, body } => {
             let at = now()?;

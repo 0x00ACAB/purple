@@ -4,5 +4,5 @@
 .claude/
 CLAUDE.md
 AGENTS.md
-docs/superpowers/
-docs/architecture.drawio
+docs/*
+!docs/protocol.md

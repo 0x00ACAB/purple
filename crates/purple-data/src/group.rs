@@ -780,6 +780,11 @@ impl Group {
         let from = credential::identity(processed.credential())?;
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app) => {
+                // MLS still decrypts the last epochs' messages, and a removed member
+                // still holds those keys.
+                if !self.identities()?.contains(&from) {
+                    return Ok(Received::Nothing);
+                }
                 match GroupContent::decode(&app.into_bytes())? {
                     GroupContent::Text(body) => Ok(Received::Text { from, body }),
                     GroupContent::Names(names) if from == *creator => Ok(Received::Names(names)),
@@ -1199,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn a_late_message_is_credited_to_its_sender_even_after_their_leaf_is_reused() {
+    fn a_removed_members_late_message_isnt_credited_to_whoever_took_their_leaf() {
         let (alice, mut group, bob, mut bobs) = pair();
         let (carol, dana) = (member(), member());
         let creator = alice.account.identity_key();
@@ -1262,10 +1267,8 @@ mod tests {
                 &creator,
             )
             .unwrap();
-        assert!(
-            matches!(&got, Received::Text { from, .. } if *from == bob.account.identity_key()),
-            "{got:?}"
-        );
+        // Bob is out, so it's dropped; above all it isn't shown as Dana's.
+        assert!(matches!(got, Received::Nothing), "{got:?}");
     }
 
     #[test]
@@ -1444,6 +1447,26 @@ mod tests {
         )
         .unwrap();
         (alice, group, bob, bobs, carol, carols)
+    }
+
+    #[test]
+    fn a_removed_member_cant_post_into_the_epoch_they_were_removed_from() {
+        let (alice, mut group, bob, mut bobs, carol, mut carols) = trio();
+        let creator = alice.account.identity_key();
+
+        let removal = group
+            .remove(&alice.provider, &carol.account.identity_key())
+            .unwrap();
+        let bytes = message(&bobs.streams()[0], &removal);
+        bobs.receive(&bob.provider, &bytes, &creator).unwrap();
+
+        // Carol still holds the old epoch's keys, and Bob still reads its stream.
+        let sneaky = carols
+            .send(&carol.provider, &GroupContent::Text(b"still here".to_vec()))
+            .unwrap();
+        let late = message(&bobs.streams()[1], &sneaky);
+        let got = bobs.receive(&bob.provider, &late, &creator).unwrap();
+        assert!(matches!(got, Received::Nothing), "{got:?}");
     }
 
     #[test]
